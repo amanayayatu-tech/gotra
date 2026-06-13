@@ -1,10 +1,11 @@
-# Gotra 全自主化 + 10×10×10年回测 · Codex 可执行任务书 v1.1
+# Gotra 全自主化 + 10×10×10年回测 · Codex 可执行任务书 v1.2
 
 > 类型：可被 **Codex `goal` / `codex exec`** 端到端执行的任务书；同时是人类审阅方的验收清单。
-> v1.1 变更：吸收审阅方对 v1.0 的核验结论，修正 8 处执行错配；**确立 gotra 为全新独立仓库与本地新工作区**；新增 Preflight、Phase 0（仓库初始化）、Phase B0（Alaya actor 合同）、Perplexity 原则迁移。所有结论已对照真实代码（文件:行）。
+> v1.1 变更：吸收审阅方对 v1.0 的核验结论，修正 8 处执行错配；确立 gotra 为全新独立仓库与本地新工作区；新增 Preflight、Phase 0、Phase B0、Perplexity 原则迁移。
+> **v1.2 变更（本版）**：吸收第二轮审阅 8 条——① 统一权威路径为 `docs/AUTONOMY_RUNBOOK.md`（消除根目录 `GOTRA_RUNBOOK_v1.1.md` 二义）；② 消除 Phase A 默认行为矛盾（ksana 代码默认保持现状，read-only 仅由 gotra `.env` 显式设）；③ B0 actor 改为从受信 API key scope 派生（body 仅审计备注）+ 补 generic PATCH 越权测试；④ README 标「Phase 0 后可用」；⑤ 写死 ksana submodule + PR 指针流程；⑥ Judge 的 `existing_knowledge` 改读 Alaya 知识状态、并把知识状态 sync 列为 Phase B 前置；⑦ Phase P 补 `_filled.yaml` 全消费链 fixture；⑧ LLM 泄漏 grep 补 `from openai/from anthropic`、`.gitignore` 补 `.env*` 与运行产物。所有结论已对照真实代码（文件:行）。
 >
 > **三仓库基线（以最新为准，已逐行核验）**
-> - **gotra**（本任务书主工作面，全新仓库）：`github.com/amanayayatu-tech/gotra`，当前仅 `README.md/LICENSE/docs/ROADMAP.md`。README 自述：「Alaya 当治理底座，worldpay 当领域引擎；先契约后合库；**不重写 Python**」。
+> - **gotra**（本任务书主工作面，全新仓库）：`github.com/amanayayatu-tech/gotra` @ `2aae595`，已含 `README.md/LICENSE/docs/ROADMAP.md/docs/AUTONOMY_RUNBOOK.md`（**本文即仓库内 `docs/AUTONOMY_RUNBOOK.md` 的权威副本**）。
 > - **ksana**（领域引擎，原 worldpay77 改名，**冻结+保持纯净**）：`github.com/amanayayatu-tech/ksana` @ `8e1f1b9`。
 > - **Alaya**（治理底座）：本地 `/Users/peachy/Documents/alaya`，分支 `codex/shadow-run-24h` @ `deba14a0`；origin/main = `ad420ee`。**前置：24h 影子验收须先 PASS 并冻结。**
 > - 全系统 LLM：**统一 gpt-5.5、reasoning effort = `xhigh`、经 Codex CLI**（`LLM_PROVIDER=codex_cli`），无 GPT-4o、无其他模型。
@@ -50,7 +51,7 @@
 
 | # | 问题（审阅实测） | 处理 |
 |---|---|---|
-| PF1 | 本地 `gotra` 为空目录、非 git；远端仅 README/docs | → **Phase 0** 初始化 gotra 工作区与子模块；runbook 落到 gotra 仓库根（不再放 Downloads）。 |
+| PF1 | 启动路径二义：曾要求复制到根目录 `GOTRA_RUNBOOK_v1.1.md`，但远端实际权威副本在 `docs/AUTONOMY_RUNBOOK.md` | → **统一权威路径 = `docs/AUTONOMY_RUNBOOK.md`**（已在远端 `2aae595`）。Phase 0 不再在根目录另放 runbook；启动命令（§7）一律读 `docs/AUTONOMY_RUNBOOK.md`。 |
 | PF2 | Alaya `resolveGate`/knowledge approve/quarantine **硬编码 `actor:"human"`**（`alaya-app/server/routes.ts:700/857/875/882`） | → **Phase B0** 先改 Alaya actor 合同，否则 Phase B 的 `event_log.actor=judge_agent/codex` 验收必不过。 |
 | PF3 | ksana methodology 明令「Agent 永不直接调用 Perplexity/外部 API」（`methodologies/research_system_v0.3.md:152`），且有守护测试扫描 `perplexity_client/requests/httpx`（`tests/orchestrator/test_decision_checks.py:8`） | → 自动执行器**放 gotra 编排层、不放 ksana agent**；在 **gotra 方法论 vN** 显式记「编排层自动回填替代 Nepha 手动」的原则迁移；ksana R8 与守护测试**保持不动**（§Phase P）。 |
 | PF4 | Codex provider 非物理只读（`--sandbox workspace-write`，`narrative_generator.py:138`），且一次极小调用账面 ~18k tokens（含本机 config/plugins/skills；clean 后仍 ~13k） | → Phase A：provider 角色改 `--sandbox read-only --ignore-user-config`、ephemeral profile；回测加缓存/采样/预算闸（§4.7）。 |
@@ -78,7 +79,7 @@
 
 **DA0 — 三仓库分工**：见 §0.1。gotra 集成层为主工作面；ksana 冻结子模块；Alaya 最小 actor 改动。
 
-**DA1 — LLM 统一 gpt-5.5 xhigh / Codex CLI（对 ksana 近零代码）**：`LLM_PROVIDER=codex_cli`、`LLM_MODEL=gpt-5.5`、`CODEX_PROVIDER_REASONING_EFFORT=xhigh`。已核实 ksana 无散落 `import openai`，故引擎侧仅配置。**Provider 硬化（PF4）**：provider 角色用 `--sandbox read-only --ignore-user-config` 干净 ephemeral profile（物理只读，而非靠 prompt）；该硬化通过「ksana 配置化最小 PR ①」实现：`CodexCliClient` 读 `CODEX_PROVIDER_SANDBOX`（默认 `read-only`）决定 `--sandbox` 取值，env 未设时回退现状不破坏。Judge 与回测两臂均走同一 gpt-5.5 xhigh。
+**DA1 — LLM 统一 gpt-5.5 xhigh / Codex CLI（对 ksana 近零代码）**：`LLM_PROVIDER=codex_cli`、`LLM_MODEL=gpt-5.5`、`CODEX_PROVIDER_REASONING_EFFORT=xhigh`。已核实 ksana 无散落 `import openai`，故引擎侧仅配置。**Provider 硬化（PF4，消除 v1.1 矛盾）**：`CodexCliClient` 读新增 env `CODEX_PROVIDER_SANDBOX` 决定 `--sandbox`，**默认值 = 现状 `workspace-write`（env 未设时与 8e1f1b9 逐位一致，不改 ksana 原行为）**；物理只读由 **gotra `.env.example` 显式设 `CODEX_PROVIDER_SANDBOX=read-only`** 达成（而非改 ksana 默认）。`--ignore-user-config` 由 `CODEX_PROVIDER_CLEAN=1`（gotra `.env` 设）开。Judge 与回测两臂均走同一 gpt-5.5 xhigh。
 
 **DA2 — Codex 两角色物理隔离**：Provider 角色（只读、禁联网、只回答）vs Orchestrator 角色（daemon/CLI 外层编排 shell、判退出码、重试）。二者不共用沙箱约束。
 
@@ -105,16 +106,17 @@
 - 0.1 本地**新建独立工作区**（满足「本地新启一个项目」）：`git clone git@github.com:amanayayatu-tech/gotra.git /Users/peachy/Documents/gotra`。
 - 0.2 加 ksana 子模块并安装：`git submodule add https://github.com/amanayayatu-tech/ksana.git engine/ksana && cd engine/ksana && git checkout 8e1f1b9 && cd ../.. && uv venv && uv pip install -e engine/ksana`。
 - 0.3 脚手架：`contracts/`、`integrations/alaya/`、`gotra/`（自主层包：judge_agent、perplexity_executor、daemon_orchestration、reporting_ext、backtest）、`methodologies/`（gotra 方法论 vN，记 Perplexity 原则迁移）、`pyproject.toml`（依赖 ksana + perplexity/telegram/统计库 + pytest/ruff）。
-- 0.4 `.gitignore`（PF8）：忽略 `FIX_REPORT_*.md`、`*.patch`、`REVIEW_BUNDLE_*.tar.gz`、`validation-logs/`、`data/backtest/prices/`、`data/backtest/runs/`、`*.env`、`.venv/`；`!data/backtest/PREREGISTERED.md` 强制跟踪。
-- 0.5 把本 runbook 复制进 `gotra/GOTRA_RUNBOOK_v1.1.md`（启动命令从此路径读，不再用 Downloads）。
-**退出闸**：`uv run python -c "import chairman, orchestrator, business_agents"` 成功；子模块 pin 在 8e1f1b9；`.gitignore` 生效；`ruff check .` 绿。
+- 0.4 `.gitignore`（PF8，显式补全）：忽略 `FIX_REPORT_*.md`、`*.patch`、`REVIEW_BUNDLE_*.tar.gz`、`validation-logs/`、`data/backtest/prices/`、`data/backtest/runs/`、`data/reports/`、`data/exports/`、`**/*.sqlite`、`**/*.db`、`.venv/`、**`.env`、`.env.*`、`!.env.example`**；`!data/backtest/PREREGISTERED.md` 强制跟踪。
+- 0.5 权威 runbook = 仓库内 **`docs/AUTONOMY_RUNBOOK.md`**（已在远端）。**不再在根目录另放 `GOTRA_RUNBOOK_v1.x.md`**；后续所有路线图修订只改此一份并提交。
+**退出闸**：`uv run python -c "import chairman, orchestrator, business_agents"` 成功；子模块 pin 在 8e1f1b9 且父 repo 已记录该指针（`git submodule status` 与 `.gitmodules` 一致）；`.gitignore` 生效；`ruff check .` 绿。
 **回滚**：删本地工作区，远端 gotra 无破坏。
 
 ### Phase A — LLM 统一 + Provider 硬化（≈0.5–1 天）
 **仓库** gotra 分支 `A-llm-codex`；ksana 分支 `cfg/provider-sandbox`（配置化 PR ①）
 **[Subagent 调度]** 实现 subagent + 审阅 subagent。
+> **子模块 + PR 指针流程（写死，PF#5）**：凡改 ksana 的改动（本 Phase 仅此一处）**必须在 ksana 仓库分支 `cfg/provider-sandbox` 提 PR、在 ksana 侧 review+合并**；然后在 gotra 侧 `cd engine/ksana && git fetch && git checkout <merged-sha>`、回到 gotra 根 `git add engine/ksana && git commit`（**仅更新 submodule 指针 SHA**）。**禁止**在 submodule 内直提而父 repo 不记指针，或反过来。
 **步骤**
-- A.1 **ksana 配置化 PR ①（单 commit，唯一 ksana 代码改动之一）**：`CodexCliClient` 命令构造读 `os.getenv("CODEX_PROVIDER_SANDBOX","read-only")` 决定 `--sandbox`；新增 `--ignore-user-config`（可由 `CODEX_PROVIDER_CLEAN=1` 开）。env 未设时**行为与 8e1f1b9 完全一致**（默认值需与现状对齐或显式标注变更）。附单测。
+- A.1 **ksana 配置化 PR ①（单 commit，唯一 ksana 代码改动之一）**：`CodexCliClient` 命令构造读 `os.getenv("CODEX_PROVIDER_SANDBOX", "workspace-write")` 决定 `--sandbox`（**默认 `workspace-write` = 现状，env 未设时与 8e1f1b9 逐位一致，不改 ksana 原行为**）；新增 `--ignore-user-config`（仅当 `CODEX_PROVIDER_CLEAN=1` 时加，默认不加）。附单测：断言「env 全不设→命令与改动前逐 token 一致」+「`CODEX_PROVIDER_SANDBOX=read-only` → `--sandbox read-only`」。该 PR 合入 ksana 后，gotra 更新 submodule SHA。
 - A.2 gotra LLM 工厂与 Judge 客户端（**走 Codex，非 OpenAI**）：
   ```python
   # gotra/judge_agent/llm.py
@@ -135,10 +137,10 @@
 **仓库** Alaya 分支 `codex/automation-actor`
 **[Subagent 调度]** 实现 subagent + **独立审阅 subagent 必做**（核验 strong 仍 human-only）。
 **步骤**
-- B0.1 `resolveGate`（`routes.ts:688`）与 knowledge `quarantine`（:882）支持从受信调用方传入 `actor`（如 `judge_agent/codex`、`auto_quarantine`）：取自鉴权后的 API key 身份或显式 body 字段，**经 service 层落 `event_log`**（底线 3），不裸写。
-- B0.2 **硬约束**：`POST /api/knowledge/:id/approve`（→ `active→strong`，:857/875）**拒绝任何非 human actor**；即使传 automation actor 也返回 4xx。新增/扩展守卫测试断言「automation actor 永不能产生 strong」（底线 2）。
-- B0.3 `human-gates approve/reject` 接受 automation actor，但 `risk` gate 的 blocking 语义不变。
-**退出闸**：Alaya 全套（`typecheck/guard/test:all/test:scripts/e2e:*/flywheel/build/secret:scan/git diff --check`）全绿 + ≥1h 真实复测；新增测试证明 automation 可 resolve gate / quarantine 但**绝不能 approve strong**；`event_log.actor` 可落非 human 值。
+- B0.1 **actor 从受信身份派生（信任边界硬化，PF#3）**：`resolveGate`（`routes.ts:688`→:700）与 knowledge `quarantine`（:882）的 `actor` **取自鉴权后的 API key / token scope**（受信身份），**body 里的 actor 最多作为审计备注，不作为权限依据**。底层 storage 已支持 actor hint（`storage.ts:1196/1313` 已核实），改动集中在 routes + auth 层；写入经 service 层落 `event_log`（底线 3），不裸写。
+- B0.2 **硬约束（strong 只能 human）**：① `POST /api/knowledge/:id/approve`（→ `active→strong`，:857/875）**拒绝任何非 human scope 的身份**，返回 4xx；② **通用 `PATCH /api/knowledge/:id` 也不得被 automation 用来写 `status=strong` 或 `humanApprovedCount`**（堵住旁路升级）。新增守卫测试断言：**automation 身份既不能伪装 human，也不能经 approve 或 generic PATCH 产生 strong / 括 humanApprovedCount**（底线 2）。
+- B0.3 `human-gates approve/reject` 接受 automation scope，但 `risk` gate 的 blocking 语义不变。
+**退出闸**：Alaya 全套（`typecheck/guard/test:all/test:scripts/e2e:*/flywheel/build/secret:scan/git diff --check`）全绿 + ≥1h 真实复测；automation 可 resolve gate / quarantine；三条越权测试（伪装 human / approve 升 strong / generic PATCH 升 strong）均被拒且有用例；`event_log.actor` 可落非 human 值。
 **回滚**：revert 分支，Alaya 回 deba14a0 行为。
 > 已知环境限制：审阅方经 pc 通道在 Mac 跑服务类测试 `listen EPERM`（6 个端口绑定测试必失败）——属环境，完整复跑在沙箱 Linux 克隆做。
 
@@ -151,7 +153,7 @@
 - P.3 **原则迁移文档（PF3，必做）**：在 `gotra/methodologies/autonomy_v1.md` 写明：ksana agent 的 R8（永不调 Perplexity）**不变且仍受 ksana 守护测试保护**；**gotra 编排层**引入「auto-fill operator」角色，机械替代「Nepha 手动在 Perplexity Max 回填」。这是层级迁移，非绕过 agent 纯度。
 - P.4 与 pipeline 对齐：executor 在 `perplexity_wait` 步骤前跑（Phase C daemon 串联）；保留 `perplexity_wait` 作失败兜底（自动优先、人工可降级）。
 - P.5 成本计入 gotra reporting（扩展，见 Phase C）。
-**退出闸**：mock 单测绿；真实 1 条 PR → 自动 `_filled.yaml` → `cd engine/ksana && uv run orchestrator rerun --from-step partners` 后 `PerplexityContext=filled`；**ksana 守护测试 `test_decision_checks.py` 仍全绿（证明未污染引擎）**；API 超时优雅降级人工通道；§5 绿。
+**退出闸**：mock 单测绿；**全消费链 fixture（PF#7，必做）**：自动生成的 `_filled.yaml` 能被 ksana 实际消费——`perplexity_results.py: load_result_status` 识别为 filled → `collect_perplexity_context` → ingest → signal sync 至少走通一个 fixture（证明能读而非只能写，不只是 schema 校验）；真实 1 条 PR → 自动 `_filled.yaml` → `cd engine/ksana && uv run orchestrator rerun --from-step partners` 后 `PerplexityContext=filled`；**ksana 守护测试 `test_decision_checks.py` 仍全绿（证明未污染引擎）**；API 超时优雅降级人工通道；§5 绿。
 **回滚**：禁用 executor 回人工填，零数据影响。
 > **回测约束**：执行器仅用于实盘自主；回测中禁实时 Perplexity（§4.3 第 3 层），`PERPLEXITY_API_KEY` 在回测环境置空。
 
@@ -160,7 +162,8 @@
 **[Subagent 调度]** 实现 subagent + **独立审阅 subagent 必做**（本 Phase 风险最高）。
 **步骤**
 - B.1 `gotra/judge_agent/{judge_agent.py,gate_poller.py,auto_quarantine.py,prompts/{meaning_gate.md,risk_gate.md},tests/}`。
-- B.2 判决上下文（来源已核验）：`ticker+gate_type+prompt_text`（Alaya `GET /api/human-gates/:id` routes.ts:639）、`existing_knowledge`（ksana `knowledge_store.py`，仅 active/strong，强制底线 4 过滤）、`fwg_recommendations`（同 run_id）、`red_team_findings`（`data/red_team_audits/`）、`historical_accuracy`（Alaya `GET /api/projects/:id/predictions` routes.ts:772，经 id_map）、`quarantine_list`。输出严格 JSON：`{decision, confidence, reasoning(简体中文≤300字，区分方法论分歧 vs 潜在错误), knowledge_flag:none|watch|strong_candidate|quarantine_candidate, audit_actor:"judge_agent/codex"}`。
+- B.2 判决上下文（来源已核验）：`ticker+gate_type+prompt_text`（Alaya `GET /api/human-gates/:id` routes.ts:639）、**`existing_knowledge`（改读 Alaya `GET /api/knowledge?status=active|strong`——知识状态机是 Alaya SoR（D3）；ksana `knowledge_store.py:77` 当前只有 `source_pr_id`、无 active/strong/quarantine 状态字段，故不能在引擎侧做状态过滤）**、`fwg_recommendations`（同 run_id）、`red_team_findings`（`data/red_team_audits/`）、`historical_accuracy`（Alaya `GET /api/projects/:id/predictions` routes.ts:772，经 id_map）、`quarantine_list`。输出严格 JSON：`{decision, confidence, reasoning(简体中文≤300字，区分方法论分歧 vs 潜在错误), knowledge_flag:none|watch|strong_candidate|quarantine_candidate, audit_actor:"judge_agent/codex"}`。
+  > **前置依赖（PF#6）**：引擎侧「脏知识不进高风险证据」的过滤（底线 4）依赖 v1.3 P4 `sync_knowledge_filter.py` 把 Alaya 的 `quarantined/conflict/stale` 状态同步为 ksana `quarantine_list.yaml`。**该 sync 是 Phase B / Judge 的硬前置**；未先落地时，过滤仅是口头契约、不生效。
 - B.3 路由：`approve`→`POST /api/human-gates/:id/approve`（**带 B0 的 automation actor**）；`reject`→`/reject`。物化回写复用 v1.3 P2 `sync_gates.py`——Judge 不直接写文件。
 - B.4 `gate_poller.py`：60s 轮询（`JUDGE_POLL_INTERVAL`），连失 ≥5 轮 stderr 告警不退出；`AUTO_JUDGE=false` → `sys.exit(0)`。
 - B.5 `auto_quarantine.py`（晚报窗、`refresh_outcome_snapshots` 后串联）：方向反向（看多实跌 >5%）或 `price_error > QUARANTINE_ERROR_THRESHOLD`（默认 0.15）→ `POST /api/knowledge/:id/quarantine`（带 automation actor，仅匹配 `source_pr_id`）→ 写晚报 + event_log。只隔离不删（底线 4/熵减）。
@@ -252,7 +255,7 @@ uv run ruff check .
 uv run pytest -q                 # 全量
 uv run pytest -q <phase 专属目录>
 git diff --check
-grep -rn "import openai\|import anthropic" --include=*.py . | grep -v narrative_generator.py   # 须空(底线6)
+grep -rnE "import openai|from openai|import anthropic|from anthropic" --include=*.py . | grep -v narrative_generator.py   # 须空(底线6；同时盖 from X import 形式)
 cd engine/ksana && uv run pytest -q tests/orchestrator/test_decision_checks.py   # Phase P 后须仍绿(引擎纯度未污染)
 ```
 **Alaya（仅 Phase B0，`npm`）**：`typecheck/guard/test:all/test:scripts/e2e:review-window/e2e:knowledge-lifecycle/e2e:long-evolution/benchmark:smoke/flywheel/build/secret:scan/git diff --check` 全绿 + ≥1h 真实复测（`local_api_human_proxy`、provider ratio ≥95%、A 类 9 判据、`UNIQUE/closed+drafting/error/runner_crashed` 扫描 0）。
@@ -282,15 +285,17 @@ cd engine/ksana && uv run pytest -q tests/orchestrator/test_decision_checks.py  
 ```bash
 # 在 gotra 仓库根目录（/Users/peachy/Documents/gotra）
 codex --ask-for-approval never --sandbox workspace-write exec --cd "$(pwd)" \
-  "阅读 GOTRA_RUNBOOK_v1.1.md，先完成 §0.6 PREFLIGHT 与 Phase 0；自验通过 §5 后产出 \
+  "阅读 docs/AUTONOMY_RUNBOOK.md，先完成 §0.6 PREFLIGHT 与 Phase 0；自验通过 §5 后产出 \
    FIX_REPORT_0.md / 0.patch / REVIEW_BUNDLE_0.tar.gz，停下等待审阅，不要继续 Phase A。"
 ```
 > 若你的 Codex 提供 `goal` 自治模式，把同样 Phase 指令作为 goal 输入；务必保留「每 Phase 停下交审阅」边界，禁一口气跑到 BT。Subagent 按各 Phase **[Subagent 调度]** 执行：实现与审阅分离、并行任务各写不同目录。
 
 ---
 
-## 附录 · 已核验事实（v1.1，防过期假设施工）
-- gotra 仓库：当前仅 `README.md/LICENSE/docs/ROADMAP.md`；README 自述「合并落地仓库，不重写 Python」。✅（gh 核实）
+## 附录 · 已核验事实（v1.2，防过期假设施工）
+- gotra 仓库 @ `2aae595`：已含 `README.md/LICENSE/docs/ROADMAP.md/docs/AUTONOMY_RUNBOOK.md`（权威 runbook 路径）。✅（gh 核实）
+- Alaya storage 已支持 actor hint（`storage.ts:1196/1313`），但 routes 仍多处硬编码 `actor:"human"`→ B0 需从 API key scope 派生 actor。✅
+- ksana `knowledge_store.py:77` 仅有 `source_pr_id`、无 Alaya active/strong/quarantine 状态字段→ Judge 的 existing_knowledge 改读 Alaya、quarantine 过滤靠 sync_knowledge_filter 前置。✅
 - ksana **无散落 `import openai/anthropic`**（narrative_generator 之外 grep 为空）→ LLM 统一对 ksana 近零代码。✅
 - ksana 可被 import：hatch wheel，`packages=[chairman,red_team,orchestrator,business_agents]`。✅
 - ksana methodology 明令 Agent 永不调 Perplexity/外部 API（`research_system_v0.3.md:152/541`），守护测试扫 `perplexity_client/requests/httpx`（`test_decision_checks.py:8`）。✅ → 执行器必须放 gotra。

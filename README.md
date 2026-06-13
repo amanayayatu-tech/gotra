@@ -125,6 +125,8 @@ gotra/
 
 ## 快速开始
 
+> ⚠️ **当前处于 Phase 0（工作区初始化）之前**：仓库尚未包含 `.gitmodules` / `engine/ksana` 子模块、`contracts/`、`.env.example`。以下命令在 **Phase 0 完成后**可用，目前作为目标形态参考。
+
 前置：本机已安装并登录 Codex CLI（系统所有模型调用经此）。
 
 ```bash
