@@ -1,5 +1,7 @@
-# Alaya × WorldPay 投研数据飞轮 · 合并执行路线图（修订版 v1.3）
+# Alaya × ksana 投研数据飞轮 · 合并执行路线图（修订版 v1.3）
 
+> **命名说明（2026-06-13 更新）**：本文撰写时领域引擎仓库名为 `worldpay77`，现已改名为 **`ksana`**（`github.com/amanayayatu-tech/ksana`）。全文出现的 `worldpay77` / `worldpay` 一律等同 `ksana`，路径与命令照旧有效。本路线图覆盖**第一阶段·桥接基础（P0–P4）**；在其之上的**全自主化与回测扩展**见 [`AUTONOMY_RUNBOOK.md`](AUTONOMY_RUNBOOK.md)（执行任务书 v1.1）。在 gotra 中，ksana 以 git 子模块 `engine/ksana`（冻结 + 纯净）形态存在，桥接代码统一放在 gotra 的 `integrations/alaya/` 与 `contracts/`。
+>
 > 日期：2026-06-11（v1.3，同日第三轮复核）
 > 基线：worldpay77 @ `Stabilize WebUI UX states`（2026-06-08）；Alaya @ `Merge phase2: sensor firewall + attribution confidence`（2026-06-11）
 > 性质：在原《Alaya × worldpay77 合并建议》基础上的**修订执行版**。原建议的方向（Alaya 治理底座 + worldpay 领域引擎、先契约后合库、不重写 Python）全部保留；本文 v1.0 修正了原建议的 6 个执行层问题（见下表），并把每一步落到已核实的真实命令、文件路径和 API 上；v1.1–v1.3 为三轮复核修订（见下方记录）。
