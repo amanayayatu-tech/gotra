@@ -127,9 +127,13 @@ def test_backtest_pauses_when_token_budget_is_exceeded(tmp_path: Path) -> None:
     assert summary["system_health"]["status"] == "paused"
     assert summary["system_health"]["alerts"] == [summary["pause_reason"]]
     assert summary["token_budget"]["spent_tokens"] == 0
+    assert summary["audit"]["ok"] is True
+    assert summary["audit"]["steps_checked"] == 0
+    assert summary["audit"]["event_rows_checked"] == 0
     run_root = tmp_path / "runs" / "budget_test"
     assert (run_root / "summary.json").exists()
     assert (run_root / "system_health.json").exists()
+    assert not (run_root / "event_log.jsonl").exists()
 
 
 def test_codex_provider_returns_decision_and_bills_real_usage(tmp_path: Path) -> None:

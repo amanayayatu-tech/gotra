@@ -68,7 +68,7 @@ def audit_run(run_root: str | Path) -> AuditResult:
                         f"{event_log}:{line_number}",
                     )
                 )
-    else:
+    elif result.steps_checked:
         result.violations.append(AuditViolation("event_log_missing", "event_log.jsonl missing", str(event_log)))
     return result
 
