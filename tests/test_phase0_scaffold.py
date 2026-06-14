@@ -60,7 +60,11 @@ def test_backtest_preregistration_marker_is_tracked_location() -> None:
     marker = ROOT / "data" / "backtest" / "PREREGISTERED.md"
 
     assert marker.exists()
-    assert "Phase 0" in marker.read_text(encoding="utf-8")
+    content = marker.read_text(encoding="utf-8")
+    assert "Phase BT Preregistration" in content
+    assert "H1 convergence" in content
+    assert "H2 drift resistance" in content
+    assert "H3 differential significance" in content
 
 
 def test_ksana_submodule_is_pinned_in_parent_index() -> None:
