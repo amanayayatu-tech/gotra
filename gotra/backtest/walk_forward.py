@@ -6,6 +6,9 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -307,6 +310,7 @@ class CodexDecisionProvider:
                     cache_key=cache_key,
                     estimated_tokens=billed_tokens,
                     cache_hit=False,
+                    allow_overage=True,
                 )
                 cache.set(
                     cache_key,
@@ -343,6 +347,94 @@ class CodexDecisionProvider:
         if self.client is None:
             self.client = _build_default_codex_client()
         return self.client
+
+
+class CodexCliUsageClient:
+    """Codex CLI completion client that returns final text plus provider JSONL usage."""
+
+    def __init__(self, base_client: Any) -> None:
+        self.model = getattr(base_client, "model", "")
+        self.project_root = Path(getattr(base_client, "project_root"))
+        self.codex_binary = str(getattr(base_client, "codex_binary", "codex"))
+
+    def complete(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int,
+        timeout_seconds: int,
+        temperature: float,
+    ) -> dict[str, Any]:
+        from chairman.llm.narrative_generator import (
+            LLMError,
+            LLMTimeout,
+            build_codex_provider_prompt,
+            codex_provider_clean_enabled,
+            codex_provider_reasoning_effort,
+            codex_provider_sandbox,
+            looks_like_codex_login_error,
+        )
+
+        if not shutil.which(self.codex_binary):
+            raise LLMError("codex CLI is not installed or not on PATH")
+
+        prompt = build_codex_provider_prompt(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        with tempfile.NamedTemporaryFile("w+", encoding="utf-8", suffix=".txt") as output_file:
+            command = [
+                self.codex_binary,
+                "--ask-for-approval",
+                "never",
+                "exec",
+                "-c",
+                f'model_reasoning_effort="{codex_provider_reasoning_effort()}"',
+                "--cd",
+                str(self.project_root),
+                "--sandbox",
+                codex_provider_sandbox(),
+                "--json",
+                "--output-last-message",
+                output_file.name,
+            ]
+            if codex_provider_clean_enabled():
+                command.insert(command.index("-c"), "--ignore-user-config")
+            if self.model:
+                command.extend(["--model", self.model])
+            command.append(prompt)
+
+            try:
+                completed = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                    check=False,
+                    cwd=self.project_root,
+                )
+            except FileNotFoundError as exc:
+                raise LLMError("codex CLI is not installed or not on PATH") from exc
+            except subprocess.TimeoutExpired as exc:
+                raise LLMTimeout(str(exc)) from exc
+
+            stdout = completed.stdout or ""
+            stderr = completed.stderr or ""
+            if completed.returncode != 0:
+                detail = (stderr or stdout).strip()
+                if looks_like_codex_login_error(detail):
+                    raise LLMError("codex CLI is not logged in")
+                raise LLMError(f"codex CLI failed with exit code {completed.returncode}: {detail}")
+
+            output_file.seek(0)
+            final_message = output_file.read().strip()
+            return {
+                "content": final_message or _last_agent_message_from_codex_jsonl(stdout),
+                "usage": _codex_jsonl_usage(stdout),
+            }
 
 
 def run_backtest(config: BacktestConfig) -> dict[str, Any]:
@@ -382,6 +474,8 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
                     skipped=skipped,
                 )
                 steps.extend(ticker_steps)
+                if budget.over_budget_error:
+                    raise BudgetExceeded(budget.over_budget_error)
             if config.max_steps is not None and len(steps) >= config.max_steps:
                 break
     except BudgetExceeded as exc:
@@ -451,7 +545,7 @@ def _build_provider(name: ProviderName) -> DecisionProvider:
 def _build_default_codex_client() -> CompletionClient:
     from gotra.judge_agent.llm import build_judge_client
 
-    return build_judge_client()
+    return CodexCliUsageClient(build_judge_client())
 
 
 def _build_system_health(
@@ -613,6 +707,8 @@ def _run_ticker_step(
                     "expected_change_pct": decision.expected_change_pct,
                 }
             )
+        if budget.over_budget_error:
+            return steps
     return steps
 
 
@@ -885,6 +981,49 @@ def _usage_total_tokens(usage: Any) -> int | None:
     if isinstance(input_tokens, int | float) and isinstance(output_tokens, int | float):
         return max(0, int(input_tokens) + int(output_tokens))
     return None
+
+
+def _codex_jsonl_usage(stdout: str) -> dict[str, int] | None:
+    last_usage: dict[str, Any] | None = None
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        usage = event.get("usage")
+        if event.get("type") == "turn.completed" and isinstance(usage, dict):
+            last_usage = usage
+    if last_usage is None:
+        return None
+    result: dict[str, int] = {}
+    for key in ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens"):
+        value = last_usage.get(key, 0)
+        if isinstance(value, int | float):
+            result[key] = max(0, int(value))
+    total = result.get("input_tokens", 0) + result.get("output_tokens", 0)
+    result["total_tokens"] = max(0, total)
+    return result
+
+
+def _last_agent_message_from_codex_jsonl(stdout: str) -> str:
+    message = ""
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = event.get("item")
+        if (
+            event.get("type") == "item.completed"
+            and isinstance(item, dict)
+            and item.get("type") == "agent_message"
+        ):
+            message = str(item.get("text") or "")
+    return message.strip()
 
 
 def _parse_decision_json(text: str) -> dict[str, Any]:
