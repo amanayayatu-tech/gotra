@@ -39,6 +39,15 @@ class TokenBudget:
             )
         self.spent_tokens = proposed
 
+    def preflight(self, *, estimated_tokens: int) -> None:
+        """Fail before an uncached provider call that is already over budget."""
+
+        proposed = self.spent_tokens + max(0, int(estimated_tokens))
+        if self.max_tokens is not None and proposed > self.max_tokens:
+            raise BudgetExceeded(
+                f"BT token budget exceeded: proposed={proposed}, max={self.max_tokens}"
+            )
+
     def snapshot(self) -> dict[str, int | None]:
         return {
             "max_tokens": self.max_tokens,

@@ -9,7 +9,7 @@ import os
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import pandas as pd
 
@@ -33,8 +33,27 @@ from gotra.backtest.statistics import summarize_steps
 
 
 Arm = Literal["baseline", "alaya"]
-ProviderName = Literal["heuristic"]
+ProviderName = Literal["heuristic", "codex_cli"]
 RunMode = Literal["sampled", "full"]
+SAMPLED_PROMPT_VERSION = "bt-sampled-v1"
+FULL_PROMPT_VERSION = "bt-full-v1"
+BT_CODEX_SYSTEM_PROMPT = """You are the Gotra Phase BT gpt-5.5 xhigh decision provider.
+
+Use only the JSON user prompt. Do not use web search, Perplexity, external APIs, files outside the
+prompt, or live market data. Treat the prompt as a compact F/W/G + Chairman workflow:
+- F partner: identify fundamental and valuation implications from the provided price history only.
+- W partner: identify market psychology and momentum implications from the provided price history only.
+- G partner: identify governance and risk implications from the provided price history only.
+- Chairman: reconcile F/W/G into one 30-day expected price-change decision.
+
+Both experimental arms share this exact skeleton. The only stateful signal is the feedback array:
+empty feedback means no cognitive-compounding state; non-empty feedback means only matured prior
+outcomes whose availability date is not after the decision date.
+
+Return strict JSON only, with exactly these keys:
+{"direction": "long|short|watch|avoid", "expected_change_pct": number, "confidence": number,
+"reasoning": "brief reason"}
+"""
 
 
 @dataclass(frozen=True)
@@ -60,7 +79,53 @@ class Decision:
     reasoning: str
     prompt_hash: str
     estimated_tokens: int
+    token_usage_source: str
     cache_hit: bool
+
+
+class CompletionClient(Protocol):
+    def complete(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int,
+        timeout_seconds: int,
+        temperature: float,
+    ) -> Any:
+        """Return provider text or a provider response object."""
+
+
+class DecisionProvider(Protocol):
+    network_enabled: bool
+
+    def decide(
+        self,
+        *,
+        ticker: str,
+        arm: Arm,
+        decision_date: date,
+        price_rows: pd.DataFrame,
+        feedback: list[dict[str, Any]],
+        cache: "DecisionCache",
+        budget: TokenBudget,
+    ) -> Decision:
+        """Return one BT decision."""
+
+
+class ProviderError(RuntimeError):
+    """A provider produced no valid decision for a step."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        prompt_hash: str = "",
+        estimated_tokens: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.prompt_hash = prompt_hash
+        self.estimated_tokens = estimated_tokens
 
 
 class DecisionCache:
@@ -111,11 +176,14 @@ class HeuristicDecisionProvider:
             "features": features,
             "feedback": feedback if arm == "alaya" else [],
             "provider": "heuristic",
-            "version": "bt-sampled-v1",
+            "version": SAMPLED_PROMPT_VERSION,
         }
         prompt = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True)
         prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        cache_key = f"{ticker}:{decision_date.isoformat()}:{arm}:heuristic:{prompt_hash}"
+        cache_key = (
+            f"{ticker}:{decision_date.isoformat()}:{arm}:heuristic:"
+            f"{SAMPLED_PROMPT_VERSION}:{prompt_hash}"
+        )
         cached = cache.get(cache_key)
         token_estimate = estimate_tokens(prompt)
         budget.charge(
@@ -131,6 +199,7 @@ class HeuristicDecisionProvider:
                 reasoning=str(cached["reasoning"]),
                 prompt_hash=prompt_hash,
                 estimated_tokens=token_estimate,
+                token_usage_source="estimated",
                 cache_hit=True,
             )
 
@@ -162,8 +231,118 @@ class HeuristicDecisionProvider:
             reasoning=reasoning,
             prompt_hash=prompt_hash,
             estimated_tokens=token_estimate,
+            token_usage_source="estimated",
             cache_hit=False,
         )
+
+
+class CodexDecisionProvider:
+    """gpt-5.5/xhigh provider through the hardened Codex CLI client."""
+
+    network_enabled = False
+
+    def __init__(
+        self,
+        *,
+        client: CompletionClient | None = None,
+        max_retries: int = 2,
+    ) -> None:
+        self.client = client
+        self.max_retries = max_retries
+
+    def decide(
+        self,
+        *,
+        ticker: str,
+        arm: Arm,
+        decision_date: date,
+        price_rows: pd.DataFrame,
+        feedback: list[dict[str, Any]],
+        cache: DecisionCache,
+        budget: TokenBudget,
+    ) -> Decision:
+        prompt_payload = _build_codex_prompt_payload(
+            ticker=ticker,
+            decision_date=decision_date,
+            price_rows=price_rows,
+            feedback=feedback if arm == "alaya" else [],
+        )
+        prompt = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True, indent=2)
+        prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        cache_key = (
+            f"{ticker}:{decision_date.isoformat()}:{arm}:codex_cli:"
+            f"{FULL_PROMPT_VERSION}:{prompt_hash}"
+        )
+        cached = cache.get(cache_key)
+        token_estimate = estimate_tokens(BT_CODEX_SYSTEM_PROMPT + "\n" + prompt)
+        if cached is not None:
+            budget.charge(cache_key=cache_key, estimated_tokens=token_estimate, cache_hit=True)
+            return Decision(
+                direction=str(cached["direction"]),
+                expected_change_pct=float(cached["expected_change_pct"]),
+                confidence=float(cached["confidence"]),
+                reasoning=str(cached["reasoning"]),
+                prompt_hash=prompt_hash,
+                estimated_tokens=int(cached.get("estimated_tokens", token_estimate)),
+                token_usage_source=str(cached.get("token_usage_source", "estimated")),
+                cache_hit=True,
+            )
+
+        budget.preflight(estimated_tokens=token_estimate)
+        last_error = ""
+        for _attempt in range(self.max_retries + 1):
+            try:
+                completion = self._client().complete(
+                    system_prompt=BT_CODEX_SYSTEM_PROMPT,
+                    user_prompt=prompt,
+                    max_tokens=700,
+                    timeout_seconds=240,
+                    temperature=0.0,
+                )
+                text, provider_tokens = _completion_text_and_usage(completion)
+                decision_payload = _parse_decision_json(text)
+                billed_tokens = provider_tokens if provider_tokens is not None else token_estimate
+                token_usage_source = "provider_usage" if provider_tokens is not None else "estimated"
+                budget.charge(
+                    cache_key=cache_key,
+                    estimated_tokens=billed_tokens,
+                    cache_hit=False,
+                )
+                cache.set(
+                    cache_key,
+                    {
+                        "direction": decision_payload["direction"],
+                        "expected_change_pct": decision_payload["expected_change_pct"],
+                        "confidence": decision_payload["confidence"],
+                        "reasoning": decision_payload["reasoning"],
+                        "estimated_tokens": billed_tokens,
+                        "token_usage_source": token_usage_source,
+                    },
+                )
+                return Decision(
+                    direction=str(decision_payload["direction"]),
+                    expected_change_pct=float(decision_payload["expected_change_pct"]),
+                    confidence=float(decision_payload["confidence"]),
+                    reasoning=str(decision_payload["reasoning"]),
+                    prompt_hash=prompt_hash,
+                    estimated_tokens=billed_tokens,
+                    token_usage_source=token_usage_source,
+                    cache_hit=False,
+                )
+            except BudgetExceeded:
+                raise
+            except Exception as exc:  # noqa: BLE001 - provider output is untrusted by design.
+                last_error = str(exc)
+        raise ProviderError(
+            f"codex_cli provider failed after {self.max_retries + 1} attempts: {last_error}",
+            prompt_hash=prompt_hash,
+            estimated_tokens=token_estimate,
+        )
+
+    def _client(self) -> CompletionClient:
+        if self.client is None:
+            self.client = _build_default_codex_client()
+        return self.client
 
 
 def run_backtest(config: BacktestConfig) -> dict[str, Any]:
@@ -176,7 +355,7 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
 
     cache = DecisionCache(config.data_dir / "runs" / "decision_cache.json")
     budget = TokenBudget.from_env(config.token_budget)
-    provider = HeuristicDecisionProvider()
+    provider = _build_provider(config.provider)
     steps: list[dict[str, Any]] = []
     feedback_by_ticker: dict[str, list[dict[str, Any]]] = {}
     skipped: list[dict[str, Any]] = []
@@ -210,10 +389,12 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
 
     audit = audit_run(run_root)
     metrics = summarize_steps(steps)
+    provider_errors = sum(1 for step in steps if step.get("status") == "provider_error")
     system_health = _build_system_health(
         budget=budget,
         budget_error=budget_error,
         audit_ok=audit.ok,
+        provider_errors=provider_errors,
         run_mode=config.mode,
         provider=config.provider,
     )
@@ -225,6 +406,7 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
         "run_id": run_id,
         "mode": config.mode,
         "provider": config.provider,
+        "provider_metadata": _provider_metadata(config.provider),
         "sampled_validation_only": config.mode == "sampled" or config.provider == "heuristic",
         "start": config.start.isoformat(),
         "end": config.end.isoformat(),
@@ -237,6 +419,7 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
         "pause_reason": budget_error,
         "price_cache_network_after_cache": False,
         "perplexity_disabled": True,
+        "provider_errors": provider_errors,
         "token_budget": budget.snapshot(),
         "system_health": system_health,
         "audit": audit.to_dict(),
@@ -257,11 +440,26 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
     return summary
 
 
+def _build_provider(name: ProviderName) -> DecisionProvider:
+    if name == "heuristic":
+        return HeuristicDecisionProvider()
+    if name == "codex_cli":
+        return CodexDecisionProvider()
+    raise ValueError(f"unsupported BT provider: {name}")
+
+
+def _build_default_codex_client() -> CompletionClient:
+    from gotra.judge_agent.llm import build_judge_client
+
+    return build_judge_client()
+
+
 def _build_system_health(
     *,
     budget: TokenBudget,
     budget_error: str,
     audit_ok: bool,
+    provider_errors: int,
     run_mode: RunMode,
     provider: ProviderName,
 ) -> dict[str, Any]:
@@ -270,13 +468,16 @@ def _build_system_health(
         alerts.append(budget_error)
     if not audit_ok and not budget_error:
         alerts.append("future-function audit failed")
+    if provider_errors:
+        alerts.append(f"provider_error steps: {provider_errors}")
     return {
-        "status": "paused" if budget_error else "failed" if not audit_ok else "ok",
+        "status": "paused" if budget_error else "failed" if (not audit_ok or provider_errors) else "ok",
         "paused": bool(budget_error),
         "pause_reason": budget_error,
         "alerts": alerts,
         "run_mode": run_mode,
         "provider": provider,
+        "provider_errors": provider_errors,
         "sampled_validation_only": run_mode == "sampled" or provider == "heuristic",
         "token_budget": budget.snapshot(),
     }
@@ -287,7 +488,7 @@ def _run_ticker_step(
     ticker: TickerSpec,
     decision_date: date,
     config: BacktestConfig,
-    provider: HeuristicDecisionProvider,
+    provider: DecisionProvider,
     cache: DecisionCache,
     budget: TokenBudget,
     feedback_by_ticker: dict[str, list[dict[str, Any]]],
@@ -326,16 +527,61 @@ def _run_ticker_step(
         if parse_date(item["outcome_availability_date"]) <= decision_date
     ]
     for arm in ("baseline", "alaya"):
-        decision = provider.decide(
-            ticker=ticker.symbol,
-            arm=arm,  # type: ignore[arg-type]
-            decision_date=decision_date,
-            price_rows=decision_slice,
-            feedback=matured_feedback if arm == "alaya" else [],
-            cache=cache,
-            budget=budget,
-        )
         actual_change = _change_pct(float(start_row["adj_close"]), float(end_row["adj_close"]))
+        try:
+            decision = provider.decide(
+                ticker=ticker.symbol,
+                arm=arm,  # type: ignore[arg-type]
+                decision_date=decision_date,
+                price_rows=decision_slice,
+                feedback=matured_feedback if arm == "alaya" else [],
+                cache=cache,
+                budget=budget,
+            )
+        except BudgetExceeded:
+            raise
+        except ProviderError as exc:
+            step = _build_provider_error_step(
+                ticker=ticker,
+                arm=arm,  # type: ignore[arg-type]
+                decision_date=decision_date,
+                outcome_date=outcome_date,
+                start_row=start_row,
+                end_row=end_row,
+                decision_slice=decision_slice,
+                actual_change_pct=actual_change,
+                feedback=matured_feedback if arm == "alaya" else [],
+                provider=provider,
+                config=config,
+                error_message=str(exc),
+                prompt_hash=exc.prompt_hash,
+                estimated_tokens=exc.estimated_tokens,
+            )
+            _write_step(run_root, step)
+            _append_event(run_root, step)
+            steps.append(step)
+            continue
+        except Exception as exc:  # noqa: BLE001 - preserve the failing step for audit.
+            step = _build_provider_error_step(
+                ticker=ticker,
+                arm=arm,  # type: ignore[arg-type]
+                decision_date=decision_date,
+                outcome_date=outcome_date,
+                start_row=start_row,
+                end_row=end_row,
+                decision_slice=decision_slice,
+                actual_change_pct=actual_change,
+                feedback=matured_feedback if arm == "alaya" else [],
+                provider=provider,
+                config=config,
+                error_message=str(exc),
+                prompt_hash="",
+                estimated_tokens=0,
+            )
+            _write_step(run_root, step)
+            _append_event(run_root, step)
+            steps.append(step)
+            continue
         error = round(actual_change - decision.expected_change_pct, 6)
         mse = round(error * error, 6)
         step = _build_step(
@@ -384,36 +630,9 @@ def _build_step(
     error: float,
     mse: float,
     feedback: list[dict[str, Any]],
-    provider: HeuristicDecisionProvider,
+    provider: DecisionProvider,
     config: BacktestConfig,
 ) -> dict[str, Any]:
-    latest_decision_row = decision_slice.iloc[-1]
-    decision_inputs = [
-        {
-            "name": "adjusted_close_history",
-            "kind": "price",
-            "source": str(latest_decision_row["source_url"]),
-            "availability_date": str(latest_decision_row["date"]),
-            "rows": int(len(decision_slice)),
-        }
-    ]
-    for index, item in enumerate(feedback):
-        decision_inputs.append(
-            {
-                "name": f"matured_feedback_{index}",
-                "kind": "alaya_feedback",
-                "source": "prior_step_outcome",
-                "availability_date": item["outcome_availability_date"],
-            }
-        )
-    outcome_inputs = [
-        {
-            "name": "outcome_adjusted_close",
-            "kind": "price",
-            "source": str(end_row["source_url"]),
-            "availability_date": str(end_row["date"]),
-        }
-    ]
     return {
         "schema": "gotra.bt.step.v1",
         "run_mode": config.mode,
@@ -434,14 +653,118 @@ def _build_step(
         "reasoning": decision.reasoning,
         "prompt_hash": decision.prompt_hash,
         "estimated_tokens": decision.estimated_tokens,
+        "token_usage_source": decision.token_usage_source,
         "cache_hit": decision.cache_hit,
         "provider": config.provider,
+        "provider_metadata": _provider_metadata(config.provider),
         "provider_network_enabled": provider.network_enabled,
         "style_window": style_window_for(decision_date),
-        "decision_inputs": decision_inputs,
-        "outcome_inputs": outcome_inputs,
+        "decision_inputs": _decision_inputs(decision_slice, feedback),
+        "outcome_inputs": _outcome_inputs(end_row),
         "future_data_allowed": False,
         "audit_actor": "backtest/walk_forward",
+    }
+
+
+def _build_provider_error_step(
+    *,
+    ticker: TickerSpec,
+    arm: Arm,
+    decision_date: date,
+    outcome_date: date,
+    start_row: pd.Series,
+    end_row: pd.Series,
+    decision_slice: pd.DataFrame,
+    actual_change_pct: float,
+    feedback: list[dict[str, Any]],
+    provider: DecisionProvider,
+    config: BacktestConfig,
+    error_message: str,
+    prompt_hash: str,
+    estimated_tokens: int,
+) -> dict[str, Any]:
+    del start_row
+    return {
+        "schema": "gotra.bt.step.v1",
+        "run_mode": config.mode,
+        "status": "provider_error",
+        "ticker": ticker.symbol,
+        "ticker_name": ticker.name,
+        "arm": arm,
+        "decision_date": decision_date.isoformat(),
+        "window_days": config.window_days,
+        "window_end_date": outcome_date.isoformat(),
+        "outcome_as_of": str(end_row["date"]),
+        "decision_direction": None,
+        "expected_change_pct": None,
+        "actual_change_pct": actual_change_pct,
+        "error": None,
+        "mse": None,
+        "confidence": None,
+        "reasoning": "",
+        "prompt_hash": prompt_hash,
+        "estimated_tokens": estimated_tokens,
+        "token_usage_source": "estimated",
+        "cache_hit": False,
+        "provider": config.provider,
+        "provider_metadata": _provider_metadata(config.provider),
+        "provider_network_enabled": provider.network_enabled,
+        "provider_error": error_message,
+        "style_window": style_window_for(decision_date),
+        "decision_inputs": _decision_inputs(decision_slice, feedback),
+        "outcome_inputs": _outcome_inputs(end_row),
+        "future_data_allowed": False,
+        "audit_actor": "backtest/walk_forward",
+    }
+
+
+def _decision_inputs(
+    decision_slice: pd.DataFrame,
+    feedback: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    latest_decision_row = decision_slice.iloc[-1]
+    decision_inputs = [
+        {
+            "name": "adjusted_close_history",
+            "kind": "price",
+            "source": str(latest_decision_row["source_url"]),
+            "availability_date": str(latest_decision_row["date"]),
+            "rows": int(len(decision_slice)),
+        }
+    ]
+    for index, item in enumerate(feedback):
+        decision_inputs.append(
+            {
+                "name": f"matured_feedback_{index}",
+                "kind": "alaya_feedback",
+                "source": "prior_step_outcome",
+                "availability_date": item["outcome_availability_date"],
+            }
+        )
+    return decision_inputs
+
+
+def _outcome_inputs(end_row: pd.Series) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "outcome_adjusted_close",
+            "kind": "price",
+            "source": str(end_row["source_url"]),
+            "availability_date": str(end_row["date"]),
+        }
+    ]
+
+
+def _provider_metadata(provider: ProviderName) -> dict[str, Any]:
+    if provider != "codex_cli":
+        return {}
+    return {
+        "model": os.getenv("JUDGE_LLM_MODEL") or os.getenv("LLM_MODEL") or "gpt-5.5",
+        "reasoning_effort": os.getenv("CODEX_PROVIDER_REASONING_EFFORT")
+        or os.getenv("JUDGE_CODEX_REASONING_EFFORT")
+        or "xhigh",
+        "sandbox": os.getenv("CODEX_PROVIDER_SANDBOX", "read-only"),
+        "clean_profile": os.getenv("CODEX_PROVIDER_CLEAN", "1") in {"1", "true", "yes", "on"},
     }
 
 
@@ -457,15 +780,166 @@ def _write_step(run_root: Path, step: dict[str, Any]) -> None:
 def _append_event(run_root: Path, step: dict[str, Any]) -> None:
     event = {
         "actor": "backtest/walk_forward",
-        "event_type": "bt_step_scored",
+        "event_type": "bt_step_scored"
+        if step.get("status") == "scored"
+        else "bt_provider_error",
         "ticker": step["ticker"],
         "arm": step["arm"],
         "decision_date": step["decision_date"],
-        "mse": step["mse"],
+        "mse": step.get("mse"),
         "created_at": datetime.now(UTC).isoformat(),
     }
+    if step.get("provider_error"):
+        event["provider_error"] = step["provider_error"]
     with (run_root / "event_log.jsonl").open("a", encoding="utf-8") as file_obj:
         file_obj.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _build_codex_prompt_payload(
+    *,
+    ticker: str,
+    decision_date: date,
+    price_rows: pd.DataFrame,
+    feedback: list[dict[str, Any]],
+) -> dict[str, Any]:
+    latest_row = price_rows.iloc[-1]
+    return {
+        "schema": "gotra.bt.decision_prompt.v1",
+        "version": FULL_PROMPT_VERSION,
+        "ticker": ticker,
+        "decision_date": decision_date.isoformat(),
+        "horizon_days": WINDOW_DAYS,
+        "input_policy": {
+            "decision_inputs_available_on_or_before": decision_date.isoformat(),
+            "fundamentals_enabled": False,
+            "network_research_enabled": False,
+            "external_apis_enabled": False,
+        },
+        "framework": {
+            "F_partner": "Use only price-derived evidence included in this payload.",
+            "W_partner": "Use only price momentum and drawdown context included in this payload.",
+            "G_partner": "Use only price-history risk context included in this payload.",
+            "Chairman": "Reconcile F/W/G into one 30-day directional expected-change decision.",
+        },
+        "price_history": {
+            "rows_available": int(len(price_rows)),
+            "latest_date": str(latest_row["date"]),
+            "latest_adjusted_close": float(latest_row["adj_close"]),
+            "features": _price_features(price_rows),
+            "recent_adjusted_close": _compact_price_rows(price_rows),
+        },
+        "feedback": feedback,
+        "output_contract": {
+            "direction": "long|short|watch|avoid",
+            "expected_change_pct": "number",
+            "confidence": "number in [0, 1]",
+            "reasoning": "brief string",
+        },
+    }
+
+
+def _compact_price_rows(rows: pd.DataFrame, *, max_rows: int = 64) -> list[dict[str, Any]]:
+    compact = rows.tail(max_rows)[["date", "adj_close"]].copy()
+    return [
+        {
+            "date": str(row["date"]),
+            "adj_close": round(float(row["adj_close"]), 6),
+        }
+        for row in compact.to_dict("records")
+    ]
+
+
+def _completion_text_and_usage(completion: Any) -> tuple[str, int | None]:
+    if isinstance(completion, str):
+        return completion, None
+    if isinstance(completion, dict):
+        text = completion.get("content") or completion.get("text") or completion.get("message") or ""
+        return str(text), _usage_total_tokens(completion.get("usage"))
+    text = getattr(completion, "content", None) or getattr(completion, "text", None) or str(completion)
+    usage = getattr(completion, "usage", None)
+    return str(text), _usage_total_tokens(usage)
+
+
+def _usage_total_tokens(usage: Any) -> int | None:
+    if usage is None:
+        return None
+    if isinstance(usage, int | float):
+        return max(0, int(usage))
+    if isinstance(usage, dict):
+        for key in ("total_tokens", "total", "tokens"):
+            value = usage.get(key)
+            if isinstance(value, int | float):
+                return max(0, int(value))
+        input_tokens = usage.get("input_tokens") or usage.get("prompt_tokens")
+        output_tokens = usage.get("output_tokens") or usage.get("completion_tokens")
+        if isinstance(input_tokens, int | float) and isinstance(output_tokens, int | float):
+            return max(0, int(input_tokens) + int(output_tokens))
+    for attr in ("total_tokens", "total", "tokens"):
+        value = getattr(usage, attr, None)
+        if isinstance(value, int | float):
+            return max(0, int(value))
+    input_tokens = getattr(usage, "input_tokens", None) or getattr(usage, "prompt_tokens", None)
+    output_tokens = getattr(usage, "output_tokens", None) or getattr(
+        usage, "completion_tokens", None
+    )
+    if isinstance(input_tokens, int | float) and isinstance(output_tokens, int | float):
+        return max(0, int(input_tokens) + int(output_tokens))
+    return None
+
+
+def _parse_decision_json(text: str) -> dict[str, Any]:
+    payload = _load_json_object(text)
+    direction = _normalize_direction(payload.get("direction"))
+    expected_change_pct = float(payload["expected_change_pct"])
+    confidence = float(payload["confidence"])
+    if 1.0 < confidence <= 100.0:
+        confidence = confidence / 100.0
+    if not 0.0 <= confidence <= 1.0:
+        raise ValueError(f"confidence out of range: {confidence}")
+    reasoning = str(payload.get("reasoning") or "").strip()
+    if not reasoning:
+        raise ValueError("reasoning is required")
+    return {
+        "direction": direction,
+        "expected_change_pct": expected_change_pct,
+        "confidence": confidence,
+        "reasoning": reasoning,
+    }
+
+
+def _load_json_object(text: str) -> dict[str, Any]:
+    candidate = text.strip()
+    if candidate.startswith("```"):
+        candidate = candidate.strip("`").strip()
+        if candidate.lower().startswith("json"):
+            candidate = candidate[4:].strip()
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        start = candidate.find("{")
+        if start < 0:
+            raise
+        parsed, _end = decoder.raw_decode(candidate[start:])
+    if not isinstance(parsed, dict):
+        raise ValueError("provider response must be a JSON object")
+    return parsed
+
+
+def _normalize_direction(value: Any) -> str:
+    direction = str(value or "").strip().lower()
+    aliases = {
+        "buy": "long",
+        "bullish": "long",
+        "sell": "short",
+        "bearish": "short",
+        "hold": "watch",
+        "neutral": "watch",
+    }
+    direction = aliases.get(direction, direction)
+    if direction not in {"long", "short", "watch", "avoid"}:
+        raise ValueError(f"unsupported direction: {value!r}")
+    return direction
 
 
 def _price_features(rows: pd.DataFrame) -> dict[str, float]:
@@ -514,7 +988,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--data-dir", default="data/backtest")
     parser.add_argument("--run-id", default="")
     parser.add_argument("--mode", choices=["sampled", "full"], default="sampled")
-    parser.add_argument("--provider", choices=["heuristic"], default="heuristic")
+    parser.add_argument("--provider", choices=["heuristic", "codex_cli"], default="heuristic")
     parser.add_argument("--start", default=DEFAULT_START.isoformat())
     parser.add_argument("--end", default=DEFAULT_END.isoformat())
     parser.add_argument("--step-months", type=int, default=SAMPLED_STEP_MONTHS)

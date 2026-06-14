@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 from chairman.llm.narrative_generator import CodexCliClient
 
@@ -16,7 +17,7 @@ def test_build_judge_client_defaults_to_read_only_clean_codex(monkeypatch) -> No
 
     assert isinstance(client, CodexCliClient)
     assert client.model == "gpt-5.5"
-    assert client.project_root.name == "gotra"
+    assert client.project_root == Path.cwd()
     assert os.environ["CODEX_PROVIDER_REASONING_EFFORT"] == "xhigh"
     assert os.environ["CODEX_PROVIDER_SANDBOX"] == "read-only"
     assert os.environ["CODEX_PROVIDER_CLEAN"] == "1"
