@@ -16,6 +16,7 @@ class TokenBudget:
     spent_tokens: int = 0
     cache_hits: int = 0
     cache_misses: int = 0
+    over_budget_error: str = ""
 
     @classmethod
     def from_env(cls, explicit: int | None = None) -> TokenBudget:
@@ -26,7 +27,14 @@ class TokenBudget:
             return cls(max_tokens=None)
         return cls(max_tokens=int(value))
 
-    def charge(self, *, cache_key: str, estimated_tokens: int, cache_hit: bool) -> None:
+    def charge(
+        self,
+        *,
+        cache_key: str,
+        estimated_tokens: int,
+        cache_hit: bool,
+        allow_overage: bool = False,
+    ) -> None:
         del cache_key
         if cache_hit:
             self.cache_hits += 1
@@ -34,6 +42,12 @@ class TokenBudget:
         self.cache_misses += 1
         proposed = self.spent_tokens + max(0, int(estimated_tokens))
         if self.max_tokens is not None and proposed > self.max_tokens:
+            if allow_overage:
+                self.spent_tokens = proposed
+                self.over_budget_error = (
+                    f"BT token budget exceeded: proposed={proposed}, max={self.max_tokens}"
+                )
+                return
             raise BudgetExceeded(
                 f"BT token budget exceeded: proposed={proposed}, max={self.max_tokens}"
             )
@@ -48,12 +62,14 @@ class TokenBudget:
                 f"BT token budget exceeded: proposed={proposed}, max={self.max_tokens}"
             )
 
-    def snapshot(self) -> dict[str, int | None]:
+    def snapshot(self) -> dict[str, int | str | bool | None]:
         return {
             "max_tokens": self.max_tokens,
             "spent_tokens": self.spent_tokens,
             "cache_hits": self.cache_hits,
             "cache_misses": self.cache_misses,
+            "over_budget": bool(self.over_budget_error),
+            "over_budget_error": self.over_budget_error,
         }
 
 

@@ -14,6 +14,8 @@ from gotra.backtest.walk_forward import (
     DecisionCache,
     ProviderError,
     BacktestConfig,
+    _codex_jsonl_usage,
+    _last_agent_message_from_codex_jsonl,
     run_backtest,
 )
 import gotra.backtest.walk_forward as walk_forward
@@ -170,6 +172,39 @@ def test_codex_provider_returns_decision_and_bills_real_usage(tmp_path: Path) ->
     assert budget.snapshot()["spent_tokens"] == 1234
 
 
+def test_codex_provider_records_actual_usage_overage_after_paid_call(tmp_path: Path) -> None:
+    class FakeClient:
+        def complete(self, **_kwargs):
+            return {
+                "content": json.dumps(
+                    {
+                        "direction": "long",
+                        "expected_change_pct": 1.0,
+                        "confidence": 0.5,
+                        "reasoning": "Valid JSON.",
+                    }
+                ),
+                "usage": {"total_tokens": 2500},
+            }
+
+    budget = TokenBudget(max_tokens=2000)
+    decision = CodexDecisionProvider(client=FakeClient()).decide(
+        ticker="AAPL",
+        arm="baseline",
+        decision_date=date(2020, 1, 1),
+        price_rows=_price_rows(start="2019-01-01", days=370),
+        feedback=[],
+        cache=DecisionCache(tmp_path / "cache.json"),
+        budget=budget,
+    )
+
+    assert decision.estimated_tokens == 2500
+    assert budget.snapshot()["spent_tokens"] == 2500
+    assert budget.snapshot()["over_budget"] is True
+    assert "token budget exceeded" in str(budget.snapshot()["over_budget_error"]).lower()
+    assert json.loads((tmp_path / "cache.json").read_text(encoding="utf-8"))
+
+
 def test_codex_provider_retries_invalid_json(tmp_path: Path) -> None:
     class FakeClient:
         def __init__(self) -> None:
@@ -202,6 +237,40 @@ def test_codex_provider_retries_invalid_json(tmp_path: Path) -> None:
     assert decision.direction == "watch"
     assert decision.confidence == 0.55
     assert decision.token_usage_source == "estimated"
+
+
+def test_codex_jsonl_usage_parser_reads_turn_completed_usage() -> None:
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "t"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": '{"direction":"long"}'},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 18445,
+                        "cached_input_tokens": 4992,
+                        "output_tokens": 33,
+                        "reasoning_output_tokens": 22,
+                    },
+                }
+            ),
+        ]
+    )
+
+    assert _last_agent_message_from_codex_jsonl(stdout) == '{"direction":"long"}'
+    assert _codex_jsonl_usage(stdout) == {
+        "input_tokens": 18445,
+        "cached_input_tokens": 4992,
+        "output_tokens": 33,
+        "reasoning_output_tokens": 22,
+        "total_tokens": 18478,
+    }
 
 
 def test_codex_provider_cache_hit_does_not_call_or_bill_again(
