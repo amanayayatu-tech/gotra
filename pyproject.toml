@@ -1,0 +1,53 @@
+[project]
+name = "gotra"
+version = "0.1.0"
+description = "Autonomy, integration, and backtest layer for the Gotra research flywheel."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "jsonschema>=4.23,<4.26",
+    "ksana-researchos",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "pydantic>=2.7",
+    "python-dotenv>=1.0",
+    "python-telegram-bot>=21",
+    "PyYAML>=6.0",
+    "rpds-py<0.29",
+    "scipy>=1.13",
+    "statsmodels>=0.14",
+    "tenacity>=8.2",
+    "yfinance>=0.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.8",
+]
+
+[tool.uv]
+package = true
+default-groups = ["dev"]
+
+[tool.uv.sources]
+ksana-researchos = { path = "engine/ksana" }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["gotra", "integrations"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [
+    "engine/ksana",
+]

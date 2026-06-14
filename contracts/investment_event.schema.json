@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gotra.local/contracts/investment_event.schema.json",
+  "title": "Gotra Investment Event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "schema_version",
+    "event_type",
+    "occurred_at",
+    "source",
+    "source_id",
+    "payload",
+    "sha256"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "pattern": "^evt_[A-Za-z0-9_.:-]+$"
+    },
+    "schema_version": {
+      "type": "string",
+      "const": "investment_event.v1"
+    },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "investment_run_started",
+        "research_signal_created",
+        "research_prompt_created",
+        "research_prompt_filled",
+        "research_prompt_skipped",
+        "decision_case_created",
+        "outcome_snapshot_created"
+      ]
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source": {
+      "type": "string",
+      "const": "ksana_researchos"
+    },
+    "source_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "as_of_date": {
+      "type": "string",
+      "format": "date"
+    },
+    "market": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_artifact_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "replay": {
+      "type": "boolean",
+      "default": false
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}

@@ -1,0 +1,3 @@
+[submodule "engine/ksana"]
+	path = engine/ksana
+	url = https://github.com/amanayayatu-tech/ksana.git
