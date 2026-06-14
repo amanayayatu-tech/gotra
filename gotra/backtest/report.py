@@ -48,8 +48,8 @@ def _render_markdown(*, run_root: Path, summary: dict[str, Any], chart_path: Pat
         f"- sampled_validation_only: `{summary.get('sampled_validation_only')}`",
         "",
         "This report distinguishes correctness evidence from scientific hypothesis evidence. "
-        "A sampled run can validate plumbing, cache, budget, audit, and report paths, "
-        "but it cannot prove the preregistered H1/H2/H3 claims.",
+        "Sampled or max-step-limited runs can validate plumbing, cache, budget, audit, "
+        "and report paths, but they cannot prove the preregistered H1/H2/H3 claims.",
         "",
         "## Correctness Gates",
         "",
@@ -98,8 +98,8 @@ def _render_markdown(*, run_root: Path, summary: dict[str, Any], chart_path: Pat
             "",
             "## Hypotheses",
             "",
-            "Hypotheses are evaluated mechanically below, but sampled heuristic runs are not "
-            "scientific validation of the full preregistered claim.",
+            "Hypotheses are evaluated mechanically below, but sampled or max-step-limited runs "
+            "are not scientific validation of the full preregistered claim.",
             "",
         ]
     )
@@ -130,8 +130,8 @@ def _render_markdown(*, run_root: Path, summary: dict[str, Any], chart_path: Pat
             "interpretable as real forecasting skill.",
             "- Differential MSE is more useful than absolute MSE under shared inputs/provider, but it "
             "may still contain state-feedback leakage interactions.",
-            "- A sampled run is a BT-sampled correctness artifact, not a full monthly "
-            "10x10-year scientific result.",
+            "- A sampled or max-step-limited run is a correctness or calibration artifact, "
+            "not a full monthly 10x10-year scientific result.",
             "",
         ]
     )
