@@ -8,6 +8,7 @@ import pandas as pd
 
 from gotra.backtest.audit import audit_step
 from gotra.backtest.budget import TokenBudget
+from gotra.backtest.compare_runs import direction_agreement
 from gotra.backtest.protocol import TickerSpec, decision_dates
 from gotra.backtest.walk_forward import (
     CodexDecisionProvider,
@@ -329,6 +330,111 @@ def test_codex_provider_cache_hit_does_not_call_or_bill_again(
     assert budget.snapshot()["cache_hits"] == 1
 
 
+def test_cache_namespace_forces_independent_provider_replay(tmp_path: Path) -> None:
+    class FakeClient:
+        def __init__(self, direction: str) -> None:
+            self.direction = direction
+            self.calls = 0
+
+        def complete(self, **_kwargs):
+            self.calls += 1
+            return {
+                "content": json.dumps(
+                    {
+                        "direction": self.direction,
+                        "expected_change_pct": 1.0,
+                        "confidence": 0.5,
+                        "reasoning": "Valid JSON.",
+                    }
+                ),
+                "usage": {"total_tokens": 100},
+            }
+
+    cache_path = tmp_path / "cache.json"
+    kwargs = {
+        "ticker": "AAPL",
+        "arm": "baseline",
+        "decision_date": date(2020, 1, 1),
+        "price_rows": _price_rows(start="2019-01-01", days=370),
+        "feedback": [],
+    }
+    first_client = FakeClient("long")
+    second_client = FakeClient("short")
+
+    first = CodexDecisionProvider(client=first_client).decide(
+        **kwargs,
+        cache=DecisionCache(cache_path),
+        budget=TokenBudget(max_tokens=10_000),
+    )
+    second = CodexDecisionProvider(client=second_client).decide(
+        **kwargs,
+        cache=DecisionCache(cache_path, namespace="baseline-replay"),
+        budget=TokenBudget(max_tokens=10_000),
+    )
+
+    assert first.prompt_hash == second.prompt_hash
+    assert first.direction == "long"
+    assert second.direction == "short"
+    assert first.cache_hit is False
+    assert second.cache_hit is False
+    assert first_client.calls == 1
+    assert second_client.calls == 1
+
+
+def test_backtest_can_run_baseline_arm_only(tmp_path: Path) -> None:
+    _write_prices(tmp_path / "prices", "AAPL", start="2016-01-01", days=470)
+
+    summary = run_backtest(
+        BacktestConfig(
+            data_dir=tmp_path,
+            run_id="baseline_only",
+            mode="sampled",
+            provider="heuristic",
+            start=date(2016, 1, 1),
+            end=date(2017, 1, 1),
+            step_months=3,
+            tickers=(TickerSpec("AAPL", "Apple", date(1980, 12, 12)),),
+            token_budget=10_000,
+            arms=("baseline",),
+            cache_namespace="baseline-replay",
+        )
+    )
+
+    run_root = tmp_path / "runs" / "baseline_only"
+    assert summary["arms"] == ["baseline"]
+    assert summary["cache_namespace"] == "baseline-replay"
+    assert summary["steps_written"] == 1
+    assert summary["metrics"]["paired_steps"] == 0
+    assert len(list((run_root / "baseline").glob("step_*.json"))) == 1
+    assert not (run_root / "alaya").exists()
+
+
+def test_direction_agreement_compares_baseline_replay_runs(tmp_path: Path) -> None:
+    reference = tmp_path / "reference"
+    candidate = tmp_path / "candidate"
+    (reference / "baseline").mkdir(parents=True)
+    (candidate / "baseline").mkdir(parents=True)
+    _write_step_json(reference / "baseline" / "step_2020-01-01_aapl.json", "AAPL", "2020-01-01", "long")
+    _write_step_json(candidate / "baseline" / "step_2020-01-01_aapl.json", "AAPL", "2020-01-01", "long")
+    _write_step_json(reference / "baseline" / "step_2020-02-01_msft.json", "MSFT", "2020-02-01", "watch")
+    _write_step_json(candidate / "baseline" / "step_2020-02-01_msft.json", "MSFT", "2020-02-01", "avoid")
+
+    result = direction_agreement(reference_run=reference, candidate_run=candidate)
+
+    assert result["same"] == 1
+    assert result["total"] == 2
+    assert result["rate"] == 0.5
+    assert result["mismatches"] == [
+        {
+            "ticker": "MSFT",
+            "decision_date": "2020-02-01",
+            "reference_direction": "watch",
+            "candidate_direction": "avoid",
+            "reason": "direction_mismatch",
+        }
+    ]
+
+
 def test_codex_provider_prompt_skeleton_differs_only_by_feedback(tmp_path: Path) -> None:
     class FakeClient:
         def __init__(self) -> None:
@@ -457,3 +563,17 @@ def _price_rows(*, start: str, days: int) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def _write_step_json(path: Path, ticker: str, decision_date: str, direction: str) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "status": "scored",
+                "ticker": ticker,
+                "decision_date": decision_date,
+                "decision_direction": direction,
+            }
+        ),
+        encoding="utf-8",
+    )

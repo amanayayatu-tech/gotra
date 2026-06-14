@@ -32,6 +32,8 @@ def write_backtest_report(
 
 
 def _render_markdown(*, run_root: Path, summary: dict[str, Any], chart_path: Path) -> str:
+    arms = summary.get("arms") or ["baseline", "alaya"]
+    cache_namespace = summary.get("cache_namespace") or ""
     lines = [
         "# Phase BT Backtest Report",
         "",
@@ -45,6 +47,8 @@ def _render_markdown(*, run_root: Path, summary: dict[str, Any], chart_path: Pat
         f"- provider: `{summary.get('provider')}`",
         f"- provider_metadata: `{json.dumps(summary.get('provider_metadata'), sort_keys=True)}`",
         f"- step_months: `{summary.get('step_months')}`",
+        f"- arms: `{json.dumps(arms, sort_keys=True)}`",
+        f"- cache_namespace: `{cache_namespace}`",
         f"- sampled_validation_only: `{summary.get('sampled_validation_only')}`",
         "",
         "This report distinguishes correctness evidence from scientific hypothesis evidence. "
