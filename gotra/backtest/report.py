@@ -43,11 +43,12 @@ def _render_markdown(*, run_root: Path, summary: dict[str, Any], chart_path: Pat
         "",
         f"- mode: `{summary.get('mode')}`",
         f"- provider: `{summary.get('provider')}`",
+        f"- provider_metadata: `{json.dumps(summary.get('provider_metadata'), sort_keys=True)}`",
         f"- step_months: `{summary.get('step_months')}`",
         f"- sampled_validation_only: `{summary.get('sampled_validation_only')}`",
         "",
         "This report distinguishes correctness evidence from scientific hypothesis evidence. "
-        "A sampled heuristic run can validate plumbing, cache, budget, audit, and report paths, "
+        "A sampled run can validate plumbing, cache, budget, audit, and report paths, "
         "but it cannot prove the preregistered H1/H2/H3 claims.",
         "",
         "## Correctness Gates",
@@ -59,6 +60,7 @@ def _render_markdown(*, run_root: Path, summary: dict[str, Any], chart_path: Pat
         [
             f"- system_health_status: `{system_health.get('status')}`",
             f"- system_health_paused: `{system_health.get('paused')}`",
+            f"- provider_errors: `{system_health.get('provider_errors')}`",
             f"- zero_future_function_audit: `{audit.get('ok')}`",
             f"- steps_checked: `{audit.get('steps_checked')}`",
             f"- event_rows_checked: `{audit.get('event_rows_checked')}`",
@@ -70,6 +72,12 @@ def _render_markdown(*, run_root: Path, summary: dict[str, Any], chart_path: Pat
             "",
         ]
     )
+    if system_health.get("alerts"):
+        lines.append("### System Health Alerts")
+        lines.append("")
+        for alert in system_health["alerts"]:
+            lines.append(f"- {alert}")
+        lines.append("")
     if audit.get("violations"):
         lines.append("### Audit Violations")
         lines.append("")
@@ -122,7 +130,7 @@ def _render_markdown(*, run_root: Path, summary: dict[str, Any], chart_path: Pat
             "interpretable as real forecasting skill.",
             "- Differential MSE is more useful than absolute MSE under shared inputs/provider, but it "
             "may still contain state-feedback leakage interactions.",
-            "- A sampled heuristic run is a BT-sampled correctness artifact, not a full monthly "
+            "- A sampled run is a BT-sampled correctness artifact, not a full monthly "
             "10x10-year scientific result.",
             "",
         ]
