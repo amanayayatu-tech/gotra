@@ -7,7 +7,7 @@ from jsonschema import Draft202012Validator
 
 
 ROOT = Path(__file__).resolve().parents[1]
-KSANA_PIN = "8e1f1b9ca90933abb59d7874a12269dc3297b66d"
+KSANA_PIN = "de7f05bd302d823b5d4992321480224de4b0391f"
 
 
 def test_phase0_packages_import() -> None:
