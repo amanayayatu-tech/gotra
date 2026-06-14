@@ -5,6 +5,7 @@ validation-logs/
 
 data/backtest/prices/
 data/backtest/runs/
+data/backtest/REPORT_backtest*
 data/reports/
 data/exports/
 !data/
