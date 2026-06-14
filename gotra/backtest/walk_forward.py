@@ -72,6 +72,8 @@ class BacktestConfig:
     window_days: int = WINDOW_DAYS
     token_budget: int | None = None
     max_steps: int | None = None
+    arms: tuple[Arm, ...] = ("baseline", "alaya")
+    cache_namespace: str = ""
 
 
 @dataclass(frozen=True)
@@ -132,18 +134,24 @@ class ProviderError(RuntimeError):
 
 
 class DecisionCache:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, namespace: str = "") -> None:
         self.path = path
+        self.namespace = namespace.strip()
         self.values = self._load()
 
     def get(self, key: str) -> dict[str, Any] | None:
-        value = self.values.get(key)
+        value = self.values.get(self._key(key))
         return dict(value) if isinstance(value, dict) else None
 
     def set(self, key: str, value: dict[str, Any]) -> None:
-        self.values[key] = value
+        self.values[self._key(key)] = value
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.values, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _key(self, key: str) -> str:
+        if not self.namespace:
+            return key
+        return f"{self.namespace}:{key}"
 
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -442,10 +450,13 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
     run_id = config.run_id or datetime.now(UTC).strftime("bt_%Y%m%dT%H%M%SZ")
     run_root = config.data_dir / "runs" / run_id
     run_root.mkdir(parents=True, exist_ok=True)
-    for arm in ("baseline", "alaya"):
+    for arm in config.arms:
         (run_root / arm).mkdir(parents=True, exist_ok=True)
 
-    cache = DecisionCache(config.data_dir / "runs" / "decision_cache.json")
+    cache = DecisionCache(
+        config.data_dir / "runs" / "decision_cache.json",
+        namespace=config.cache_namespace,
+    )
     budget = TokenBudget.from_env(config.token_budget)
     provider = _build_provider(config.provider)
     steps: list[dict[str, Any]] = []
@@ -506,6 +517,8 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
         "end": config.end.isoformat(),
         "step_months": config.step_months,
         "tickers": [ticker.symbol for ticker in config.tickers],
+        "arms": list(config.arms),
+        "cache_namespace": config.cache_namespace,
         "window_days": config.window_days,
         "steps_written": len(steps),
         "skipped": skipped,
@@ -620,7 +633,7 @@ def _run_ticker_step(
         for item in feedback_by_ticker.get(ticker.symbol, [])
         if parse_date(item["outcome_availability_date"]) <= decision_date
     ]
-    for arm in ("baseline", "alaya"):
+    for arm in config.arms:
         actual_change = _change_pct(float(start_row["adj_close"]), float(end_row["adj_close"]))
         try:
             decision = provider.decide(
@@ -751,6 +764,7 @@ def _build_step(
         "estimated_tokens": decision.estimated_tokens,
         "token_usage_source": decision.token_usage_source,
         "cache_hit": decision.cache_hit,
+        "cache_namespace": config.cache_namespace,
         "provider": config.provider,
         "provider_metadata": _provider_metadata(config.provider),
         "provider_network_enabled": provider.network_enabled,
@@ -802,6 +816,7 @@ def _build_provider_error_step(
         "estimated_tokens": estimated_tokens,
         "token_usage_source": "estimated",
         "cache_hit": False,
+        "cache_namespace": config.cache_namespace,
         "provider": config.provider,
         "provider_metadata": _provider_metadata(config.provider),
         "provider_network_enabled": provider.network_enabled,
@@ -1135,6 +1150,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--window-days", type=int, default=WINDOW_DAYS)
     parser.add_argument("--token-budget", type=int)
     parser.add_argument("--max-steps", type=int)
+    parser.add_argument(
+        "--arms",
+        default="baseline,alaya",
+        help="Comma-separated arms to run: baseline, alaya, or both. Default: baseline,alaya.",
+    )
+    parser.add_argument(
+        "--cache-namespace",
+        default="",
+        help="Optional cache namespace for independent provider replays without changing prompts.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1154,6 +1179,8 @@ def main(argv: list[str] | None = None) -> int:
             window_days=args.window_days,
             token_budget=args.token_budget,
             max_steps=args.max_steps,
+            arms=_parse_arms(args.arms),
+            cache_namespace=args.cache_namespace,
         )
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
@@ -1162,6 +1189,20 @@ def main(argv: list[str] | None = None) -> int:
     if not (summary.get("audit") or {}).get("ok"):
         return 1
     return 0
+
+
+def _parse_arms(value: str) -> tuple[Arm, ...]:
+    raw = [item.strip().lower() for item in value.split(",") if item.strip()]
+    if not raw:
+        raise ValueError("--arms must include at least one arm")
+    seen: list[Arm] = []
+    for item in raw:
+        if item not in {"baseline", "alaya"}:
+            raise ValueError(f"unsupported arm: {item!r}")
+        arm = item  # type: ignore[assignment]
+        if arm not in seen:
+            seen.append(arm)
+    return tuple(seen)
 
 
 if __name__ == "__main__":
