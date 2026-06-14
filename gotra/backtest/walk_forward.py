@@ -74,6 +74,9 @@ class BacktestConfig:
     max_steps: int | None = None
     arms: tuple[Arm, ...] = ("baseline", "alaya")
     cache_namespace: str = ""
+    provider_preflight: bool = True
+    provider_error_abort_consecutive: int = 8
+    provider_error_abort_rate: float = 0.10
 
 
 @dataclass(frozen=True)
@@ -261,6 +264,21 @@ class CodexDecisionProvider:
         self.client = client
         self.max_retries = max_retries
 
+    def preflight(self) -> None:
+        """Verify the Codex provider path before the expensive walk-forward loop."""
+
+        completion = self._client().complete(
+            system_prompt="Return strict JSON only.",
+            user_prompt='Return exactly {"ok": true}.',
+            max_tokens=32,
+            timeout_seconds=120,
+            temperature=0.0,
+        )
+        text, _provider_tokens = _completion_text_and_usage(completion)
+        payload = json.loads(text)
+        if payload != {"ok": True}:
+            raise ProviderError(f"codex_cli preflight returned unexpected payload: {text}")
+
     def decide(
         self,
         *,
@@ -381,6 +399,7 @@ class CodexCliUsageClient:
             codex_provider_clean_enabled,
             codex_provider_reasoning_effort,
             codex_provider_sandbox,
+            codex_provider_subprocess_env,
             looks_like_codex_login_error,
         )
 
@@ -415,19 +434,21 @@ class CodexCliUsageClient:
                 command.extend(["--model", self.model])
             command.append(prompt)
 
-            try:
-                completed = subprocess.run(
-                    command,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_seconds,
-                    check=False,
-                    cwd=self.project_root,
-                )
-            except FileNotFoundError as exc:
-                raise LLMError("codex CLI is not installed or not on PATH") from exc
-            except subprocess.TimeoutExpired as exc:
-                raise LLMTimeout(str(exc)) from exc
+            with codex_provider_subprocess_env() as provider_env:
+                try:
+                    completed = subprocess.run(
+                        command,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout_seconds,
+                        check=False,
+                        cwd=self.project_root,
+                        env=provider_env,
+                    )
+                except FileNotFoundError as exc:
+                    raise LLMError("codex CLI is not installed or not on PATH") from exc
+                except subprocess.TimeoutExpired as exc:
+                    raise LLMTimeout(str(exc)) from exc
 
             stdout = completed.stdout or ""
             stderr = completed.stderr or ""
@@ -463,13 +484,32 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
     feedback_by_ticker: dict[str, list[dict[str, Any]]] = {}
     skipped: list[dict[str, Any]] = []
     budget_error = ""
+    provider_abort_reason = ""
+    provider_health = _provider_health_initial_state(
+        config=config,
+        provider=provider,
+        budget=budget,
+    )
+    consecutive_provider_errors = 0
 
     try:
+        if provider_health["preflight_enabled"]:
+            try:
+                preflight = getattr(provider, "preflight")
+                preflight()
+                provider_health["preflight_ok"] = True
+            except Exception as exc:  # noqa: BLE001 - provider path is external.
+                provider_health["preflight_ok"] = False
+                provider_health["preflight_error"] = str(exc)
+                provider_abort_reason = f"provider preflight failed: {exc}"
+
         for decision_date in decision_dates(
             start=config.start,
             end=config.end,
             step_months=config.step_months,
         ):
+            if provider_abort_reason:
+                break
             for ticker in config.tickers:
                 if config.max_steps is not None and len(steps) >= config.max_steps:
                     break
@@ -483,8 +523,23 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
                     feedback_by_ticker=feedback_by_ticker,
                     run_root=run_root,
                     skipped=skipped,
+                    next_step_index=len(steps) + 1,
                 )
                 steps.extend(ticker_steps)
+                for step in ticker_steps:
+                    if step.get("status") == "provider_error":
+                        consecutive_provider_errors += 1
+                    else:
+                        consecutive_provider_errors = 0
+                provider_abort_reason = _provider_abort_reason(
+                    config=config,
+                    provider=provider,
+                    steps=steps,
+                    consecutive_provider_errors=consecutive_provider_errors,
+                )
+                if provider_abort_reason:
+                    provider_health["abort_reason"] = provider_abort_reason
+                    break
                 if budget.over_budget_error:
                     raise BudgetExceeded(budget.over_budget_error)
             if config.max_steps is not None and len(steps) >= config.max_steps:
@@ -500,6 +555,7 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
         budget_error=budget_error,
         audit_ok=audit.ok,
         provider_errors=provider_errors,
+        provider_abort_reason=provider_abort_reason,
         run_mode=config.mode,
         provider=config.provider,
     )
@@ -524,6 +580,9 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
         "skipped": skipped,
         "paused": bool(budget_error),
         "pause_reason": budget_error,
+        "aborted_provider_unhealthy": bool(provider_abort_reason),
+        "provider_abort_reason": provider_abort_reason,
+        "provider_health": provider_health,
         "price_cache_network_after_cache": False,
         "perplexity_disabled": True,
         "provider_errors": provider_errors,
@@ -567,20 +626,32 @@ def _build_system_health(
     budget_error: str,
     audit_ok: bool,
     provider_errors: int,
+    provider_abort_reason: str,
     run_mode: RunMode,
     provider: ProviderName,
 ) -> dict[str, Any]:
     alerts: list[str] = []
     if budget_error:
         alerts.append(budget_error)
+    if provider_abort_reason:
+        alerts.append(provider_abort_reason)
     if not audit_ok and not budget_error:
         alerts.append("future-function audit failed")
     if provider_errors:
         alerts.append(f"provider_error steps: {provider_errors}")
+    status = "ok"
+    if budget_error:
+        status = "paused"
+    elif provider_abort_reason:
+        status = "aborted_provider_unhealthy"
+    elif not audit_ok or provider_errors:
+        status = "failed"
     return {
-        "status": "paused" if budget_error else "failed" if (not audit_ok or provider_errors) else "ok",
+        "status": status,
         "paused": bool(budget_error),
         "pause_reason": budget_error,
+        "aborted_provider_unhealthy": bool(provider_abort_reason),
+        "provider_abort_reason": provider_abort_reason,
         "alerts": alerts,
         "run_mode": run_mode,
         "provider": provider,
@@ -588,6 +659,59 @@ def _build_system_health(
         "sampled_validation_only": run_mode == "sampled" or provider == "heuristic",
         "token_budget": budget.snapshot(),
     }
+
+
+def _provider_health_initial_state(
+    *,
+    config: BacktestConfig,
+    provider: DecisionProvider,
+    budget: TokenBudget,
+) -> dict[str, Any]:
+    enough_budget_for_preflight = budget.max_tokens is None or budget.max_tokens >= 50_000
+    preflight_enabled = (
+        config.provider == "codex_cli"
+        and config.provider_preflight
+        and enough_budget_for_preflight
+        and hasattr(provider, "preflight")
+    )
+    return {
+        "preflight_enabled": preflight_enabled,
+        "preflight_ok": None,
+        "preflight_error": "",
+        "abort_reason": "",
+        "error_abort_consecutive": config.provider_error_abort_consecutive,
+        "error_abort_rate": config.provider_error_abort_rate,
+    }
+
+
+def _provider_abort_reason(
+    *,
+    config: BacktestConfig,
+    provider: DecisionProvider,
+    steps: list[dict[str, Any]],
+    consecutive_provider_errors: int,
+) -> str:
+    if config.provider != "codex_cli":
+        return ""
+    if (
+        config.provider_error_abort_consecutive > 0
+        and consecutive_provider_errors >= config.provider_error_abort_consecutive
+    ):
+        return (
+            "provider unhealthy: "
+            f"{consecutive_provider_errors} consecutive provider_error steps"
+        )
+
+    if len(steps) < max(config.provider_error_abort_consecutive, 20):
+        return ""
+    provider_errors = sum(1 for step in steps if step.get("status") == "provider_error")
+    error_rate = provider_errors / len(steps)
+    if config.provider_error_abort_rate > 0 and error_rate > config.provider_error_abort_rate:
+        return (
+            "provider unhealthy: "
+            f"provider_error rate {error_rate:.2%} exceeds {config.provider_error_abort_rate:.2%}"
+        )
+    return ""
 
 
 def _run_ticker_step(
@@ -601,6 +725,7 @@ def _run_ticker_step(
     feedback_by_ticker: dict[str, list[dict[str, Any]]],
     run_root: Path,
     skipped: list[dict[str, Any]],
+    next_step_index: int,
 ) -> list[dict[str, Any]]:
     if decision_date < ticker.listing_date:
         skipped.append(
@@ -649,6 +774,7 @@ def _run_ticker_step(
             raise
         except ProviderError as exc:
             step = _build_provider_error_step(
+                step_index=next_step_index + len(steps),
                 ticker=ticker,
                 arm=arm,  # type: ignore[arg-type]
                 decision_date=decision_date,
@@ -670,6 +796,7 @@ def _run_ticker_step(
             continue
         except Exception as exc:  # noqa: BLE001 - preserve the failing step for audit.
             step = _build_provider_error_step(
+                step_index=next_step_index + len(steps),
                 ticker=ticker,
                 arm=arm,  # type: ignore[arg-type]
                 decision_date=decision_date,
@@ -692,6 +819,7 @@ def _run_ticker_step(
         error = round(actual_change - decision.expected_change_pct, 6)
         mse = round(error * error, 6)
         step = _build_step(
+            step_index=next_step_index + len(steps),
             ticker=ticker,
             arm=arm,  # type: ignore[arg-type]
             decision_date=decision_date,
@@ -727,6 +855,7 @@ def _run_ticker_step(
 
 def _build_step(
     *,
+    step_index: int,
     ticker: TickerSpec,
     arm: Arm,
     decision_date: date,
@@ -744,6 +873,8 @@ def _build_step(
 ) -> dict[str, Any]:
     return {
         "schema": "gotra.bt.step.v1",
+        "step": step_index,
+        "date": decision_date.isoformat(),
         "run_mode": config.mode,
         "status": "scored",
         "ticker": ticker.symbol,
@@ -778,6 +909,7 @@ def _build_step(
 
 def _build_provider_error_step(
     *,
+    step_index: int,
     ticker: TickerSpec,
     arm: Arm,
     decision_date: date,
@@ -796,6 +928,9 @@ def _build_provider_error_step(
     del start_row
     return {
         "schema": "gotra.bt.step.v1",
+        "step": step_index,
+        "date": decision_date.isoformat(),
+        "error_type": "provider_error",
         "run_mode": config.mode,
         "status": "provider_error",
         "ticker": ticker.symbol,
@@ -1186,6 +1321,8 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     if summary.get("paused"):
         return 2
+    if (summary.get("system_health") or {}).get("status") != "ok":
+        return 1
     if not (summary.get("audit") or {}).get("ok"):
         return 1
     return 0

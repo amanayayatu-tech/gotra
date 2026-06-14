@@ -11,6 +11,7 @@ from gotra.backtest.budget import TokenBudget
 from gotra.backtest.compare_runs import direction_agreement
 from gotra.backtest.protocol import TickerSpec, decision_dates
 from gotra.backtest.walk_forward import (
+    CodexCliUsageClient,
     CodexDecisionProvider,
     DecisionCache,
     ProviderError,
@@ -278,6 +279,56 @@ def test_codex_jsonl_usage_parser_reads_turn_completed_usage() -> None:
     }
 
 
+def test_codex_usage_client_uses_clean_codex_home(monkeypatch, tmp_path: Path) -> None:
+    source_home = tmp_path / "source-codex"
+    source_home.mkdir()
+    (source_home / "auth.json").write_text('{"token":"test"}', encoding="utf-8")
+    (source_home / "skills").mkdir()
+    (source_home / "skills" / "bad").mkdir()
+    calls = []
+
+    class BaseClient:
+        model = "gpt-5.5"
+        project_root = tmp_path
+        codex_binary = "codex"
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        clean_home = Path(kwargs["env"]["CODEX_HOME"])
+        assert clean_home != source_home
+        assert (clean_home / "auth.json").exists()
+        assert not list((clean_home / "skills").iterdir())
+        output_path = command[command.index("--output-last-message") + 1]
+        Path(output_path).write_text('{"direction":"long"}', encoding="utf-8")
+        stdout = "\n".join(
+            [
+                json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "{}"}}),
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 2}}),
+            ]
+        )
+        return walk_forward.subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    monkeypatch.setenv("CODEX_PROVIDER_CLEAN", "1")
+    monkeypatch.setenv("CODEX_PROVIDER_SANDBOX", "read-only")
+    monkeypatch.setattr(walk_forward.shutil, "which", lambda _: "/usr/local/bin/codex")
+    monkeypatch.setattr(walk_forward.subprocess, "run", fake_run)
+
+    result = CodexCliUsageClient(BaseClient()).complete(
+        system_prompt="Return JSON.",
+        user_prompt="{}",
+        max_tokens=20,
+        timeout_seconds=10,
+        temperature=0,
+    )
+
+    command, kwargs = calls[0]
+    assert command[command.index("exec") + 1] == "--ignore-user-config"
+    assert command[command.index("--sandbox") + 1] == "read-only"
+    assert kwargs["env"]["CODEX_HOME"] != str(source_home)
+    assert result["usage"]["total_tokens"] == 12
+
+
 def test_codex_provider_cache_hit_does_not_call_or_bill_again(
     tmp_path: Path,
     monkeypatch,
@@ -522,8 +573,87 @@ def test_provider_error_steps_are_written_and_counted(tmp_path: Path, monkeypatc
     assert summary["system_health"]["status"] == "failed"
     assert summary["audit"]["ok"] is True
     assert step["status"] == "provider_error"
+    assert step["step"] == 1
+    assert step["date"] == "2017-01-01"
+    assert step["error_type"] == "provider_error"
     assert step["provider_error"] == "bad provider json"
     assert step["audit_actor"] == "backtest/walk_forward"
+
+
+def test_codex_provider_preflight_failure_aborts_before_main_loop(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _write_prices(tmp_path / "prices", "AAPL", start="2016-01-01", days=470)
+
+    class UnhealthyProvider:
+        network_enabled = True
+
+        def preflight(self):
+            raise ProviderError("failed to load skill invalid YAML")
+
+        def decide(self, **_kwargs):
+            raise AssertionError("main loop should not call provider after failed preflight")
+
+    monkeypatch.setattr(walk_forward, "_build_provider", lambda _name: UnhealthyProvider())
+    summary = run_backtest(
+        BacktestConfig(
+            data_dir=tmp_path,
+            run_id="preflight_abort_test",
+            mode="sampled",
+            provider="codex_cli",
+            start=date(2016, 1, 1),
+            end=date(2017, 1, 1),
+            step_months=3,
+            tickers=(TickerSpec("AAPL", "Apple", date(1980, 12, 12)),),
+            token_budget=50_000,
+        )
+    )
+
+    assert summary["steps_written"] == 0
+    assert summary["provider_errors"] == 0
+    assert summary["aborted_provider_unhealthy"] is True
+    assert summary["provider_health"]["preflight_ok"] is False
+    assert "failed to load skill" in summary["provider_health"]["preflight_error"]
+    assert summary["system_health"]["status"] == "aborted_provider_unhealthy"
+    assert (tmp_path / "runs" / "preflight_abort_test" / "summary.json").exists()
+
+
+def test_codex_provider_error_fuse_aborts_after_consecutive_failures(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _write_prices(tmp_path / "prices", "AAPL", start="2016-01-01", days=760)
+
+    class FailingProvider:
+        network_enabled = True
+
+        def preflight(self):
+            return None
+
+        def decide(self, **_kwargs):
+            raise ProviderError("provider quota exhausted")
+
+    monkeypatch.setattr(walk_forward, "_build_provider", lambda _name: FailingProvider())
+    summary = run_backtest(
+        BacktestConfig(
+            data_dir=tmp_path,
+            run_id="provider_fuse_test",
+            mode="sampled",
+            provider="codex_cli",
+            start=date(2016, 1, 1),
+            end=date(2017, 10, 1),
+            step_months=3,
+            tickers=(TickerSpec("AAPL", "Apple", date(1980, 12, 12)),),
+            token_budget=50_000,
+        )
+    )
+
+    assert summary["steps_written"] == 8
+    assert summary["provider_errors"] == 8
+    assert summary["aborted_provider_unhealthy"] is True
+    assert "8 consecutive provider_error" in summary["provider_abort_reason"]
+    assert summary["system_health"]["status"] == "aborted_provider_unhealthy"
 
 
 def _write_prices(price_dir: Path, ticker: str, *, start: str, days: int) -> None:
