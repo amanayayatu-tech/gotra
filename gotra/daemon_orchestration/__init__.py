@@ -1,1 +1,1 @@
-"""Daemon orchestration scaffolding for later gotra phases."""
+"""Gotra daemon orchestration package."""
