@@ -40,7 +40,7 @@ from gotra.backtest.statistics import summarize_steps
 
 
 Arm = Literal["baseline", "alaya"]
-ProviderName = Literal["heuristic", "codex_cli"]
+ProviderName = Literal["heuristic", "codex_cli", "codex_responses"]
 RunMode = Literal["sampled", "full"]
 LedgerBackend = Literal["json", "sqlite"]
 ParallelMode = Literal["off", "baseline", "ticker-chains", "both"]
@@ -274,9 +274,11 @@ class CodexDecisionProvider:
         *,
         client: CompletionClient | None = None,
         max_retries: int = 2,
+        provider_name: ProviderName = "codex_cli",
     ) -> None:
         self.client = client
         self.max_retries = max_retries
+        self.provider_name = provider_name
 
     def preflight(self) -> None:
         """Verify the Codex provider path before the expensive walk-forward loop."""
@@ -291,7 +293,7 @@ class CodexDecisionProvider:
         text, _provider_tokens = _completion_text_and_usage(completion)
         payload = json.loads(text)
         if payload != {"ok": True}:
-            raise ProviderError(f"codex_cli preflight returned unexpected payload: {text}")
+            raise ProviderError(f"{self.provider_name} preflight returned unexpected payload: {text}")
 
     def decide(
         self,
@@ -313,7 +315,7 @@ class CodexDecisionProvider:
         prompt = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True, indent=2)
         prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         cache_key = (
-            f"{ticker}:{decision_date.isoformat()}:{arm}:codex_cli:"
+            f"{ticker}:{decision_date.isoformat()}:{arm}:{self.provider_name}:"
             f"{FULL_PROMPT_VERSION}:{prompt_hash}"
         )
         cached = cache.get(cache_key)
@@ -378,7 +380,7 @@ class CodexDecisionProvider:
             except Exception as exc:  # noqa: BLE001 - provider output is untrusted by design.
                 last_error = str(exc)
         raise ProviderError(
-            f"codex_cli provider failed after {self.max_retries + 1} attempts: {last_error}",
+            f"{self.provider_name} provider failed after {self.max_retries + 1} attempts: {last_error}",
             prompt_hash=prompt_hash,
             estimated_tokens=token_estimate,
         )
@@ -980,7 +982,14 @@ def _build_provider(name: ProviderName) -> DecisionProvider:
     if name == "heuristic":
         return HeuristicDecisionProvider()
     if name == "codex_cli":
-        return CodexDecisionProvider()
+        return CodexDecisionProvider(provider_name="codex_cli")
+    if name == "codex_responses":
+        from gotra.backtest.codex_responses_client import CodexResponsesCompletionClient
+
+        return CodexDecisionProvider(
+            client=CodexResponsesCompletionClient(),
+            provider_name="codex_responses",
+        )
     raise ValueError(f"unsupported BT provider: {name}")
 
 
@@ -1045,7 +1054,7 @@ def _provider_health_initial_state(
 ) -> dict[str, Any]:
     enough_budget_for_preflight = budget.max_tokens is None or budget.max_tokens >= 50_000
     preflight_enabled = (
-        config.provider == "codex_cli"
+        config.provider in {"codex_cli", "codex_responses"}
         and config.provider_preflight
         and enough_budget_for_preflight
         and hasattr(provider, "preflight")
@@ -1067,7 +1076,7 @@ def _provider_abort_reason(
     steps: list[dict[str, Any]],
     consecutive_provider_errors: int,
 ) -> str:
-    if config.provider != "codex_cli":
+    if config.provider not in {"codex_cli", "codex_responses"}:
         return ""
     if (
         config.provider_error_abort_consecutive > 0
@@ -1378,8 +1387,20 @@ def _outcome_inputs(end_row: pd.Series) -> list[dict[str, Any]]:
 
 
 def _provider_metadata(provider: ProviderName) -> dict[str, Any]:
-    if provider != "codex_cli":
+    if provider == "heuristic":
         return {}
+    if provider == "codex_responses":
+        from gotra.backtest.codex_responses_client import DEFAULT_CODEX_RESPONSES_BASE_URL
+
+        return {
+            "model": os.getenv("JUDGE_LLM_MODEL") or os.getenv("LLM_MODEL") or "gpt-5.5",
+            "reasoning_effort": os.getenv("CODEX_PROVIDER_REASONING_EFFORT")
+            or os.getenv("JUDGE_CODEX_REASONING_EFFORT")
+            or "xhigh",
+            "transport": "codex_responses",
+            "base_url": os.getenv("CODEX_RESPONSES_BASE_URL") or DEFAULT_CODEX_RESPONSES_BASE_URL,
+            "auth_source": os.getenv("CODEX_AUTH_JSON") or "~/.codex/auth.json",
+        }
     return {
         "model": os.getenv("JUDGE_LLM_MODEL") or os.getenv("LLM_MODEL") or "gpt-5.5",
         "reasoning_effort": os.getenv("CODEX_PROVIDER_REASONING_EFFORT")
@@ -1420,6 +1441,18 @@ def _provider_determinism_metadata(
                 "approved Codex CLI route does not expose reliable temperature, top_p, "
                 "or seed controls for preregistered baseline replay acceptance"
             ),
+        }
+    if provider == "codex_responses":
+        return {
+            "provider": provider,
+            "required_for_stage3": require_stage3_provider,
+            "stage3_acceptance_eligible": True,
+            "temperature_control": "supported",
+            "top_p_control": False,
+            "seed_control": False,
+            "acceptance_metric": "direction_agreement>=0.95",
+            "bit_level_reproducible": False,
+            "blocking_reason": "",
         }
     raise ValueError(f"unsupported BT provider: {provider}")
 
@@ -1708,7 +1741,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--data-dir", default="data/backtest")
     parser.add_argument("--run-id", default="")
     parser.add_argument("--mode", choices=["sampled", "full"], default="sampled")
-    parser.add_argument("--provider", choices=["heuristic", "codex_cli"], default="heuristic")
+    parser.add_argument(
+        "--provider",
+        choices=["heuristic", "codex_cli", "codex_responses"],
+        default="heuristic",
+    )
     parser.add_argument("--start", default=DEFAULT_START.isoformat())
     parser.add_argument("--end", default=DEFAULT_END.isoformat())
     parser.add_argument("--step-months", type=int, default=SAMPLED_STEP_MONTHS)

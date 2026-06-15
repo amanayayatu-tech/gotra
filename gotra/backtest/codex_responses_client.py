@@ -1,0 +1,235 @@
+"""Codex OAuth Responses API completion client for Phase BT."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+import httpx
+from dotenv import dotenv_values
+
+
+DEFAULT_CODEX_RESPONSES_BASE_URL = "https://chatgpt.com/backend-api/codex/responses"
+DEFAULT_CODEX_RESPONSES_USER_AGENT = "codex_cli_rs/0.0.0"
+
+
+class CodexResponsesCompletionClient:
+    """CompletionClient implementation backed by the Codex Responses API route."""
+
+    def __init__(
+        self,
+        *,
+        auth_json_path: str | Path | None = None,
+        base_url: str | None = None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        user_agent: str | None = None,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        self.auth_json_path = (
+            Path(auth_json_path).expanduser()
+            if auth_json_path is not None
+            else Path(_config_value("CODEX_AUTH_JSON", "") or "~/.codex/auth.json").expanduser()
+        )
+        self.base_url = (
+            base_url
+            or _config_value("CODEX_RESPONSES_BASE_URL", "")
+            or DEFAULT_CODEX_RESPONSES_BASE_URL
+        )
+        self.model = model or _config_value("JUDGE_LLM_MODEL", "") or _config_value("LLM_MODEL", "") or "gpt-5.5"
+        self.reasoning_effort = (
+            reasoning_effort
+            or _config_value("CODEX_PROVIDER_REASONING_EFFORT", "")
+            or _config_value("JUDGE_CODEX_REASONING_EFFORT", "")
+            or "xhigh"
+        )
+        self.user_agent = user_agent or DEFAULT_CODEX_RESPONSES_USER_AGENT
+        self.transport = transport
+
+    def complete(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int,
+        timeout_seconds: int,
+        temperature: float,
+    ) -> dict[str, Any]:
+        """Return model text plus provider usage without exposing credentials."""
+
+        auth = _load_codex_auth(self.auth_json_path)
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "instructions": system_prompt,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": user_prompt}],
+                }
+            ],
+            "max_output_tokens": max_tokens,
+            "temperature": temperature,
+            "store": False,
+            "reasoning": {"effort": self.reasoning_effort},
+        }
+        headers = {
+            "Authorization": f"Bearer {auth.access_token}",
+            "chatgpt-account-id": auth.account_id,
+            "OpenAI-Beta": "responses=experimental",
+            "originator": "codex_cli_rs",
+            "session_id": str(uuid4()),
+            "User-Agent": self.user_agent,
+        }
+
+        try:
+            with httpx.Client(transport=self.transport, timeout=timeout_seconds) as client:
+                response = client.post(self.base_url, headers=headers, json=payload)
+        except httpx.TimeoutException as exc:
+            raise RuntimeError("Codex Responses API request timed out") from exc
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"Codex Responses API request failed: {type(exc).__name__}") from exc
+
+        if response.status_code in {401, 403}:
+            raise RuntimeError(
+                f"Codex Responses API authentication failed with HTTP {response.status_code}; "
+                "run codex login to refresh the Codex OAuth session"
+            )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Codex Responses API request failed with HTTP {response.status_code}")
+
+        try:
+            body = response.json()
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Codex Responses API returned non-JSON response") from exc
+
+        content = _extract_response_text(body)
+        if not content:
+            raise RuntimeError("Codex Responses API response did not contain output text")
+        return {"content": content, "usage": body.get("usage")}
+
+
+class _CodexAuth:
+    def __init__(self, *, access_token: str, account_id: str) -> None:
+        self.access_token = access_token
+        self.account_id = account_id
+
+
+def _load_codex_auth(path: Path) -> _CodexAuth:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Codex auth file not found at {path}; run codex login") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Codex auth file at {path} is not valid JSON; run codex login") from exc
+
+    access_token = _find_string_by_keys(raw, ("access_token", "accessToken"))
+    account_id = _find_account_id(raw)
+    if not access_token:
+        raise RuntimeError(f"Codex auth file at {path} is missing an access token; run codex login")
+    if not account_id:
+        raise RuntimeError(f"Codex auth file at {path} is missing an account id; run codex login")
+    return _CodexAuth(access_token=access_token, account_id=account_id)
+
+
+def _find_string_by_keys(value: Any, keys: tuple[str, ...]) -> str:
+    if isinstance(value, dict):
+        for key in keys:
+            found = value.get(key)
+            if isinstance(found, str) and found.strip():
+                return found.strip()
+        for item in value.values():
+            found = _find_string_by_keys(item, keys)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _find_string_by_keys(item, keys)
+            if found:
+                return found
+    return ""
+
+
+def _find_account_id(value: Any) -> str:
+    found = _find_string_by_keys(
+        value,
+        (
+            "account_id",
+            "accountId",
+            "chatgpt_account_id",
+            "chatgptAccountId",
+            "active_account_id",
+            "last_account_id",
+        ),
+    )
+    if found:
+        return found
+    if isinstance(value, dict):
+        accounts = value.get("accounts")
+        if isinstance(accounts, dict):
+            for key in accounts:
+                if isinstance(key, str) and key.strip():
+                    return key.strip()
+    return ""
+
+
+def _extract_response_text(body: Any) -> str:
+    if not isinstance(body, dict):
+        return ""
+    direct = body.get("output_text") or body.get("content") or body.get("text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+
+    chunks: list[str] = []
+    output = body.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict):
+                        text = part.get("text") or part.get("content")
+                        if isinstance(text, str):
+                            chunks.append(text)
+                    elif isinstance(part, str):
+                        chunks.append(part)
+            elif isinstance(content, str):
+                chunks.append(content)
+            item_text = item.get("text")
+            if isinstance(item_text, str):
+                chunks.append(item_text)
+    if chunks:
+        return "".join(chunks).strip()
+
+    choices = body.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if isinstance(message, dict):
+                text = message.get("content")
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+            text = choice.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+    return ""
+
+
+def _config_value(name: str, default: str) -> str:
+    value = os.getenv(name)
+    if value is not None:
+        return value
+    env_path = Path(".env")
+    if not env_path.exists():
+        return default
+    parsed = dotenv_values(env_path)
+    parsed_value = parsed.get(name)
+    if parsed_value is None:
+        return default
+    return parsed_value

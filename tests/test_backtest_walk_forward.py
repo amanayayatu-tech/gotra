@@ -692,6 +692,80 @@ def test_codex_cli_provider_is_not_stage3_deterministic() -> None:
     assert "temperature" in metadata["blocking_reason"]
 
 
+def test_codex_responses_provider_is_stage3_eligible() -> None:
+    metadata = walk_forward._provider_determinism_metadata(  # noqa: SLF001
+        "codex_responses",
+        require_stage3_provider=True,
+    )
+
+    assert metadata["stage3_acceptance_eligible"] is True
+    assert metadata["temperature_control"] == "supported"
+    assert metadata["top_p_control"] is False
+    assert metadata["seed_control"] is False
+    assert metadata["blocking_reason"] == ""
+    assert walk_forward._provider_determinism_error(metadata) == ""  # noqa: SLF001
+
+
+def test_parse_args_accepts_codex_responses_provider() -> None:
+    args = walk_forward.parse_args(["--provider", "codex_responses"])
+
+    assert args.provider == "codex_responses"
+
+
+def test_require_stage3_provider_allows_codex_responses(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _write_prices(tmp_path / "prices", "AAPL", start="2016-01-01", days=470)
+
+    class Stage3EligibleProvider:
+        network_enabled = False
+
+        def __init__(self) -> None:
+            self.preflight_called = False
+
+        def preflight(self) -> None:
+            self.preflight_called = True
+
+        def decide(self, **_kwargs):
+            return walk_forward.Decision(
+                direction="long",
+                expected_change_pct=1.0,
+                confidence=0.5,
+                reasoning="fixture",
+                prompt_hash="abc123",
+                estimated_tokens=10,
+                token_usage_source="provider_usage",
+                cache_hit=False,
+            )
+
+    provider = Stage3EligibleProvider()
+    monkeypatch.setattr(walk_forward, "_build_provider", lambda _name: provider)
+
+    summary = run_backtest(
+        BacktestConfig(
+            data_dir=tmp_path,
+            run_id="stage3_codex_responses_allowed_test",
+            mode="sampled",
+            provider="codex_responses",
+            start=date(2016, 1, 1),
+            end=date(2017, 1, 1),
+            step_months=3,
+            tickers=(TickerSpec("AAPL", "Apple", date(1980, 12, 12)),),
+            arms=("baseline",),
+            require_stage3_provider=True,
+            token_budget=50_000,
+        )
+    )
+
+    assert provider.preflight_called is True
+    assert summary["steps_written"] == 1
+    assert summary["provider_errors"] == 0
+    assert summary["provider_determinism_error"] == ""
+    assert summary["provider_determinism"]["stage3_acceptance_eligible"] is True
+    assert summary["system_health"]["status"] == "ok"
+
+
 def test_require_stage3_provider_blocks_before_codex_preflight(
     tmp_path: Path,
     monkeypatch,
