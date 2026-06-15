@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "BT-*"
+      - "codex/**"
+
+jobs:
+  test:
+    name: Python checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Ruff
+        run: uv run ruff check . --force-exclude
+
+      - name: Tests
+        run: uv run pytest -q
+
+      - name: No direct vendor LLM imports
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          allowed = Path("engine/ksana/chairman/llm/narrative_generator.py")
+          pattern = re.compile(r"\b(import|from)\s+(openai|anthropic)\b")
+          matches = []
+          for path in Path(".").rglob("*.py"):
+              if path == allowed or ".venv" in path.parts:
+                  continue
+              text = path.read_text(encoding="utf-8", errors="ignore")
+              for lineno, line in enumerate(text.splitlines(), 1):
+                  if pattern.search(line):
+                      matches.append(f"{path}:{lineno}:{line.strip()}")
+
+          if matches:
+              print("Direct OpenAI/Anthropic imports are forbidden outside the ksana Codex provider adapter.")
+              print("\n".join(matches))
+              raise SystemExit(1)
+          PY
+
+      - name: Ksana orchestration guard
+        run: uv run pytest -q engine/ksana/tests/orchestrator/test_decision_checks.py

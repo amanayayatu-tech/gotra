@@ -34,6 +34,22 @@
 
 ---
 
+## 工程铁律（CI 与审阅口径）
+
+以下约束来自 [`docs/AUTONOMY_RUNBOOK.md`](docs/AUTONOMY_RUNBOOK.md)，违反即判 FAIL：
+
+1. **宪法优先** —— 任何加速开关都不能破坏 ksana 纯函数、Alaya 审计路径或 `active→strong` human-only 底线。
+2. **LLM 唯一通道** —— gotra 业务代码不得直连 OpenAI / Anthropic SDK；模型调用必须留在 provider 接口之后，经 Codex CLI 路径执行。
+3. **审计不可旁路** —— 跨系统写入必须走会记录 `actor` 的事件路径，禁止裸写绕过审计。
+4. **分支隔离与单独提交** —— 每个 Phase / runner 修复使用独立分支和清晰 commit，不把工装、科学结论和产物混在一起。
+5. **仓库卫生** —— bundle、validation logs、回测缓存、报告、patch、密钥不进 git；可复现实验定义和源码必须进 git。
+6. **零未来函数** —— 回测中任一 `T` 的决策只允许读取 `availability_date <= T` 的输入。
+7. **不得伪装通过** —— N/A 标 N/A，失败标 FAIL，禁止为了指标变绿而改阈值、改口径或 p-hack。
+
+GitHub CI 执行 `ruff`、全量 `pytest`、直连 LLM import grep、ksana orchestration guard。详见 [CI workflow](.github/workflows/ci.yml)。
+
+---
+
 ## 自主闭环（Definition of Done）
 
 ```text
@@ -125,7 +141,7 @@ gotra/
 
 ## 快速开始
 
-> ⚠️ **当前处于 Phase 0（工作区初始化）之前**：仓库尚未包含 `.gitmodules` / `engine/ksana` 子模块、`contracts/`、`.env.example`。以下命令在 **Phase 0 完成后**可用，目前作为目标形态参考。
+> 当前代码已包含 gotra Python 包、`engine/ksana` 子模块、事件契约、Judge / Perplexity / daemon / reporting / backtest 模块和测试。真实 LLM / Perplexity / Alaya 写入仍需显式环境配置；默认测试不连接真实 provider。
 
 前置：本机已安装并登录 Codex CLI（系统所有模型调用经此）。
 
@@ -150,14 +166,23 @@ cp .env.example .env
 python -c "import json,jsonschema; jsonschema.Draft202012Validator.check_schema(json.load(open('contracts/investment_event.schema.json')))"
 
 # daemon 干跑（验证编排串联与失败隔离，不实跑模型）
-python -m autonomy.daemon.run --once --type morning --dry-run
+uv run python -m gotra.daemon_orchestration.run --once --type morning --dry-run
+```
+
+### 本地验证
+
+```bash
+uv run ruff check . --force-exclude
+uv run pytest -q
+uv run pytest -q engine/ksana/tests/orchestrator/test_decision_checks.py
+git diff --check
 ```
 
 ---
 
 ## 状态
 
-🚧 早期建设中。当前阶段：工作区初始化与事件链路（Phase 0 / Phase A）。自主层（Judge Agent / 自动 Perplexity / daemon / 回测）按任务书逐 Phase 推进。
+🚧 早期建设中。当前代码线已推进到 BT provider-fix 分支：基础自主层、回测 harness、Codex CLI provider 隔离、baseline replay compare、provider health artifacts 已落地。最近一次正式 BT Stage 3 的机械链路健康，但预注册 A 类 baseline replay 方向一致率未达 `95%`，因此不能标记为正式验收全绿。下一步执行计划见 [`docs/BT_PARALLEL_RUNNER_REPAIR_PLAN.md`](docs/BT_PARALLEL_RUNNER_REPAIR_PLAN.md)。
 
 ## License
 
