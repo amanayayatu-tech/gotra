@@ -1443,16 +1443,29 @@ def _provider_determinism_metadata(
             ),
         }
     if provider == "codex_responses":
+        measured_repro_ok = _env_flag("CODEX_RESPONSES_MEASURED_REPRO_OK")
+        blocking_reason = (
+            ""
+            if measured_repro_ok
+            else (
+                "codex_responses (ChatGPT OAuth) does not accept temperature; "
+                "sampling is uncontrolled. Stage 3 eligibility depends on an "
+                "empirically measured direction-agreement rate >=95%, not on "
+                "temperature control."
+            )
+        )
         return {
             "provider": provider,
             "required_for_stage3": require_stage3_provider,
-            "stage3_acceptance_eligible": True,
-            "temperature_control": "supported",
+            "stage3_acceptance_eligible": measured_repro_ok,
+            "temperature_control": "unsupported",
             "top_p_control": False,
             "seed_control": False,
             "acceptance_metric": "direction_agreement>=0.95",
+            "acceptance_basis": "empirically_measured_direction_agreement",
+            "measured_repro_flag": "CODEX_RESPONSES_MEASURED_REPRO_OK",
             "bit_level_reproducible": False,
-            "blocking_reason": "",
+            "blocking_reason": blocking_reason,
         }
     raise ValueError(f"unsupported BT provider: {provider}")
 
@@ -1463,6 +1476,10 @@ def _provider_determinism_error(provider_determinism: dict[str, Any]) -> str:
     if provider_determinism.get("stage3_acceptance_eligible") is True:
         return ""
     return str(provider_determinism.get("blocking_reason") or "provider is not Stage 3 eligible")
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _write_step(run_root: Path, step: dict[str, Any]) -> None:

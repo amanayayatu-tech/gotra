@@ -65,6 +65,10 @@ class CodexResponsesCompletionClient:
         # max_output_tokens field; keep max_tokens only for the shared caller
         # contract. Output length is controlled by the prompt and reasoning effort.
         del max_tokens
+        # This route also rejects explicit temperature. Sampling follows the
+        # backend default behavior; callers keep passing temperature via the
+        # shared CompletionClient protocol, but it is not a wire parameter here.
+        del temperature
         payload: dict[str, Any] = {
             "model": self.model,
             "instructions": system_prompt,
@@ -74,7 +78,6 @@ class CodexResponsesCompletionClient:
                     "content": [{"type": "input_text", "text": user_prompt}],
                 }
             ],
-            "temperature": temperature,
             "store": False,
             "stream": True,
             "reasoning": {"effort": self.reasoning_effort},

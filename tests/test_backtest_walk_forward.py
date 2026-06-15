@@ -692,14 +692,35 @@ def test_codex_cli_provider_is_not_stage3_deterministic() -> None:
     assert "temperature" in metadata["blocking_reason"]
 
 
-def test_codex_responses_provider_is_stage3_eligible() -> None:
+def test_codex_responses_provider_requires_empirical_repro_flag(monkeypatch) -> None:
+    monkeypatch.delenv("CODEX_RESPONSES_MEASURED_REPRO_OK", raising=False)
+    metadata = walk_forward._provider_determinism_metadata(  # noqa: SLF001
+        "codex_responses",
+        require_stage3_provider=True,
+    )
+
+    assert metadata["stage3_acceptance_eligible"] is False
+    assert metadata["temperature_control"] == "unsupported"
+    assert metadata["top_p_control"] is False
+    assert metadata["seed_control"] is False
+    assert metadata["acceptance_basis"] == "empirically_measured_direction_agreement"
+    assert metadata["measured_repro_flag"] == "CODEX_RESPONSES_MEASURED_REPRO_OK"
+    assert "does not accept temperature" in metadata["blocking_reason"]
+    assert "direction-agreement rate >=95%" in metadata["blocking_reason"]
+    assert "temperature" in walk_forward._provider_determinism_error(metadata)  # noqa: SLF001
+
+
+def test_codex_responses_provider_is_stage3_eligible_when_empirically_flagged(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("CODEX_RESPONSES_MEASURED_REPRO_OK", "1")
     metadata = walk_forward._provider_determinism_metadata(  # noqa: SLF001
         "codex_responses",
         require_stage3_provider=True,
     )
 
     assert metadata["stage3_acceptance_eligible"] is True
-    assert metadata["temperature_control"] == "supported"
+    assert metadata["temperature_control"] == "unsupported"
     assert metadata["top_p_control"] is False
     assert metadata["seed_control"] is False
     assert metadata["blocking_reason"] == ""
@@ -716,6 +737,7 @@ def test_require_stage3_provider_allows_codex_responses(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    monkeypatch.setenv("CODEX_RESPONSES_MEASURED_REPRO_OK", "true")
     _write_prices(tmp_path / "prices", "AAPL", start="2016-01-01", days=470)
 
     class Stage3EligibleProvider:
@@ -766,10 +788,12 @@ def test_require_stage3_provider_allows_codex_responses(
     assert summary["system_health"]["status"] == "ok"
 
 
-def test_require_stage3_provider_blocks_before_codex_preflight(
+def test_require_stage3_provider_blocks_codex_responses_before_preflight_without_flag(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    monkeypatch.delenv("CODEX_RESPONSES_MEASURED_REPRO_OK", raising=False)
+
     class ProviderThatMustNotRun:
         network_enabled = False
 
@@ -784,9 +808,9 @@ def test_require_stage3_provider_blocks_before_codex_preflight(
     summary = run_backtest(
         BacktestConfig(
             data_dir=tmp_path,
-            run_id="stage3_provider_block_test",
+            run_id="stage3_codex_responses_block_test",
             mode="full",
-            provider="codex_cli",
+            provider="codex_responses",
             start=date(2016, 1, 1),
             end=date(2017, 1, 1),
             step_months=1,
@@ -802,12 +826,14 @@ def test_require_stage3_provider_blocks_before_codex_preflight(
     assert summary["provider_health"]["preflight_enabled"] is False
     assert summary["provider_determinism"]["required_for_stage3"] is True
     assert summary["provider_determinism"]["stage3_acceptance_eligible"] is False
+    assert summary["provider_determinism"]["temperature_control"] == "unsupported"
     assert "temperature" in summary["provider_determinism_error"]
+    assert "direction-agreement rate >=95%" in summary["provider_determinism_error"]
     assert summary["system_health"]["status"] == "blocked_provider_determinism"
     assert summary["system_health"]["provider_determinism_error"] == summary[
         "provider_determinism_error"
     ]
-    assert (tmp_path / "runs" / "stage3_provider_block_test" / "summary.json").exists()
+    assert (tmp_path / "runs" / "stage3_codex_responses_block_test" / "summary.json").exists()
 
 
 def test_provider_error_steps_are_written_and_counted(tmp_path: Path, monkeypatch) -> None:
