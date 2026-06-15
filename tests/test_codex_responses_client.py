@@ -20,20 +20,24 @@ def test_codex_responses_complete_sends_expected_headers_and_body(tmp_path: Path
         captured["body"] = json.loads(request.content.decode("utf-8"))
         return httpx.Response(
             200,
-            json={
-                "output": [
-                    {
-                        "type": "message",
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": '{"direction":"long","expected_change_pct":1.5}',
-                            }
-                        ],
-                    }
-                ],
-                "usage": {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14},
-            },
+            content=_sse_content(
+                {"type": "response.created", "response": {"id": "resp_fixture"}},
+                {"type": "response.output_text.delta", "text": '{"direction":"'},
+                {"type": "response.output_text.delta", "delta": 'long",'},
+                {"type": "response.output_text.delta", "text": '"expected_change_pct":1.5}'},
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_fixture",
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 4,
+                            "total_tokens": 14,
+                        },
+                    },
+                },
+                "[DONE]",
+            ),
         )
 
     client = CodexResponsesCompletionClient(
@@ -73,6 +77,7 @@ def test_codex_responses_complete_sends_expected_headers_and_body(tmp_path: Path
         "max_output_tokens": 123,
         "temperature": 0.0,
         "store": False,
+        "stream": True,
         "reasoning": {"effort": "xhigh"},
     }
     assert result == {
@@ -81,11 +86,20 @@ def test_codex_responses_complete_sends_expected_headers_and_body(tmp_path: Path
     }
 
 
-def test_codex_responses_complete_parses_direct_output_text(tmp_path: Path) -> None:
+def test_codex_responses_complete_can_fall_back_to_completed_response_text(tmp_path: Path) -> None:
     auth_path = _write_auth(tmp_path)
 
     def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"output_text": '{"ok": true}', "usage": {"total": 3}})
+        return httpx.Response(
+            200,
+            content=_sse_content(
+                {
+                    "type": "response.completed",
+                    "response": {"output_text": '{"ok": true}', "usage": {"total": 3}},
+                },
+                "[DONE]",
+            ),
+        )
 
     client = CodexResponsesCompletionClient(
         auth_json_path=auth_path,
@@ -117,7 +131,14 @@ def test_codex_responses_complete_accepts_account_id_from_accounts_map(tmp_path:
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["account_id"] = request.headers["chatgpt-account-id"]
-        return httpx.Response(200, json={"output_text": '{"ok": true}'})
+        return httpx.Response(
+            200,
+            content=_sse_content(
+                {"type": "response.output_text.delta", "text": '{"ok": true}'},
+                {"type": "response.completed", "response": {}},
+                "[DONE]",
+            ),
+        )
 
     client = CodexResponsesCompletionClient(
         auth_json_path=auth_path,
@@ -140,7 +161,7 @@ def test_codex_responses_complete_auth_failure_is_sanitized(tmp_path: Path) -> N
     auth_path = _write_auth(tmp_path)
 
     def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(401, json={"error": "expired secret test-access-token"})
+        return httpx.Response(401, content=b'{"error":"expired secret test-access-token"}')
 
     client = CodexResponsesCompletionClient(
         auth_json_path=auth_path,
@@ -161,6 +182,37 @@ def test_codex_responses_complete_auth_failure_is_sanitized(tmp_path: Path) -> N
     assert "HTTP 401" in message
     assert "codex login" in message
     assert "test-access-token" not in message
+
+
+def test_codex_responses_complete_request_format_error_reports_body(tmp_path: Path) -> None:
+    auth_path = _write_auth(tmp_path)
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(400, content=b'{"detail":"Stream must be set to true"}')
+
+    client = CodexResponsesCompletionClient(
+        auth_json_path=auth_path,
+        base_url="https://example.test/responses",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        client.complete(
+            system_prompt="system",
+            user_prompt="user",
+            max_tokens=8,
+            timeout_seconds=30,
+            temperature=0.0,
+        )
+
+    body = captured["body"]
+    assert body["stream"] is True
+    assert body["store"] is False
+    assert "HTTP 400" in str(exc_info.value)
+    assert "request format" in str(exc_info.value)
+    assert "Stream must be set to true" in str(exc_info.value)
 
 
 def test_codex_responses_complete_rejects_missing_auth_fields(tmp_path: Path) -> None:
@@ -194,3 +246,13 @@ def _write_auth(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return auth_path
+
+
+def _sse_content(*events: object) -> bytes:
+    lines: list[str] = []
+    for event in events:
+        if event == "[DONE]":
+            lines.append("data: [DONE]\n\n")
+        else:
+            lines.append(f"data: {json.dumps(event)}\n\n")
+    return "".join(lines).encode("utf-8")

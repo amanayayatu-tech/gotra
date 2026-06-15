@@ -73,6 +73,7 @@ class CodexResponsesCompletionClient:
             "max_output_tokens": max_tokens,
             "temperature": temperature,
             "store": False,
+            "stream": True,
             "reasoning": {"effort": self.reasoning_effort},
         }
         headers = {
@@ -86,29 +87,33 @@ class CodexResponsesCompletionClient:
 
         try:
             with httpx.Client(transport=self.transport, timeout=timeout_seconds) as client:
-                response = client.post(self.base_url, headers=headers, json=payload)
+                with client.stream("POST", self.base_url, headers=headers, json=payload) as response:
+                    if response.status_code in {401, 403}:
+                        response.read()
+                        raise RuntimeError(
+                            f"Codex Responses API authentication failed with HTTP {response.status_code}; "
+                            "run codex login to refresh the Codex OAuth session"
+                        )
+                    if response.status_code >= 400:
+                        detail = _response_error_detail(response, auth=auth)
+                        if response.status_code == 400:
+                            raise RuntimeError(
+                                "Codex Responses API request format failed with HTTP 400"
+                                f"{detail}"
+                            )
+                        raise RuntimeError(
+                            f"Codex Responses API request failed with HTTP {response.status_code}"
+                            f"{detail}"
+                        )
+                    content, usage = _parse_sse_response(response.iter_lines())
         except httpx.TimeoutException as exc:
             raise RuntimeError("Codex Responses API request timed out") from exc
         except httpx.HTTPError as exc:
             raise RuntimeError(f"Codex Responses API request failed: {type(exc).__name__}") from exc
 
-        if response.status_code in {401, 403}:
-            raise RuntimeError(
-                f"Codex Responses API authentication failed with HTTP {response.status_code}; "
-                "run codex login to refresh the Codex OAuth session"
-            )
-        if response.status_code >= 400:
-            raise RuntimeError(f"Codex Responses API request failed with HTTP {response.status_code}")
-
-        try:
-            body = response.json()
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("Codex Responses API returned non-JSON response") from exc
-
-        content = _extract_response_text(body)
         if not content:
             raise RuntimeError("Codex Responses API response did not contain output text")
-        return {"content": content, "usage": body.get("usage")}
+        return {"content": content, "usage": usage}
 
 
 class _CodexAuth:
@@ -219,6 +224,86 @@ def _extract_response_text(body: Any) -> str:
             if isinstance(text, str) and text.strip():
                 return text.strip()
     return ""
+
+
+def _parse_sse_response(lines: Any) -> tuple[str, dict[str, Any] | None]:
+    chunks: list[str] = []
+    usage: dict[str, Any] | None = None
+    completed_response: Any = None
+
+    for raw_line in lines:
+        line = _decode_sse_line(raw_line)
+        if not line or not line.startswith("data:"):
+            continue
+        data = line.removeprefix("data:").strip()
+        if data == "[DONE]":
+            break
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+
+        event_type = event.get("type")
+        if event_type == "response.output_text.delta":
+            text = _event_delta_text(event)
+            if text:
+                chunks.append(text)
+        elif event_type == "response.completed":
+            completed_response = event.get("response")
+            event_usage = _event_usage(event)
+            if event_usage is not None:
+                usage = event_usage
+
+    content = "".join(chunks).strip()
+    if not content and completed_response is not None:
+        content = _extract_response_text(completed_response)
+    return content, usage
+
+
+def _decode_sse_line(raw_line: Any) -> str:
+    if isinstance(raw_line, bytes):
+        return raw_line.decode("utf-8", errors="replace").strip()
+    if isinstance(raw_line, str):
+        return raw_line.strip()
+    return ""
+
+
+def _event_delta_text(event: dict[str, Any]) -> str:
+    for key in ("delta", "text"):
+        value = event.get(key)
+        if isinstance(value, str):
+            return value
+    output_text = event.get("output_text")
+    if isinstance(output_text, str):
+        return output_text
+    return ""
+
+
+def _event_usage(event: dict[str, Any]) -> dict[str, Any] | None:
+    response = event.get("response")
+    if isinstance(response, dict):
+        usage = response.get("usage")
+        if isinstance(usage, dict):
+            return usage
+    usage = event.get("usage")
+    if isinstance(usage, dict):
+        return usage
+    return None
+
+
+def _response_error_detail(response: httpx.Response, *, auth: _CodexAuth) -> str:
+    body = response.read()
+    if not body:
+        return ""
+    text = body.decode(response.encoding or "utf-8", errors="replace").strip()
+    if not text:
+        return ""
+    redacted = text.replace(auth.access_token, "[redacted]").replace(auth.account_id, "[redacted]")
+    if len(redacted) > 500:
+        redacted = redacted[:497] + "..."
+    return f": {redacted}"
 
 
 def _config_value(name: str, default: str) -> str:
