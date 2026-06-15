@@ -74,12 +74,12 @@ def test_codex_responses_complete_sends_expected_headers_and_body(tmp_path: Path
                 "content": [{"type": "input_text", "text": "user"}],
             }
         ],
-        "max_output_tokens": 123,
         "temperature": 0.0,
         "store": False,
         "stream": True,
         "reasoning": {"effort": "xhigh"},
     }
+    assert "max_output_tokens" not in body
     assert result == {
         "content": '{"direction":"long","expected_change_pct":1.5}',
         "usage": {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14},
@@ -210,9 +210,72 @@ def test_codex_responses_complete_request_format_error_reports_body(tmp_path: Pa
     body = captured["body"]
     assert body["stream"] is True
     assert body["store"] is False
+    assert "max_output_tokens" not in body
     assert "HTTP 400" in str(exc_info.value)
     assert "request format" in str(exc_info.value)
     assert "Stream must be set to true" in str(exc_info.value)
+
+
+def test_codex_responses_complete_does_not_send_unsupported_max_output_tokens(
+    tmp_path: Path,
+) -> None:
+    auth_path = _write_auth(tmp_path)
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            400,
+            content=b'{"detail":"Unsupported parameter: max_output_tokens"}',
+        )
+
+    client = CodexResponsesCompletionClient(
+        auth_json_path=auth_path,
+        base_url="https://example.test/responses",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        client.complete(
+            system_prompt="system",
+            user_prompt="user",
+            max_tokens=8,
+            timeout_seconds=30,
+            temperature=0.0,
+        )
+
+    body = captured["body"]
+    assert "max_output_tokens" not in body
+    assert body["stream"] is True
+    assert body["store"] is False
+    assert "Unsupported parameter: max_output_tokens" in str(exc_info.value)
+
+
+def test_codex_responses_complete_forbidden_failure_is_sanitized(tmp_path: Path) -> None:
+    auth_path = _write_auth(tmp_path)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, content=b'{"error":"forbidden test-access-token"}')
+
+    client = CodexResponsesCompletionClient(
+        auth_json_path=auth_path,
+        base_url="https://example.test/responses",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        client.complete(
+            system_prompt="system",
+            user_prompt="user",
+            max_tokens=8,
+            timeout_seconds=30,
+            temperature=0.0,
+        )
+
+    message = str(exc_info.value)
+    assert "HTTP 403" in message
+    assert "codex login" in message
+    assert "test-access-token" not in message
 
 
 def test_codex_responses_complete_rejects_missing_auth_fields(tmp_path: Path) -> None:

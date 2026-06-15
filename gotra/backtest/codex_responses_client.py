@@ -61,6 +61,10 @@ class CodexResponsesCompletionClient:
         """Return model text plus provider usage without exposing credentials."""
 
         auth = _load_codex_auth(self.auth_json_path)
+        # The Codex OAuth backend rejects the official Responses API
+        # max_output_tokens field; keep max_tokens only for the shared caller
+        # contract. Output length is controlled by the prompt and reasoning effort.
+        del max_tokens
         payload: dict[str, Any] = {
             "model": self.model,
             "instructions": system_prompt,
@@ -70,7 +74,6 @@ class CodexResponsesCompletionClient:
                     "content": [{"type": "input_text", "text": user_prompt}],
                 }
             ],
-            "max_output_tokens": max_tokens,
             "temperature": temperature,
             "store": False,
             "stream": True,
