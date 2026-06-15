@@ -32,6 +32,8 @@ LLM_MODEL=gpt-5.5
 CODEX_PROVIDER_REASONING_EFFORT=xhigh
 CODEX_PROVIDER_SANDBOX=read-only
 CODEX_PROVIDER_CLEAN=1
+CODEX_AUTH_JSON=
+CODEX_RESPONSES_BASE_URL=https://chatgpt.com/backend-api/codex/responses
 AUTO_JUDGE=true
 ```
 
@@ -117,6 +119,36 @@ uv run python -m gotra.backtest.compare_runs \
   --threshold 0.95
 ```
 
+`codex_responses` 复现性预检示例：同一 sampled baseline 配置跑两遍，用独立
+`cache_namespace` 避免 cache hit 掩盖 provider 非确定性，再用 `compare_runs` 量方向
+一致率。
+
+```bash
+uv run python -m gotra.backtest.walk_forward \
+  --run-id bt_responses_sampled_replay_a \
+  --mode sampled \
+  --provider codex_responses \
+  --arms baseline \
+  --ledger sqlite \
+  --cache-namespace responses-preflight-a \
+  --token-budget 100000
+
+uv run python -m gotra.backtest.walk_forward \
+  --run-id bt_responses_sampled_replay_b \
+  --mode sampled \
+  --provider codex_responses \
+  --arms baseline \
+  --ledger sqlite \
+  --cache-namespace responses-preflight-b \
+  --token-budget 100000
+
+uv run python -m gotra.backtest.compare_runs \
+  --reference-run data/backtest/runs/bt_responses_sampled_replay_a \
+  --candidate-run data/backtest/runs/bt_responses_sampled_replay_b \
+  --arm baseline \
+  --threshold 0.95
+```
+
 正式 Stage 3 科学 run 前，先检查 provider 是否具备预注册 replay gate 需要的确定性能力：
 
 ```bash
@@ -134,7 +166,8 @@ uv run python -m gotra.backtest.walk_forward \
 只支持 prompt-level temperature guidance，不暴露可靠 `temperature/top_p/seed` sampling
 控制。
 
-任何 `codex_cli` full/monthly provider run 都属于高成本动作，启动前必须取得明确批准。
+任何 `codex_cli` 或 `codex_responses` full/monthly provider run 都属于高成本动作，
+启动前必须取得明确批准。
 
 ## 目标
 
@@ -242,7 +275,8 @@ class DaemonRunConfig:
 - 在作出状态判断前验证真实本地状态：branch、dirty tree、submodule state、当前
   artifact、相关 run JSON。
 - 除非 runbook 明确要求跟踪，generated artifact 不进 git。
-- LLM 调用必须留在批准的 provider interface 与 Codex CLI 路径之后。
+- LLM 调用必须留在批准的 provider interface 之后：默认 Codex CLI 路径；Phase BT
+  可使用已登记的 `codex_responses` 受控接口。
 - BT 输入可用性必须可审计：`availability_date <= T`，或价格行切片到
   `date <= decision_date`。
 - 判断 BT run 健康时读取/生成 `system_health.json`、`summary.json`、
@@ -255,7 +289,8 @@ class DaemonRunConfig:
 
 ### Ask First
 
-- 启动 full/monthly `codex_cli` provider BT run，或任何可能消耗大量 token 的动作。
+- 启动 full/monthly `codex_cli` / `codex_responses` provider BT run，或任何可能消耗
+  大量 token 的动作。
 - 修改 preregistered BT hypothesis、threshold、window、universe，或 `95%` baseline
   replay direction-agreement gate。
 - 新增依赖、修改 `uv.lock`、修改 CI。
@@ -270,7 +305,13 @@ class DaemonRunConfig:
 - 绝不提交 secrets、`.env`、API key、token、SQLite DB、validation log、provider cache、
   BT run directory、generated report、patch、tarball、pyc 文件。
 - 绝不在 gotra business code 中直接 import OpenAI/Anthropic SDK，或调用 direct vendor
-  endpoint。
+  endpoint。原则仍然成立；唯一已批准的受控例外是 `codex_responses`，且必须同时满足：
+  仅用于 Phase BT 决策 provider，不得用于其他业务路径；仅访问
+  `https://chatgpt.com/backend-api/codex/responses`，复用 Codex OAuth
+  `~/.codex/auth.json` 或 `CODEX_AUTH_JSON` 覆盖路径，不引入 API key 计费路径；
+  不得 import `openai` / `anthropic` SDK，必须使用 `httpx` 裸 HTTP；允许控制
+  `temperature`，但无 seed，复现性口径是方向一致率 `>=95%`，不是逐位相同；
+  不放开任何其他 vendor endpoint，`api.openai.com` / `api.anthropic.com` 仍然禁止。
 - 绝不在外部依赖/子模块代码中加入外部研究 API 调用。
 - 绝不在设置了 `PERPLEXITY_API_KEY` 或 `PPLX_API_KEY` 的情况下运行 Phase BT。
 - 绝不绕过审计 API/service path 做 raw write。
@@ -286,6 +327,9 @@ BT 有两类必须分开的 verdict：
   budget/pause 状态清晰、event actor 存在、本地 deterministic tests/canaries 通过。
 - Scientific hypotheses：`data/backtest/PREREGISTERED.md` 中的 H1/H2/H3，包括正式 gate
   要求 baseline replay direction agreement 达到或超过 `95%`。
+
+`codex_responses` 的 Stage 3 资格口径是方向一致率 `>=95%`。seed 不可用，不得据此
+声称逐位可复现。
 
 具体 run id、replay count、当前 pass/fail 状态不在本 spec 中维护。作出状态判断前，
 读取当前 run artifact、`README.md` 和 BT repair/status 文档。
