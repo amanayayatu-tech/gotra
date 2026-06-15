@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from statistics import mean, median
 from typing import Any, Literal, Protocol
 
 import pandas as pd
@@ -55,9 +56,9 @@ prompt, or live market data. Treat the prompt as a compact F/W/G + Chairman work
 - G partner: identify governance and risk implications from the provided price history only.
 - Chairman: reconcile F/W/G into one 30-day expected price-change decision.
 
-Both experimental arms share this exact skeleton. The only stateful signal is the feedback array:
-empty feedback means no cognitive-compounding state; non-empty feedback means only matured prior
-outcomes whose availability date is not after the decision date.
+Both experimental arms share this exact skeleton. The only stateful signal is the
+cognitive_compounding_state object: empty cards mean no state; non-empty cards and confidence
+adaptation mean only matured prior outcomes whose availability date is not after the decision date.
 
 Return strict JSON only, with exactly these keys:
 {"direction": "long|short|watch|avoid", "expected_change_pct": number, "confidence": number,
@@ -936,8 +937,14 @@ def _resume_ticker_steps(
                     "decision_date": step["decision_date"],
                     "outcome_availability_date": step["outcome_as_of"],
                     "error": step["error"],
+                    "mse": step["mse"],
                     "actual_change_pct": step["actual_change_pct"],
                     "expected_change_pct": step["expected_change_pct"],
+                    "decision_direction": step["decision_direction"],
+                    "actual_direction": _direction_from_change(float(step["actual_change_pct"])),
+                    "direction_hit": step["decision_direction"]
+                    == _direction_from_change(float(step["actual_change_pct"])),
+                    "style_window": step.get("style_window"),
                 }
             )
     return steps
@@ -1138,11 +1145,10 @@ def _run_ticker_step(
         return []
 
     steps: list[dict[str, Any]] = []
-    matured_feedback = [
-        item
-        for item in feedback_by_ticker.get(ticker.symbol, [])
-        if parse_date(item["outcome_availability_date"]) <= decision_date
-    ]
+    matured_feedback = _matured_feedback_for_decision(
+        feedback_by_ticker.get(ticker.symbol, []),
+        decision_date=decision_date,
+    )
     for arm in config.arms:
         actual_change = _change_pct(float(start_row["adj_close"]), float(end_row["adj_close"]))
         try:
@@ -1229,8 +1235,13 @@ def _run_ticker_step(
                     "decision_date": decision_date.isoformat(),
                     "outcome_availability_date": step["outcome_as_of"],
                     "error": error,
+                    "mse": mse,
                     "actual_change_pct": actual_change,
                     "expected_change_pct": decision.expected_change_pct,
+                    "decision_direction": decision.direction,
+                    "actual_direction": _direction_from_change(actual_change),
+                    "direction_hit": decision.direction == _direction_from_change(actual_change),
+                    "style_window": style_window_for(decision_date),
                 }
             )
         if budget.over_budget_error:
@@ -1363,6 +1374,17 @@ def _decision_inputs(
             "rows": int(len(decision_slice)),
         }
     ]
+    if feedback:
+        latest_card_availability = max(str(item["outcome_availability_date"]) for item in feedback)
+        decision_inputs.append(
+            {
+                "name": "cognitive_compounding_knowledge_card",
+                "kind": "alaya_knowledge_card",
+                "source": "matured_prior_step_outcomes",
+                "availability_date": latest_card_availability,
+                "matured_samples": len(feedback),
+            }
+        )
     for index, item in enumerate(feedback):
         decision_inputs.append(
             {
@@ -1530,6 +1552,11 @@ def _build_codex_prompt_payload(
     feedback: list[dict[str, Any]],
 ) -> dict[str, Any]:
     latest_row = price_rows.iloc[-1]
+    cognitive_state = _build_cognitive_compounding_state(
+        ticker=ticker,
+        decision_date=decision_date,
+        feedback=feedback,
+    )
     return {
         "schema": "gotra.bt.decision_prompt.v1",
         "version": FULL_PROMPT_VERSION,
@@ -1555,7 +1582,7 @@ def _build_codex_prompt_payload(
             "features": _price_features(price_rows),
             "recent_adjusted_close": _compact_price_rows(price_rows),
         },
-        "feedback": feedback,
+        "cognitive_compounding_state": cognitive_state,
         "output_contract": {
             "direction": "long|short|watch|avoid",
             "expected_change_pct": "number",
@@ -1574,6 +1601,200 @@ def _compact_price_rows(rows: pd.DataFrame, *, max_rows: int = 64) -> list[dict[
         }
         for row in compact.to_dict("records")
     ]
+
+
+def _build_cognitive_compounding_state(
+    *,
+    ticker: str,
+    decision_date: date,
+    feedback: list[dict[str, Any]],
+) -> dict[str, Any]:
+    matured_feedback = _matured_feedback_for_decision(feedback, decision_date=decision_date)
+    cards = _build_knowledge_cards(
+        ticker=ticker,
+        decision_date=decision_date,
+        feedback=matured_feedback,
+    )
+    return {
+        "knowledge_cards": cards,
+        "confidence_adaptation": _build_confidence_adaptation(cards),
+    }
+
+
+def _matured_feedback_for_decision(
+    feedback: list[dict[str, Any]],
+    *,
+    decision_date: date,
+) -> list[dict[str, Any]]:
+    matured: list[dict[str, Any]] = []
+    for item in feedback:
+        availability = item.get("outcome_availability_date")
+        if not availability:
+            continue
+        if parse_date(str(availability)) <= decision_date:
+            matured.append(dict(item))
+    return sorted(
+        matured,
+        key=lambda item: (
+            str(item.get("decision_date") or ""),
+            str(item.get("outcome_availability_date") or ""),
+        ),
+    )
+
+
+def _build_knowledge_cards(
+    *,
+    ticker: str,
+    decision_date: date,
+    feedback: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    matured_feedback = _matured_feedback_for_decision(feedback, decision_date=decision_date)
+    if not matured_feedback:
+        return []
+
+    abs_errors = [
+        abs(float(item["error"]))
+        for item in matured_feedback
+        if item.get("error") is not None
+    ]
+    errors = [
+        float(item["error"])
+        for item in matured_feedback
+        if item.get("error") is not None
+    ]
+    direction_hits = [
+        hit
+        for item in matured_feedback
+        if (hit := _direction_hit(item)) is not None
+    ]
+    recent_feedback = matured_feedback[-6:]
+    recent_hits = [
+        hit
+        for item in recent_feedback
+        if (hit := _direction_hit(item)) is not None
+    ]
+    latest_availability = max(str(item["outcome_availability_date"]) for item in matured_feedback)
+    return [
+        {
+            "kind": "ticker_cognitive_compounding_card",
+            "ticker": ticker,
+            "as_of_decision_date": decision_date.isoformat(),
+            "latest_outcome_availability_date": latest_availability,
+            "matured_samples": len(matured_feedback),
+            "recent_window_samples": len(recent_feedback),
+            "direction_hit_rate": _rate(direction_hits),
+            "recent_direction_hit_rate": _rate(recent_hits),
+            "typical_abs_error_pct": _rounded(median(abs_errors)) if abs_errors else None,
+            "mean_error_bias_pct": _rounded(mean(errors)) if errors else None,
+            "style_window_performance": _style_window_performance(matured_feedback),
+        }
+    ]
+
+
+def _build_confidence_adaptation(cards: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not cards:
+        return None
+    card = cards[0]
+    recent_hit_rate = card.get("recent_direction_hit_rate")
+    hit_rate = recent_hit_rate if recent_hit_rate is not None else card.get("direction_hit_rate")
+    typical_abs_error = card.get("typical_abs_error_pct")
+    if hit_rate is None:
+        mode = "neutral"
+        expected_change_guidance = "No direction-hit history is available; keep confidence conservative."
+    elif float(hit_rate) < 0.45 or (typical_abs_error is not None and float(typical_abs_error) >= 8.0):
+        mode = "shrink_expected_change"
+        expected_change_guidance = (
+            "Prior direction hit rate or error profile is weak; shrink absolute expected_change_pct "
+            "toward zero unless current price evidence is unusually strong."
+        )
+    elif float(hit_rate) >= 0.65 and (typical_abs_error is None or float(typical_abs_error) <= 5.0):
+        mode = "allow_historical_confidence"
+        expected_change_guidance = (
+            "Prior direction hit rate and error profile are acceptable; use normal confidence, "
+            "still bounded by current price evidence."
+        )
+    else:
+        mode = "neutral"
+        expected_change_guidance = (
+            "Prior evidence is mixed; avoid increasing absolute expected_change_pct from history alone."
+        )
+    return {
+        "policy": "historical_accuracy_calibration",
+        "mode": mode,
+        "basis": {
+            "recent_direction_hit_rate": recent_hit_rate,
+            "direction_hit_rate": card.get("direction_hit_rate"),
+            "typical_abs_error_pct": typical_abs_error,
+            "matured_samples": card.get("matured_samples"),
+        },
+        "expected_change_guidance": expected_change_guidance,
+    }
+
+
+def _style_window_performance(feedback: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in feedback:
+        window = str(item.get("style_window") or "unclassified")
+        grouped.setdefault(window, []).append(item)
+
+    performance: list[dict[str, Any]] = []
+    for window, items in sorted(grouped.items()):
+        abs_errors = [
+            abs(float(item["error"]))
+            for item in items
+            if item.get("error") is not None
+        ]
+        mses = [
+            float(item["mse"])
+            for item in items
+            if item.get("mse") is not None
+        ]
+        hits = [
+            hit
+            for item in items
+            if (hit := _direction_hit(item)) is not None
+        ]
+        performance.append(
+            {
+                "style_window": window,
+                "samples": len(items),
+                "direction_hit_rate": _rate(hits),
+                "mean_abs_error_pct": _rounded(mean(abs_errors)) if abs_errors else None,
+                "mean_mse": _rounded(mean(mses)) if mses else None,
+            }
+        )
+    return performance
+
+
+def _direction_hit(item: dict[str, Any]) -> bool | None:
+    actual_change = item.get("actual_change_pct")
+    if actual_change is None:
+        return None
+    actual_direction = _direction_from_change(float(actual_change))
+    predicted_direction = str(
+        item.get("decision_direction") or _direction_from_change(float(item.get("expected_change_pct") or 0.0))
+    )
+    if predicted_direction == "short":
+        predicted_direction = "avoid"
+    return predicted_direction == actual_direction
+
+
+def _direction_from_change(change_pct: float) -> str:
+    if change_pct >= 2.0:
+        return "long"
+    if change_pct <= -2.0:
+        return "avoid"
+    return "watch"
+
+
+def _rate(values: list[bool]) -> float | None:
+    if not values:
+        return None
+    return _rounded(sum(1 for value in values if value) / len(values))
+
+
+def _rounded(value: float) -> float:
+    return round(float(value), 6)
 
 
 def _completion_text_and_usage(completion: Any) -> tuple[str, int | None]:

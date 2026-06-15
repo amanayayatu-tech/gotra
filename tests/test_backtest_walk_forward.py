@@ -594,6 +594,7 @@ def test_alaya_ticker_chain_parallel_preserves_feedback_order(tmp_path: Path) ->
     assert summary["steps_written"] == 12
     assert summary["metrics"]["paired_steps"] == 6
     assert any(item["kind"] == "alaya_feedback" for item in later_aapl["decision_inputs"])
+    assert any(item["kind"] == "alaya_knowledge_card" for item in later_aapl["decision_inputs"])
 
 
 def test_direction_agreement_compares_baseline_replay_runs(tmp_path: Path) -> None:
@@ -622,7 +623,89 @@ def test_direction_agreement_compares_baseline_replay_runs(tmp_path: Path) -> No
     ]
 
 
-def test_codex_provider_prompt_skeleton_differs_only_by_feedback(tmp_path: Path) -> None:
+def test_knowledge_cards_use_only_matured_feedback() -> None:
+    feedback = [
+        {
+            "decision_date": "2019-10-01",
+            "outcome_availability_date": "2019-11-01",
+            "error": -1.2,
+            "mse": 1.44,
+            "actual_change_pct": 3.0,
+            "expected_change_pct": 4.2,
+            "decision_direction": "long",
+            "style_window": "US-China trade war",
+        },
+        {
+            "decision_date": "2020-01-01",
+            "outcome_availability_date": "2020-03-01",
+            "error": 8.0,
+            "mse": 64.0,
+            "actual_change_pct": -6.0,
+            "expected_change_pct": 2.0,
+            "decision_direction": "long",
+            "style_window": "COVID shock",
+        },
+    ]
+
+    cards = walk_forward._build_knowledge_cards(  # noqa: SLF001
+        ticker="AAPL",
+        decision_date=date(2020, 2, 1),
+        feedback=feedback,
+    )
+
+    assert len(cards) == 1
+    card = cards[0]
+    assert card["matured_samples"] == 1
+    assert card["latest_outcome_availability_date"] == "2019-11-01"
+    assert card["recent_direction_hit_rate"] == 1.0
+    assert card["style_window_performance"] == [
+        {
+            "style_window": "US-China trade war",
+            "samples": 1,
+            "direction_hit_rate": 1.0,
+            "mean_abs_error_pct": 1.2,
+            "mean_mse": 1.44,
+        }
+    ]
+
+
+def test_confidence_adaptation_shrinks_when_history_is_weak() -> None:
+    cards = walk_forward._build_knowledge_cards(  # noqa: SLF001
+        ticker="MSFT",
+        decision_date=date(2020, 6, 1),
+        feedback=[
+            {
+                "decision_date": "2020-01-01",
+                "outcome_availability_date": "2020-02-03",
+                "error": -10.0,
+                "mse": 100.0,
+                "actual_change_pct": -8.0,
+                "expected_change_pct": 2.0,
+                "decision_direction": "long",
+                "style_window": "COVID shock",
+            },
+            {
+                "decision_date": "2020-03-01",
+                "outcome_availability_date": "2020-04-01",
+                "error": 9.0,
+                "mse": 81.0,
+                "actual_change_pct": 7.0,
+                "expected_change_pct": -2.0,
+                "decision_direction": "avoid",
+                "style_window": "COVID shock",
+            },
+        ],
+    )
+
+    adaptation = walk_forward._build_confidence_adaptation(cards)  # noqa: SLF001
+
+    assert adaptation is not None
+    assert adaptation["policy"] == "historical_accuracy_calibration"
+    assert adaptation["mode"] == "shrink_expected_change"
+    assert "shrink absolute expected_change_pct" in adaptation["expected_change_guidance"]
+
+
+def test_codex_provider_prompt_skeleton_differs_only_by_cognitive_state(tmp_path: Path) -> None:
     class FakeClient:
         def __init__(self) -> None:
             self.user_prompts: list[str] = []
@@ -649,6 +732,11 @@ def test_codex_provider_prompt_skeleton_differs_only_by_feedback(tmp_path: Path)
             "decision_date": "2019-10-01",
             "outcome_availability_date": "2019-11-01",
             "error": -1.2,
+            "mse": 1.44,
+            "actual_change_pct": 3.0,
+            "expected_change_pct": 4.2,
+            "decision_direction": "long",
+            "style_window": "US-China trade war",
         }
     ]
 
@@ -674,8 +762,13 @@ def test_codex_provider_prompt_skeleton_differs_only_by_feedback(tmp_path: Path)
     assert client.system_prompts[0] == client.system_prompts[1]
     baseline_payload = json.loads(client.user_prompts[0])
     alaya_payload = json.loads(client.user_prompts[1])
-    assert baseline_payload.pop("feedback") == []
-    assert alaya_payload.pop("feedback") == feedback
+    baseline_state = baseline_payload.pop("cognitive_compounding_state")
+    alaya_state = alaya_payload.pop("cognitive_compounding_state")
+    assert baseline_state == {"knowledge_cards": [], "confidence_adaptation": None}
+    assert len(alaya_state["knowledge_cards"]) == 1
+    assert alaya_state["knowledge_cards"][0]["kind"] == "ticker_cognitive_compounding_card"
+    assert alaya_state["knowledge_cards"][0]["matured_samples"] == 1
+    assert alaya_state["confidence_adaptation"]["policy"] == "historical_accuracy_calibration"
     assert baseline_payload == alaya_payload
 
 
