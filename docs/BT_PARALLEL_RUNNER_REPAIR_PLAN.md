@@ -11,6 +11,8 @@ The completed BT Stage 3 run is mechanically healthy but not formally valid:
 - `bt_full_v3_20260615`: `system_health=ok`, `audit.ok=true`, `provider_errors=0`, `steps_written=2012`.
 - Independent baseline replay: healthy, `cache_hits=0`, `steps_written=1006`.
 - Preregistered A-class gate failed: baseline replay direction agreement is `825/1006 = 82.01%`, below the required `95%`.
+- Canonical `/Users/peachy/Documents/gotra` concurrency-4 replay also failed the same gate:
+  `846/1006 = 84.10%` against `bt_full_v3_20260615`.
 
 The failure is not a cache, isolation, or audit failure. It is a reproducibility failure caused by the current Codex CLI provider surface not exposing reliable `temperature`, `top_p`, or seed controls.
 
@@ -35,6 +37,7 @@ All implementation and validation must obey these constraints from `docs/AUTONOM
 - Do not change the existing Stage 3 scientific result.
 - Do not make prompt compression part of the current Stage 3 evidence retroactively.
 - Do not parallelize same-ticker Alaya steps out of order.
+- Do not treat Codex CLI `temperature=0` prompt guidance as reliable sampling control.
 
 ## 4. Target Architecture
 
@@ -275,15 +278,16 @@ uv run python -m gotra.backtest.walk_forward \
   --provider-concurrency 4 \
   --parallel-mode baseline \
   --ledger sqlite \
+  --resume \
   --cache-namespace baseline-replay-parallel-20260615 \
   --run-id bt_baseline_replay_parallel_20260615
 
 uv run python -m gotra.backtest.compare_runs \
-  --left data/backtest/runs/bt_full_v3_20260615 \
-  --right data/backtest/runs/bt_baseline_replay_parallel_20260615 \
+  --reference-run /Users/peachy/Documents/gotra-BT-full-monthly/data/backtest/runs/bt_full_v3_20260615 \
+  --candidate-run data/backtest/runs/bt_baseline_replay_parallel_20260615 \
   --arm baseline \
   --threshold 0.95 \
-  --output data/backtest/runs/bt_baseline_replay_parallel_20260615/compare_baseline_direction.json
+  > data/backtest/runs/bt_baseline_replay_parallel_20260615/compare_baseline_direction.json
 ```
 
 Acceptance:
@@ -291,6 +295,35 @@ Acceptance:
 - If direction agreement is `>=95%`, A-class replay gate passes for that run pair.
 - If direction agreement remains below `95%`, report the experiment as invalid under the preregistered gate.
 - In either case, do not change thresholds after observing results.
+
+### R6. Provider Determinism Gate
+
+The approved routebook currently allows Codex CLI as the LLM route and forbids direct vendor SDKs
+inside gotra business code. The current Codex CLI provider does not expose reliable
+`temperature`, `top_p`, or `seed` controls. Therefore no current real LLM provider in this repo is
+eligible for preregistered Stage 3 replay acceptance.
+
+Use `--require-stage3-provider` before any future formal science run. It must abort before provider
+preflight or provider calls unless the selected provider explicitly declares Stage 3 eligibility.
+
+```bash
+uv run python -m gotra.backtest.walk_forward \
+  --provider codex_cli \
+  --mode full \
+  --arms baseline \
+  --step-months 1 \
+  --ledger sqlite \
+  --require-stage3-provider \
+  --run-id stage3_provider_gate_check
+```
+
+Expected current result:
+
+- `system_health.status=blocked_provider_determinism`.
+- `steps_written=0`.
+- `provider_errors=0`.
+- `provider_determinism.stage3_acceptance_eligible=false`.
+- The run is blocked by provider capability, not by cache, audit, budget, or isolation.
 
 ## 6. Speed Targets
 
@@ -325,5 +358,6 @@ The repair is complete only when all are true:
 - SQLite ledger passes race and resume tests.
 - Baseline parallel canary shows speedup without cache, budget, or event-log corruption.
 - Alaya ticker-chain parallel canary preserves serial feedback semantics.
+- `--require-stage3-provider` blocks current `codex_cli` before expensive formal science calls.
 - Repair report states that CI green is not formal Stage 3 acceptance.
 - Formal Stage 3 report states whether the preregistered replay gate passes or fails, without changing the gate.

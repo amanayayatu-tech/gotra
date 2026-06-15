@@ -85,6 +85,7 @@ class BacktestConfig:
     provider_preflight: bool = True
     provider_error_abort_consecutive: int = 8
     provider_error_abort_rate: float = 0.10
+    require_stage3_provider: bool = False
     ledger: LedgerBackend = "json"
     ledger_path: Path | None = None
     provider_concurrency: int = 1
@@ -489,6 +490,11 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
 
     cache, budget, ledger = _cache_budget_ledger(config=config, run_root=run_root, run_id=run_id)
     provider = _provider_for_run(config=config, ledger=ledger)
+    provider_determinism = _provider_determinism_metadata(
+        config.provider,
+        require_stage3_provider=config.require_stage3_provider,
+    )
+    provider_determinism_error = _provider_determinism_error(provider_determinism)
     steps: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     budget_error = ""
@@ -501,7 +507,10 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
     consecutive_provider_errors = 0
 
     try:
-        if provider_health["preflight_enabled"]:
+        if provider_determinism_error:
+            provider_health["preflight_enabled"] = False
+            provider_health["abort_reason"] = provider_determinism_error
+        elif provider_health["preflight_enabled"]:
             try:
                 preflight = getattr(provider, "preflight")
                 preflight()
@@ -511,7 +520,7 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
                 provider_health["preflight_error"] = str(exc)
                 provider_abort_reason = f"provider preflight failed: {exc}"
 
-        if not provider_abort_reason:
+        if not provider_abort_reason and not provider_determinism_error:
             if _parallel_enabled(config):
                 steps, skipped, provider_abort_reason, consecutive_provider_errors = _run_parallel(
                     config=config,
@@ -552,6 +561,7 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
         audit_ok=audit.ok,
         provider_errors=provider_errors,
         provider_abort_reason=provider_abort_reason,
+        provider_determinism_error=provider_determinism_error,
         run_mode=config.mode,
         provider=config.provider,
     )
@@ -564,6 +574,9 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
         "mode": config.mode,
         "provider": config.provider,
         "provider_metadata": _provider_metadata(config.provider),
+        "provider_determinism": provider_determinism,
+        "provider_determinism_error": provider_determinism_error,
+        "require_stage3_provider": config.require_stage3_provider,
         "sampled_validation_only": config.mode == "sampled" or config.provider == "heuristic",
         "start": config.start.isoformat(),
         "end": config.end.isoformat(),
@@ -984,10 +997,13 @@ def _build_system_health(
     audit_ok: bool,
     provider_errors: int,
     provider_abort_reason: str,
+    provider_determinism_error: str,
     run_mode: RunMode,
     provider: ProviderName,
 ) -> dict[str, Any]:
     alerts: list[str] = []
+    if provider_determinism_error:
+        alerts.append(provider_determinism_error)
     if budget_error:
         alerts.append(budget_error)
     if provider_abort_reason:
@@ -997,7 +1013,9 @@ def _build_system_health(
     if provider_errors:
         alerts.append(f"provider_error steps: {provider_errors}")
     status = "ok"
-    if budget_error:
+    if provider_determinism_error:
+        status = "blocked_provider_determinism"
+    elif budget_error:
         status = "paused"
     elif provider_abort_reason:
         status = "aborted_provider_unhealthy"
@@ -1009,6 +1027,7 @@ def _build_system_health(
         "pause_reason": budget_error,
         "aborted_provider_unhealthy": bool(provider_abort_reason),
         "provider_abort_reason": provider_abort_reason,
+        "provider_determinism_error": provider_determinism_error,
         "alerts": alerts,
         "run_mode": run_mode,
         "provider": provider,
@@ -1371,6 +1390,48 @@ def _provider_metadata(provider: ProviderName) -> dict[str, Any]:
     }
 
 
+def _provider_determinism_metadata(
+    provider: ProviderName,
+    *,
+    require_stage3_provider: bool = False,
+) -> dict[str, Any]:
+    if provider == "heuristic":
+        return {
+            "provider": provider,
+            "required_for_stage3": require_stage3_provider,
+            "stage3_acceptance_eligible": False,
+            "temperature_control": "not_applicable",
+            "top_p_control": False,
+            "seed_control": False,
+            "blocking_reason": (
+                "heuristic is a local sampled-plumbing provider and is not a real LLM "
+                "science provider"
+            ),
+        }
+    if provider == "codex_cli":
+        return {
+            "provider": provider,
+            "required_for_stage3": require_stage3_provider,
+            "stage3_acceptance_eligible": False,
+            "temperature_control": "prompt_guidance_only",
+            "top_p_control": False,
+            "seed_control": False,
+            "blocking_reason": (
+                "approved Codex CLI route does not expose reliable temperature, top_p, "
+                "or seed controls for preregistered baseline replay acceptance"
+            ),
+        }
+    raise ValueError(f"unsupported BT provider: {provider}")
+
+
+def _provider_determinism_error(provider_determinism: dict[str, Any]) -> str:
+    if not provider_determinism.get("required_for_stage3"):
+        return ""
+    if provider_determinism.get("stage3_acceptance_eligible") is True:
+        return ""
+    return str(provider_determinism.get("blocking_reason") or "provider is not Stage 3 eligible")
+
+
 def _write_step(run_root: Path, step: dict[str, Any]) -> None:
     path = _step_path(
         run_root,
@@ -1675,6 +1736,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--no-provider-preflight", action="store_true")
+    parser.add_argument(
+        "--require-stage3-provider",
+        action="store_true",
+        help=(
+            "Abort before provider calls unless the provider exposes reliable temperature/top_p/seed "
+            "controls and is eligible for preregistered Stage 3 replay acceptance."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1697,6 +1766,7 @@ def main(argv: list[str] | None = None) -> int:
             arms=_parse_arms(args.arms),
             cache_namespace=args.cache_namespace,
             provider_preflight=not args.no_provider_preflight,
+            require_stage3_provider=args.require_stage3_provider,
             ledger=args.ledger,
             ledger_path=Path(args.ledger_path) if args.ledger_path else None,
             provider_concurrency=args.provider_concurrency,

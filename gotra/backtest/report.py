@@ -46,6 +46,7 @@ def _render_markdown(*, run_root: Path, summary: dict[str, Any], chart_path: Pat
         f"- mode: `{summary.get('mode')}`",
         f"- provider: `{summary.get('provider')}`",
         f"- provider_metadata: `{json.dumps(summary.get('provider_metadata'), sort_keys=True)}`",
+        f"- provider_determinism: `{json.dumps(summary.get('provider_determinism'), sort_keys=True)}`",
         f"- step_months: `{summary.get('step_months')}`",
         f"- arms: `{json.dumps(arms, sort_keys=True)}`",
         f"- cache_namespace: `{cache_namespace}`",

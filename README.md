@@ -187,7 +187,7 @@ git diff --check
 
 ## 状态
 
-🚧 早期建设中。当前代码线已推进到 BT provider-fix 分支：基础自主层、回测 harness、Codex CLI provider 隔离、baseline replay compare、provider health artifacts、BT analyzer、SQLite ledger、baseline 并行和 Alaya ticker-chain 并行已落地。最近一次正式 BT Stage 3 的机械链路健康，但预注册 A 类 baseline replay 方向一致率未达 `95%`，因此不能标记为正式验收全绿。下一步执行计划见 [`docs/BT_PARALLEL_RUNNER_REPAIR_PLAN.md`](docs/BT_PARALLEL_RUNNER_REPAIR_PLAN.md)。
+🚧 早期建设中。当前代码线已包含基础自主层、回测 harness、Codex CLI provider 隔离、baseline replay compare、provider health artifacts、BT analyzer、SQLite ledger、baseline 并行和 Alaya ticker-chain 并行。最近一次正式 BT Stage 3 与 canonical concurrency-4 baseline replay 的机械链路健康，但预注册 A 类 baseline replay 方向一致率仍低于 `95%`（latest replay `846/1006 = 84.10%`），因此不能标记为正式验收全绿。当前 `codex_cli` provider 不具备可靠 `temperature/top_p/seed` 控制；正式科学运行前应先用 `--require-stage3-provider` 阻断不合格 provider。详见 [`docs/BT_PARALLEL_RUNNER_REPAIR_PLAN.md`](docs/BT_PARALLEL_RUNNER_REPAIR_PLAN.md)。
 
 ## License
 

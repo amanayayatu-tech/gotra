@@ -679,6 +679,63 @@ def test_codex_provider_prompt_skeleton_differs_only_by_feedback(tmp_path: Path)
     assert baseline_payload == alaya_payload
 
 
+def test_codex_cli_provider_is_not_stage3_deterministic() -> None:
+    metadata = walk_forward._provider_determinism_metadata(  # noqa: SLF001
+        "codex_cli",
+        require_stage3_provider=True,
+    )
+
+    assert metadata["stage3_acceptance_eligible"] is False
+    assert metadata["temperature_control"] == "prompt_guidance_only"
+    assert metadata["top_p_control"] is False
+    assert metadata["seed_control"] is False
+    assert "temperature" in metadata["blocking_reason"]
+
+
+def test_require_stage3_provider_blocks_before_codex_preflight(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class ProviderThatMustNotRun:
+        network_enabled = False
+
+        def preflight(self):
+            raise AssertionError("preflight should not run when Stage 3 provider gate blocks")
+
+        def decide(self, **_kwargs):
+            raise AssertionError("main loop should not run when Stage 3 provider gate blocks")
+
+    monkeypatch.setattr(walk_forward, "_build_provider", lambda _name: ProviderThatMustNotRun())
+
+    summary = run_backtest(
+        BacktestConfig(
+            data_dir=tmp_path,
+            run_id="stage3_provider_block_test",
+            mode="full",
+            provider="codex_cli",
+            start=date(2016, 1, 1),
+            end=date(2017, 1, 1),
+            step_months=1,
+            tickers=(TickerSpec("AAPL", "Apple", date(1980, 12, 12)),),
+            require_stage3_provider=True,
+            token_budget=50_000,
+        )
+    )
+
+    assert summary["steps_written"] == 0
+    assert summary["provider_errors"] == 0
+    assert summary["aborted_provider_unhealthy"] is False
+    assert summary["provider_health"]["preflight_enabled"] is False
+    assert summary["provider_determinism"]["required_for_stage3"] is True
+    assert summary["provider_determinism"]["stage3_acceptance_eligible"] is False
+    assert "temperature" in summary["provider_determinism_error"]
+    assert summary["system_health"]["status"] == "blocked_provider_determinism"
+    assert summary["system_health"]["provider_determinism_error"] == summary[
+        "provider_determinism_error"
+    ]
+    assert (tmp_path / "runs" / "stage3_provider_block_test" / "summary.json").exists()
+
+
 def test_provider_error_steps_are_written_and_counted(tmp_path: Path, monkeypatch) -> None:
     _write_prices(tmp_path / "prices", "AAPL", start="2016-01-01", days=470)
 

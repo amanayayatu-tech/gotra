@@ -117,6 +117,23 @@ uv run python -m gotra.backtest.compare_runs \
   --threshold 0.95
 ```
 
+正式 Stage 3 科学 run 前，先检查 provider 是否具备预注册 replay gate 需要的确定性能力：
+
+```bash
+uv run python -m gotra.backtest.walk_forward \
+  --provider codex_cli \
+  --mode full \
+  --arms baseline \
+  --step-months 1 \
+  --ledger sqlite \
+  --require-stage3-provider \
+  --run-id stage3_provider_gate_check
+```
+
+当前预期结果是 `system_health.status=blocked_provider_determinism`，因为 `codex_cli`
+只支持 prompt-level temperature guidance，不暴露可靠 `temperature/top_p/seed` sampling
+控制。
+
 任何 `codex_cli` full/monthly provider run 都属于高成本动作，启动前必须取得明确批准。
 
 ## 目标
@@ -230,6 +247,8 @@ class DaemonRunConfig:
   `date <= decision_date`。
 - 判断 BT run 健康时读取/生成 `system_health.json`、`summary.json`、
   `event_log.jsonl`、`quality_summary.json`。
+- 正式 Stage 3 科学 run 前使用 `--require-stage3-provider` 确认 provider capability；
+  当前 `codex_cli` 应被阻断为 `blocked_provider_determinism`。
 - 只有 sampled/local correctness 得到验证时，表述为 `BT-sampled PASS`。
 - 保留负面或混合科学结果，如实报告，不改口径。
 - `active -> strong` 知识晋级保持 human-only。
