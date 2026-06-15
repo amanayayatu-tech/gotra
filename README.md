@@ -50,6 +50,8 @@ GitHub CI 执行 `ruff`、全量 `pytest`、直连 LLM import grep、ksana orche
 
 CI green 只代表工程 plumbing、并行 runner、analyzer、ledger 和本地确定性测试通过；它不等于 Stage 3 科学验收通过。正式 BT 验收仍必须另外给出完整 run id、baseline replay compare artifact，并满足预注册 A 类 gate。
 
+面向 AI coding agent 的本地操作规约见 [`SPEC.md`](SPEC.md)；若与 CI workflow 或 runbook 冲突，采用更严格的安全/审计规则。
+
 ---
 
 ## 自主闭环（Definition of Done）

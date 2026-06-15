@@ -1,6 +1,8 @@
 FIX_REPORT_*.md
 *.patch
+*.bundle
 REVIEW_BUNDLE_*.tar.gz
+gotra_BT_full_monthly_prompt.md
 validation-logs/
 
 data/backtest/prices/
