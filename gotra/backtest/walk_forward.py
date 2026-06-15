@@ -9,7 +9,9 @@ import os
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+import threading
+import time
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -18,6 +20,8 @@ import pandas as pd
 
 from gotra.backtest.audit import audit_run
 from gotra.backtest.budget import BudgetExceeded, TokenBudget, estimate_tokens
+from gotra.backtest.ledger import ProviderCall, SQLiteDecisionCache, SQLiteLedger
+from gotra.backtest.parallel import StepTask, run_independent_tasks, run_ticker_chains, stable_step_plan
 from gotra.backtest.price_cache import read_price_cache
 from gotra.backtest.protocol import (
     DEFAULT_END,
@@ -38,6 +42,8 @@ from gotra.backtest.statistics import summarize_steps
 Arm = Literal["baseline", "alaya"]
 ProviderName = Literal["heuristic", "codex_cli"]
 RunMode = Literal["sampled", "full"]
+LedgerBackend = Literal["json", "sqlite"]
+ParallelMode = Literal["off", "baseline", "ticker-chains", "both"]
 SAMPLED_PROMPT_VERSION = "bt-sampled-v1"
 FULL_PROMPT_VERSION = "bt-full-v1"
 BT_CODEX_SYSTEM_PROMPT = """You are the Gotra Phase BT gpt-5.5 xhigh decision provider.
@@ -57,6 +63,8 @@ Return strict JSON only, with exactly these keys:
 {"direction": "long|short|watch|avoid", "expected_change_pct": number, "confidence": number,
 "reasoning": "brief reason"}
 """
+_EVENT_WRITE_LOCK = threading.Lock()
+_STEP_WRITE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -77,6 +85,11 @@ class BacktestConfig:
     provider_preflight: bool = True
     provider_error_abort_consecutive: int = 8
     provider_error_abort_rate: float = 0.10
+    ledger: LedgerBackend = "json"
+    ledger_path: Path | None = None
+    provider_concurrency: int = 1
+    parallel_mode: ParallelMode = "off"
+    resume: bool = False
 
 
 @dataclass(frozen=True)
@@ -474,14 +487,9 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
     for arm in config.arms:
         (run_root / arm).mkdir(parents=True, exist_ok=True)
 
-    cache = DecisionCache(
-        config.data_dir / "runs" / "decision_cache.json",
-        namespace=config.cache_namespace,
-    )
-    budget = TokenBudget.from_env(config.token_budget)
-    provider = _build_provider(config.provider)
+    cache, budget, ledger = _cache_budget_ledger(config=config, run_root=run_root, run_id=run_id)
+    provider = _provider_for_run(config=config, ledger=ledger)
     steps: list[dict[str, Any]] = []
-    feedback_by_ticker: dict[str, list[dict[str, Any]]] = {}
     skipped: list[dict[str, Any]] = []
     budget_error = ""
     provider_abort_reason = ""
@@ -503,50 +511,38 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
                 provider_health["preflight_error"] = str(exc)
                 provider_abort_reason = f"provider preflight failed: {exc}"
 
-        for decision_date in decision_dates(
-            start=config.start,
-            end=config.end,
-            step_months=config.step_months,
-        ):
-            if provider_abort_reason:
-                break
-            for ticker in config.tickers:
-                if config.max_steps is not None and len(steps) >= config.max_steps:
-                    break
-                ticker_steps = _run_ticker_step(
-                    ticker=ticker,
-                    decision_date=decision_date,
+        if not provider_abort_reason:
+            if _parallel_enabled(config):
+                steps, skipped, provider_abort_reason, consecutive_provider_errors = _run_parallel(
                     config=config,
+                    run_root=run_root,
+                    cache=cache,
+                    budget=budget,
+                    ledger=ledger,
+                    initial_steps=steps,
+                    initial_skipped=skipped,
+                    initial_consecutive_provider_errors=consecutive_provider_errors,
+                )
+            else:
+                steps, skipped, provider_abort_reason, consecutive_provider_errors = _run_serial(
+                    config=config,
+                    run_root=run_root,
                     provider=provider,
                     cache=cache,
                     budget=budget,
-                    feedback_by_ticker=feedback_by_ticker,
-                    run_root=run_root,
-                    skipped=skipped,
-                    next_step_index=len(steps) + 1,
+                    initial_steps=steps,
+                    initial_skipped=skipped,
+                    initial_consecutive_provider_errors=consecutive_provider_errors,
                 )
-                steps.extend(ticker_steps)
-                for step in ticker_steps:
-                    if step.get("status") == "provider_error":
-                        consecutive_provider_errors += 1
-                    else:
-                        consecutive_provider_errors = 0
-                provider_abort_reason = _provider_abort_reason(
-                    config=config,
-                    provider=provider,
-                    steps=steps,
-                    consecutive_provider_errors=consecutive_provider_errors,
-                )
-                if provider_abort_reason:
-                    provider_health["abort_reason"] = provider_abort_reason
-                    break
-                if budget.over_budget_error:
-                    raise BudgetExceeded(budget.over_budget_error)
-            if config.max_steps is not None and len(steps) >= config.max_steps:
-                break
+            if provider_abort_reason:
+                provider_health["abort_reason"] = provider_abort_reason
+            if budget.over_budget_error:
+                raise BudgetExceeded(budget.over_budget_error)
     except BudgetExceeded as exc:
         budget_error = str(exc)
 
+    steps = sorted(steps, key=lambda item: int(item.get("step") or 0))
+    _record_steps(ledger=ledger, run_root=run_root, steps=steps)
     audit = audit_run(run_root)
     metrics = summarize_steps(steps)
     provider_errors = sum(1 for step in steps if step.get("status") == "provider_error")
@@ -587,6 +583,8 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
         "perplexity_disabled": True,
         "provider_errors": provider_errors,
         "token_budget": budget.snapshot(),
+        "ledger": _ledger_metadata(config=config, ledger=ledger),
+        "parallel": _parallel_metadata(config),
         "system_health": system_health,
         "audit": audit.to_dict(),
         "metrics": metrics,
@@ -603,7 +601,366 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    from gotra.backtest.analyze import analyze_run
+
+    summary = analyze_run(run_root)["summary"]
     return summary
+
+
+def _cache_budget_ledger(
+    *,
+    config: BacktestConfig,
+    run_root: Path,
+    run_id: str,
+) -> tuple[Any, Any, SQLiteLedger | None]:
+    if config.ledger == "sqlite":
+        base_budget = TokenBudget.from_env(config.token_budget)
+        ledger = SQLiteLedger(
+            config.ledger_path or run_root / "run_ledger.sqlite",
+            run_id=run_id,
+            cache_namespace=config.cache_namespace,
+            max_tokens=base_budget.max_tokens,
+        )
+        return SQLiteDecisionCache(ledger), ledger, ledger
+    cache = DecisionCache(
+        config.data_dir / "runs" / "decision_cache.json",
+        namespace=config.cache_namespace,
+    )
+    return cache, TokenBudget.from_env(config.token_budget), None
+
+
+def _parallel_enabled(config: BacktestConfig) -> bool:
+    return config.parallel_mode != "off" or config.provider_concurrency > 1
+
+
+def _parallel_metadata(config: BacktestConfig) -> dict[str, Any]:
+    return {
+        "mode": config.parallel_mode,
+        "provider_concurrency": config.provider_concurrency,
+        "resume": config.resume,
+    }
+
+
+def _ledger_metadata(config: BacktestConfig, ledger: SQLiteLedger | None) -> dict[str, Any]:
+    return {
+        "backend": config.ledger,
+        "path": str(ledger.path) if ledger else "",
+    }
+
+
+def _provider_for_run(
+    *,
+    config: BacktestConfig,
+    ledger: SQLiteLedger | None,
+) -> DecisionProvider:
+    provider = _build_provider(config.provider)
+    if ledger is None:
+        return provider
+    return _LedgerProvider(provider=provider, ledger=ledger)
+
+
+class _LedgerProvider:
+    def __init__(self, *, provider: DecisionProvider, ledger: SQLiteLedger) -> None:
+        self.provider = provider
+        self.ledger = ledger
+        self.network_enabled = provider.network_enabled
+
+    def preflight(self) -> None:
+        preflight = getattr(self.provider, "preflight", None)
+        if preflight is not None:
+            preflight()
+
+    def decide(self, **kwargs: Any) -> Decision:
+        started = time.perf_counter()
+        started_at = datetime.now(UTC).isoformat()
+        status = "ok"
+        error_type = ""
+        estimated_tokens = 0
+        try:
+            decision = self.provider.decide(**kwargs)
+            estimated_tokens = decision.estimated_tokens
+            return decision
+        except Exception as exc:
+            status = "error"
+            error_type = type(exc).__name__
+            estimated_tokens = int(getattr(exc, "estimated_tokens", 0) or 0)
+            raise
+        finally:
+            finished_at = datetime.now(UTC).isoformat()
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            self.ledger.record_provider_call(
+                ProviderCall(
+                    call_id=(
+                        f"{threading.get_ident()}:{time.time_ns()}:"
+                        f"{kwargs.get('ticker')}:{kwargs.get('decision_date')}:{kwargs.get('arm')}"
+                    ),
+                    worker_id=str(threading.get_ident()),
+                    arm=str(kwargs.get("arm") or ""),
+                    ticker=str(kwargs.get("ticker") or ""),
+                    decision_date=str(kwargs.get("decision_date") or ""),
+                    cache_key=(
+                        f"{kwargs.get('ticker')}:{kwargs.get('decision_date')}:{kwargs.get('arm')}"
+                    ),
+                    status=status,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    elapsed_ms=elapsed_ms,
+                    estimated_tokens=estimated_tokens,
+                    error_type=error_type,
+                )
+            )
+
+
+def _run_serial(
+    *,
+    config: BacktestConfig,
+    run_root: Path,
+    provider: DecisionProvider,
+    cache: Any,
+    budget: Any,
+    initial_steps: list[dict[str, Any]],
+    initial_skipped: list[dict[str, Any]],
+    initial_consecutive_provider_errors: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str, int]:
+    steps = list(initial_steps)
+    skipped = list(initial_skipped)
+    feedback_by_ticker: dict[str, list[dict[str, Any]]] = {}
+    provider_abort_reason = ""
+    consecutive_provider_errors = initial_consecutive_provider_errors
+
+    for decision_date in decision_dates(
+        start=config.start,
+        end=config.end,
+        step_months=config.step_months,
+    ):
+        if provider_abort_reason:
+            break
+        for ticker in config.tickers:
+            if config.max_steps is not None and len(steps) >= config.max_steps:
+                break
+            resumed_steps = _resume_ticker_steps(
+                config=config,
+                run_root=run_root,
+                ticker=ticker,
+                decision_date=decision_date,
+                feedback_by_ticker=feedback_by_ticker,
+            )
+            if resumed_steps:
+                ticker_steps = resumed_steps
+            else:
+                ticker_steps = _run_ticker_step(
+                    ticker=ticker,
+                    decision_date=decision_date,
+                    config=config,
+                    provider=provider,
+                    cache=cache,
+                    budget=budget,
+                    feedback_by_ticker=feedback_by_ticker,
+                    run_root=run_root,
+                    skipped=skipped,
+                    next_step_index=len(steps) + 1,
+                )
+            steps.extend(ticker_steps)
+            consecutive_provider_errors = _consecutive_provider_errors(
+                steps=ticker_steps,
+                current=consecutive_provider_errors,
+            )
+            provider_abort_reason = _provider_abort_reason(
+                config=config,
+                provider=provider,
+                steps=steps,
+                consecutive_provider_errors=consecutive_provider_errors,
+            )
+            if provider_abort_reason or budget.over_budget_error:
+                break
+        if config.max_steps is not None and len(steps) >= config.max_steps:
+            break
+    return steps, skipped, provider_abort_reason, consecutive_provider_errors
+
+
+def _run_parallel(
+    *,
+    config: BacktestConfig,
+    run_root: Path,
+    cache: Any,
+    budget: Any,
+    ledger: SQLiteLedger | None,
+    initial_steps: list[dict[str, Any]],
+    initial_skipped: list[dict[str, Any]],
+    initial_consecutive_provider_errors: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str, int]:
+    if ledger is None or config.ledger != "sqlite":
+        raise ValueError("parallel BT execution requires --ledger sqlite")
+    if config.parallel_mode == "baseline" and config.arms != ("baseline",):
+        raise ValueError("--parallel-mode baseline requires --arms baseline")
+    if config.provider_concurrency < 1:
+        raise ValueError("--provider-concurrency must be >= 1")
+
+    if config.parallel_mode == "baseline" or config.arms == ("baseline",):
+        tasks = stable_step_plan(
+            tickers=config.tickers,
+            decision_dates=decision_dates(
+                start=config.start,
+                end=config.end,
+                step_months=config.step_months,
+            ),
+            arms=("baseline",),
+            max_steps=config.max_steps,
+        )
+        worker = _parallel_step_worker(
+            config=replace(config, arms=("baseline",)),
+            run_root=run_root,
+            cache=cache,
+            budget=budget,
+            ledger=ledger,
+        )
+        results = run_independent_tasks(tasks, worker, max_workers=config.provider_concurrency)
+    else:
+        tasks = _ticker_group_tasks(config)
+        worker = _parallel_step_worker(
+            config=config,
+            run_root=run_root,
+            cache=cache,
+            budget=budget,
+            ledger=ledger,
+        )
+        results = run_ticker_chains(tasks, worker, max_workers=config.provider_concurrency)
+
+    steps = list(initial_steps)
+    skipped = list(initial_skipped)
+    for ticker_steps, ticker_skipped in results:
+        steps.extend(ticker_steps)
+        skipped.extend(ticker_skipped)
+    consecutive_provider_errors = initial_consecutive_provider_errors
+    for step in sorted(steps, key=lambda item: int(item.get("step") or 0)):
+        consecutive_provider_errors = 1 + consecutive_provider_errors if step.get("status") == "provider_error" else 0
+    provider_abort_reason = _provider_abort_reason(
+        config=config,
+        provider=_provider_for_run(config=config, ledger=ledger),
+        steps=steps,
+        consecutive_provider_errors=consecutive_provider_errors,
+    )
+    return steps, skipped, provider_abort_reason, consecutive_provider_errors
+
+
+def _parallel_step_worker(
+    *,
+    config: BacktestConfig,
+    run_root: Path,
+    cache: Any,
+    budget: Any,
+    ledger: SQLiteLedger,
+) -> Any:
+    feedback_by_ticker: dict[str, list[dict[str, Any]]] = {ticker.symbol: [] for ticker in config.tickers}
+
+    def worker(task: StepTask) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        skipped: list[dict[str, Any]] = []
+        resumed_steps = _resume_ticker_steps(
+            config=config,
+            run_root=run_root,
+            ticker=task.ticker,
+            decision_date=task.decision_date,
+            feedback_by_ticker=feedback_by_ticker,
+        )
+        if resumed_steps:
+            return resumed_steps, skipped
+        provider = _provider_for_run(config=config, ledger=ledger)
+        ticker_steps = _run_ticker_step(
+            ticker=task.ticker,
+            decision_date=task.decision_date,
+            config=config,
+            provider=provider,
+            cache=cache,
+            budget=budget,
+            feedback_by_ticker=feedback_by_ticker,
+            run_root=run_root,
+            skipped=skipped,
+            next_step_index=task.step_index,
+        )
+        return ticker_steps, skipped
+
+    return worker
+
+
+def _ticker_group_tasks(config: BacktestConfig) -> list[StepTask]:
+    first_arm = config.arms[0]
+    return [
+        task
+        for task in stable_step_plan(
+            tickers=config.tickers,
+            decision_dates=decision_dates(
+                start=config.start,
+                end=config.end,
+                step_months=config.step_months,
+            ),
+            arms=config.arms,
+            max_steps=config.max_steps,
+        )
+        if task.arm == first_arm
+    ]
+
+
+def _resume_ticker_steps(
+    *,
+    config: BacktestConfig,
+    run_root: Path,
+    ticker: TickerSpec,
+    decision_date: date,
+    feedback_by_ticker: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    if not config.resume:
+        return []
+    paths = [_step_path(run_root, arm=arm, ticker=ticker.symbol, decision_date=decision_date) for arm in config.arms]
+    if not all(path.exists() for path in paths):
+        return []
+    steps = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+    for step in sorted(steps, key=lambda item: int(item.get("step") or 0)):
+        if step.get("arm") == "alaya" and step.get("status") == "scored":
+            feedback_by_ticker.setdefault(ticker.symbol, []).append(
+                {
+                    "decision_date": step["decision_date"],
+                    "outcome_availability_date": step["outcome_as_of"],
+                    "error": step["error"],
+                    "actual_change_pct": step["actual_change_pct"],
+                    "expected_change_pct": step["expected_change_pct"],
+                }
+            )
+    return steps
+
+
+def _consecutive_provider_errors(*, steps: list[dict[str, Any]], current: int) -> int:
+    consecutive = current
+    for step in steps:
+        if step.get("status") == "provider_error":
+            consecutive += 1
+        else:
+            consecutive = 0
+    return consecutive
+
+
+def _record_steps(
+    *,
+    ledger: SQLiteLedger | None,
+    run_root: Path,
+    steps: list[dict[str, Any]],
+) -> None:
+    if ledger is None:
+        return
+    for step in steps:
+        ledger.record_step(
+            step_id=f"{int(step.get('step') or 0):06d}:{step.get('decision_date')}:{step.get('ticker')}:{step.get('arm')}",
+            step_index=int(step.get("step") or 0),
+            arm=str(step.get("arm") or ""),
+            ticker=str(step.get("ticker") or ""),
+            decision_date=str(step.get("decision_date") or ""),
+            status=str(step.get("status") or ""),
+            step_path=str(_step_path(
+                run_root,
+                arm=str(step.get("arm") or ""),
+                ticker=str(step.get("ticker") or ""),
+                decision_date=parse_date(str(step.get("decision_date"))),
+            )),
+        )
 
 
 def _build_provider(name: ProviderName) -> DecisionProvider:
@@ -1015,12 +1372,24 @@ def _provider_metadata(provider: ProviderName) -> dict[str, Any]:
 
 
 def _write_step(run_root: Path, step: dict[str, Any]) -> None:
-    arm_dir = run_root / str(step["arm"])
-    filename = f"step_{step['decision_date']}_{ticker_slug(step['ticker'])}.json"
-    (arm_dir / filename).write_text(
+    path = _step_path(
+        run_root,
+        arm=str(step["arm"]),
+        ticker=str(step["ticker"]),
+        decision_date=parse_date(str(step["decision_date"])),
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + f".{threading.get_ident()}.tmp")
+    tmp_path.write_text(
         json.dumps(step, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    with _STEP_WRITE_LOCK:
+        tmp_path.replace(path)
+
+
+def _step_path(run_root: Path, *, arm: str, ticker: str, decision_date: date) -> Path:
+    return run_root / arm / f"step_{decision_date.isoformat()}_{ticker_slug(ticker)}.json"
 
 
 def _append_event(run_root: Path, step: dict[str, Any]) -> None:
@@ -1037,8 +1406,9 @@ def _append_event(run_root: Path, step: dict[str, Any]) -> None:
     }
     if step.get("provider_error"):
         event["provider_error"] = step["provider_error"]
-    with (run_root / "event_log.jsonl").open("a", encoding="utf-8") as file_obj:
-        file_obj.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    with _EVENT_WRITE_LOCK:
+        with (run_root / "event_log.jsonl").open("a", encoding="utf-8") as file_obj:
+            file_obj.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 def _build_codex_prompt_payload(
@@ -1295,6 +1665,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="",
         help="Optional cache namespace for independent provider replays without changing prompts.",
     )
+    parser.add_argument("--ledger", choices=["json", "sqlite"], default="json")
+    parser.add_argument("--ledger-path", default="")
+    parser.add_argument("--provider-concurrency", type=int, default=1)
+    parser.add_argument(
+        "--parallel-mode",
+        choices=["off", "baseline", "ticker-chains", "both"],
+        default="off",
+    )
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--no-provider-preflight", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -1316,6 +1696,12 @@ def main(argv: list[str] | None = None) -> int:
             max_steps=args.max_steps,
             arms=_parse_arms(args.arms),
             cache_namespace=args.cache_namespace,
+            provider_preflight=not args.no_provider_preflight,
+            ledger=args.ledger,
+            ledger_path=Path(args.ledger_path) if args.ledger_path else None,
+            provider_concurrency=args.provider_concurrency,
+            parallel_mode=args.parallel_mode,
+            resume=args.resume,
         )
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))

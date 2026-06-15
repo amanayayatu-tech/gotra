@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -94,11 +95,14 @@ def test_sampled_backtest_writes_steps_audit_summary_and_report(tmp_path: Path) 
     assert alaya_steps
     assert (run_root / "event_log.jsonl").exists()
     assert (run_root / "system_health.json").exists()
+    assert (run_root / "quality_summary.json").exists()
     assert (tmp_path / "REPORT_backtest.md").exists()
     assert (tmp_path / "REPORT_backtest_mse.svg").exists()
     system_health = json.loads((run_root / "system_health.json").read_text(encoding="utf-8"))
     assert system_health["status"] == "ok"
     assert system_health["token_budget"]["max_tokens"] == 10_000
+    quality_summary = json.loads((run_root / "quality_summary.json").read_text(encoding="utf-8"))
+    assert quality_summary["overall_status"] in {"pass", "low_coverage"}
 
     step = json.loads(alaya_steps[0].read_text(encoding="utf-8"))
     assert step["future_data_allowed"] is False
@@ -458,6 +462,138 @@ def test_backtest_can_run_baseline_arm_only(tmp_path: Path) -> None:
     assert summary["metrics"]["paired_steps"] == 0
     assert len(list((run_root / "baseline").glob("step_*.json"))) == 1
     assert not (run_root / "alaya").exists()
+
+
+def test_sqlite_ledger_serial_backtest_writes_ledger(tmp_path: Path) -> None:
+    _write_prices(tmp_path / "prices", "AAPL", start="2016-01-01", days=470)
+
+    summary = run_backtest(
+        BacktestConfig(
+            data_dir=tmp_path,
+            run_id="sqlite_serial",
+            mode="sampled",
+            provider="heuristic",
+            start=date(2016, 1, 1),
+            end=date(2017, 1, 1),
+            step_months=3,
+            tickers=(TickerSpec("AAPL", "Apple", date(1980, 12, 12)),),
+            token_budget=10_000,
+            ledger="sqlite",
+        )
+    )
+
+    ledger_path = tmp_path / "runs" / "sqlite_serial" / "run_ledger.sqlite"
+    assert summary["ledger"]["backend"] == "sqlite"
+    assert ledger_path.exists()
+    with sqlite3.connect(ledger_path) as conn:
+        assert conn.execute("select count(*) from steps").fetchone()[0] == 2
+        assert conn.execute("select count(*) from provider_calls").fetchone()[0] == 2
+
+
+def test_baseline_parallel_backtest_writes_ordered_steps(tmp_path: Path) -> None:
+    _write_prices(tmp_path / "prices", "AAPL", start="2016-01-01", days=470)
+    _write_prices(tmp_path / "prices", "MSFT", start="2016-01-01", days=470)
+
+    summary = run_backtest(
+        BacktestConfig(
+            data_dir=tmp_path,
+            run_id="parallel_baseline",
+            mode="sampled",
+            provider="heuristic",
+            start=date(2016, 1, 1),
+            end=date(2017, 1, 1),
+            step_months=3,
+            tickers=(
+                TickerSpec("AAPL", "Apple", date(1980, 12, 12)),
+                TickerSpec("MSFT", "Microsoft", date(1986, 3, 13)),
+            ),
+            token_budget=100_000,
+            arms=("baseline",),
+            ledger="sqlite",
+            provider_concurrency=2,
+            parallel_mode="baseline",
+        )
+    )
+
+    run_root = tmp_path / "runs" / "parallel_baseline"
+    steps = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((run_root / "baseline").glob("step_*.json"))
+    ]
+    assert summary["parallel"]["mode"] == "baseline"
+    assert summary["steps_written"] == 2
+    assert [step["step"] for step in sorted(steps, key=lambda item: item["step"])] == [1, 2]
+    assert summary["audit"]["ok"] is True
+
+
+def test_parallel_resume_reuses_existing_steps_without_provider_call(tmp_path: Path, monkeypatch) -> None:
+    _write_prices(tmp_path / "prices", "AAPL", start="2016-01-01", days=470)
+    config = BacktestConfig(
+        data_dir=tmp_path,
+        run_id="parallel_resume",
+        mode="sampled",
+        provider="heuristic",
+        start=date(2016, 1, 1),
+        end=date(2017, 1, 1),
+        step_months=3,
+        tickers=(TickerSpec("AAPL", "Apple", date(1980, 12, 12)),),
+        token_budget=100_000,
+        arms=("baseline",),
+        ledger="sqlite",
+        provider_concurrency=2,
+        parallel_mode="baseline",
+    )
+    first = run_backtest(config)
+
+    class ExplodingProvider:
+        network_enabled = False
+
+        def decide(self, **_kwargs):
+            raise AssertionError("resume should not call provider")
+
+    monkeypatch.setattr(walk_forward, "_build_provider", lambda _name: ExplodingProvider())
+    second = run_backtest(BacktestConfig(**{**config.__dict__, "resume": True}))
+
+    assert first["steps_written"] == second["steps_written"] == 1
+    event_rows = (tmp_path / "runs" / "parallel_resume" / "event_log.jsonl").read_text().splitlines()
+    assert len(event_rows) == 1
+
+
+def test_alaya_ticker_chain_parallel_preserves_feedback_order(tmp_path: Path) -> None:
+    _write_prices(tmp_path / "prices", "AAPL", start="2016-01-01", days=760)
+    _write_prices(tmp_path / "prices", "MSFT", start="2016-01-01", days=760)
+
+    summary = run_backtest(
+        BacktestConfig(
+            data_dir=tmp_path,
+            run_id="parallel_alaya_chain",
+            mode="sampled",
+            provider="heuristic",
+            start=date(2016, 1, 1),
+            end=date(2017, 7, 1),
+            step_months=3,
+            tickers=(
+                TickerSpec("AAPL", "Apple", date(1980, 12, 12)),
+                TickerSpec("MSFT", "Microsoft", date(1986, 3, 13)),
+            ),
+            token_budget=100_000,
+            ledger="sqlite",
+            provider_concurrency=2,
+            parallel_mode="ticker-chains",
+        )
+    )
+
+    run_root = tmp_path / "runs" / "parallel_alaya_chain"
+    alaya_steps = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((run_root / "alaya").glob("step_*.json"))
+    ]
+    later_aapl = next(
+        step for step in alaya_steps if step["ticker"] == "AAPL" and step["decision_date"] == "2017-04-01"
+    )
+    assert summary["steps_written"] == 12
+    assert summary["metrics"]["paired_steps"] == 6
+    assert any(item["kind"] == "alaya_feedback" for item in later_aapl["decision_inputs"])
 
 
 def test_direction_agreement_compares_baseline_replay_runs(tmp_path: Path) -> None:

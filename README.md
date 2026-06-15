@@ -48,6 +48,8 @@
 
 GitHub CI 执行 `ruff`、全量 `pytest`、直连 LLM import grep、ksana orchestration guard。详见 [CI workflow](.github/workflows/ci.yml)。
 
+CI green 只代表工程 plumbing、并行 runner、analyzer、ledger 和本地确定性测试通过；它不等于 Stage 3 科学验收通过。正式 BT 验收仍必须另外给出完整 run id、baseline replay compare artifact，并满足预注册 A 类 gate。
+
 ---
 
 ## 自主闭环（Definition of Done）
@@ -174,6 +176,7 @@ uv run python -m gotra.daemon_orchestration.run --once --type morning --dry-run
 ```bash
 uv run ruff check . --force-exclude
 uv run pytest -q
+uv run pytest -q tests/test_backtest_analyze.py tests/test_backtest_ledger.py tests/test_backtest_parallel.py tests/test_backtest_walk_forward.py
 uv run pytest -q engine/ksana/tests/orchestrator/test_decision_checks.py
 git diff --check
 ```
@@ -182,7 +185,7 @@ git diff --check
 
 ## 状态
 
-🚧 早期建设中。当前代码线已推进到 BT provider-fix 分支：基础自主层、回测 harness、Codex CLI provider 隔离、baseline replay compare、provider health artifacts 已落地。最近一次正式 BT Stage 3 的机械链路健康，但预注册 A 类 baseline replay 方向一致率未达 `95%`，因此不能标记为正式验收全绿。下一步执行计划见 [`docs/BT_PARALLEL_RUNNER_REPAIR_PLAN.md`](docs/BT_PARALLEL_RUNNER_REPAIR_PLAN.md)。
+🚧 早期建设中。当前代码线已推进到 BT provider-fix 分支：基础自主层、回测 harness、Codex CLI provider 隔离、baseline replay compare、provider health artifacts、BT analyzer、SQLite ledger、baseline 并行和 Alaya ticker-chain 并行已落地。最近一次正式 BT Stage 3 的机械链路健康，但预注册 A 类 baseline replay 方向一致率未达 `95%`，因此不能标记为正式验收全绿。下一步执行计划见 [`docs/BT_PARALLEL_RUNNER_REPAIR_PLAN.md`](docs/BT_PARALLEL_RUNNER_REPAIR_PLAN.md)。
 
 ## License
 

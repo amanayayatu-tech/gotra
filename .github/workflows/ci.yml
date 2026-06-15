@@ -39,9 +39,80 @@ jobs:
       - name: Tests
         run: uv run pytest -q
 
+      - name: BT repair tests
+        run: |
+          uv run pytest -q \
+            tests/test_backtest_analyze.py \
+            tests/test_backtest_ledger.py \
+            tests/test_backtest_parallel.py \
+            tests/test_backtest_walk_forward.py
+
+      - name: BT heuristic parallel canaries
+        run: |
+          BT_TMP="$(mktemp -d)"
+          export BT_TMP
+          uv run python - <<'PY'
+          from datetime import date, timedelta
+          from pathlib import Path
+          import os
+
+          root = Path(os.environ["BT_TMP"]) / "prices"
+          root.mkdir(parents=True, exist_ok=True)
+          start = date(2016, 1, 1)
+          for ticker, offset in {"AAPL": 0.0, "MSFT": 12.5}.items():
+              rows = ["date,ticker,adj_close,source_url,evidence_unverified"]
+              for index in range(900):
+                  current = start + timedelta(days=index)
+                  rows.append(
+                      f"{current.isoformat()},{ticker},{100 + offset + index * 0.17:.6f},fixture,false"
+                  )
+              (root / f"{ticker}.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+          PY
+
+          uv run python -m gotra.backtest.walk_forward \
+            --data-dir "$BT_TMP" \
+            --run-id ci_parallel_baseline \
+            --mode sampled \
+            --provider heuristic \
+            --start 2016-01-01 \
+            --end 2017-01-01 \
+            --step-months 3 \
+            --tickers AAPL,MSFT \
+            --arms baseline \
+            --ledger sqlite \
+            --provider-concurrency 2 \
+            --parallel-mode baseline \
+            --token-budget 100000 \
+            > "$BT_TMP/ci_parallel_baseline.json"
+
+          uv run python -m gotra.backtest.walk_forward \
+            --data-dir "$BT_TMP" \
+            --run-id ci_parallel_alaya \
+            --mode sampled \
+            --provider heuristic \
+            --start 2016-01-01 \
+            --end 2017-07-01 \
+            --step-months 3 \
+            --tickers AAPL,MSFT \
+            --arms baseline,alaya \
+            --ledger sqlite \
+            --provider-concurrency 2 \
+            --parallel-mode ticker-chains \
+            --token-budget 100000 \
+            > "$BT_TMP/ci_parallel_alaya.json"
+
+          uv run python -m gotra.backtest.analyze \
+            --run-root "$BT_TMP/runs/ci_parallel_alaya" \
+            --min-paired-coverage 0.95 \
+            > "$BT_TMP/ci_parallel_analyze.json"
+
+          uv run python -m json.tool "$BT_TMP/ci_parallel_baseline.json" >/dev/null
+          uv run python -m json.tool "$BT_TMP/ci_parallel_alaya.json" >/dev/null
+          uv run python -m json.tool "$BT_TMP/ci_parallel_analyze.json" >/dev/null
+
       - name: No direct vendor LLM imports
         run: |
-          python - <<'PY'
+          uv run python - <<'PY'
           from pathlib import Path
           import re
 
@@ -59,6 +130,76 @@ jobs:
           if matches:
               print("Direct OpenAI/Anthropic imports are forbidden outside the ksana Codex provider adapter.")
               print("\n".join(matches))
+              raise SystemExit(1)
+          PY
+
+      - name: No direct vendor endpoints or SDK dependencies
+        run: |
+          uv run python - <<'PY'
+          from pathlib import Path
+          import re
+
+          allowed = {Path("engine/ksana/chairman/llm/narrative_generator.py")}
+          pattern = re.compile(r"api\.openai\.com|api\.anthropic\.com|OpenAI\(|Anthropic\(")
+          matches = []
+          for path in Path(".").rglob("*.py"):
+              if path in allowed or ".venv" in path.parts:
+                  continue
+              text = path.read_text(encoding="utf-8", errors="ignore")
+              for lineno, line in enumerate(text.splitlines(), 1):
+                  if pattern.search(line):
+                      matches.append(f"{path}:{lineno}:{line.strip()}")
+
+          pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
+          for dependency in ("openai", "anthropic"):
+              if re.search(rf'["\']{dependency}[<>=~!]', pyproject):
+                  matches.append(f"pyproject.toml: direct {dependency} dependency")
+
+          if matches:
+              print("Direct vendor endpoints/SDK clients are forbidden in gotra.")
+              print("\n".join(matches))
+              raise SystemExit(1)
+          PY
+
+      - name: Repository hygiene guard
+        run: |
+          uv run python - <<'PY'
+          import subprocess
+
+          tracked = subprocess.check_output(["git", "ls-files"], text=True).splitlines()
+          forbidden_prefixes = (
+              "data/backtest/prices/",
+              "data/backtest/runs/",
+              "data/backtest/_invalid_runs/",
+              "validation-logs/",
+          )
+          forbidden_suffixes = (
+              ".patch",
+              ".tar.gz",
+              ".sqlite",
+              ".db",
+              ".pyc",
+          )
+          forbidden_names = {".DS_Store"}
+          violations = []
+          for path in tracked:
+              name = path.rsplit("/", 1)[-1]
+              if path.startswith(forbidden_prefixes):
+                  violations.append(path)
+              if path.startswith("data/backtest/REPORT_backtest"):
+                  violations.append(path)
+              if path.startswith("FIX_REPORT_") or path.startswith("REVIEW_BUNDLE_"):
+                  violations.append(path)
+              if path.startswith(".env") and path != ".env.example":
+                  violations.append(path)
+              if name in forbidden_names or name == "__pycache__":
+                  violations.append(path)
+              if path.endswith(forbidden_suffixes):
+                  violations.append(path)
+
+          if violations:
+              print("Forbidden generated artifacts are tracked:")
+              print("\n".join(sorted(set(violations))))
               raise SystemExit(1)
           PY
 

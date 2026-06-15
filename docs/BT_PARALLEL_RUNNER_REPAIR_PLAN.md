@@ -1,6 +1,6 @@
 # BT Parallel Runner Repair Plan
 
-Status: executable repair plan, not a claim that the existing Stage 3 experiment passed.
+Status: implemented repair plan for runner plumbing, not a claim that the existing Stage 3 experiment passed.
 
 Date: 2026-06-15
 
@@ -14,7 +14,7 @@ The completed BT Stage 3 run is mechanically healthy but not formally valid:
 
 The failure is not a cache, isolation, or audit failure. It is a reproducibility failure caused by the current Codex CLI provider surface not exposing reliable `temperature`, `top_p`, or seed controls.
 
-This plan repairs the runner so future verification is faster, resumable, and auditable. It does not lower the preregistered gate and does not reinterpret the failed Stage 3 run as valid.
+This plan repairs the runner so future verification is faster, resumable, and auditable. It does not lower the preregistered gate and does not reinterpret the failed Stage 3 run as valid. CI green means this repair plumbing is healthy; formal Stage 3 acceptance still requires a full baseline replay compare artifact with direction agreement `>=95%`.
 
 ## 2. Iron Laws
 
@@ -107,8 +107,8 @@ Acceptance:
 
 Files:
 
-- `gotra/backtest/analyze.py`
-- `tests/test_backtest_analyze.py`
+- `gotra/backtest/analyze.py` implemented
+- `tests/test_backtest_analyze.py` implemented
 
 Steps:
 
@@ -150,9 +150,9 @@ Acceptance:
 
 Files:
 
-- `gotra/backtest/ledger.py`
-- `gotra/backtest/walk_forward.py`
-- `tests/test_backtest_ledger.py`
+- `gotra/backtest/ledger.py` implemented
+- `gotra/backtest/walk_forward.py` integrated behind `--ledger sqlite`
+- `tests/test_backtest_ledger.py` implemented
 
 Steps:
 
@@ -183,9 +183,9 @@ Acceptance:
 
 Files:
 
-- `gotra/backtest/parallel.py`
-- `gotra/backtest/walk_forward.py`
-- `tests/test_backtest_parallel.py`
+- `gotra/backtest/parallel.py` implemented
+- `gotra/backtest/walk_forward.py` integrated behind `--parallel-mode baseline`
+- `tests/test_backtest_parallel.py` implemented
 
 Steps:
 
@@ -230,9 +230,9 @@ Acceptance:
 
 Files:
 
-- `gotra/backtest/parallel.py`
-- `gotra/backtest/walk_forward.py`
-- `tests/test_backtest_parallel_alaya.py`
+- `gotra/backtest/parallel.py` implemented
+- `gotra/backtest/walk_forward.py` integrated behind `--parallel-mode ticker-chains`
+- `tests/test_backtest_walk_forward.py` includes Alaya ticker-chain integration coverage
 
 Steps:
 
@@ -244,7 +244,7 @@ Steps:
 Validation:
 
 ```bash
-uv run pytest -q tests/test_backtest_parallel_alaya.py
+uv run pytest -q tests/test_backtest_parallel.py tests/test_backtest_walk_forward.py
 uv run python -m gotra.backtest.walk_forward --provider heuristic --mode sampled --arms alaya --provider-concurrency 4 --parallel-mode ticker-chains --ledger sqlite --run-id heuristic_parallel_alaya --max-steps 40
 uv run python -m gotra.backtest.analyze --run-root data/backtest/runs/heuristic_parallel_alaya
 ```
@@ -325,4 +325,5 @@ The repair is complete only when all are true:
 - SQLite ledger passes race and resume tests.
 - Baseline parallel canary shows speedup without cache, budget, or event-log corruption.
 - Alaya ticker-chain parallel canary preserves serial feedback semantics.
-- Final report states whether the preregistered replay gate passes or fails, without changing the gate.
+- Repair report states that CI green is not formal Stage 3 acceptance.
+- Formal Stage 3 report states whether the preregistered replay gate passes or fails, without changing the gate.
