@@ -1,6 +1,7 @@
 # BT Parallel Runner Repair Plan
 
-Status: implemented repair plan for runner plumbing, not a claim that the existing Stage 3 experiment passed.
+Status: implemented repair plan for runner plumbing. Stage 3 is now frozen as A-class gate failure
+and negative/mixed scientific result; see `docs/STAGE3_FINAL_VERDICT_20260615.md`.
 
 Date: 2026-06-15
 
@@ -16,7 +17,7 @@ The completed BT Stage 3 run is mechanically healthy but not formally valid:
 
 The failure is not a cache, isolation, or audit failure. It is a reproducibility failure caused by the current Codex CLI provider surface not exposing reliable `temperature`, `top_p`, or seed controls.
 
-This plan repairs the runner so future verification is faster, resumable, and auditable. It does not lower the preregistered gate and does not reinterpret the failed Stage 3 run as valid. CI green means this repair plumbing is healthy; formal Stage 3 acceptance still requires a full baseline replay compare artifact with direction agreement `>=95%`.
+This plan repaired the runner so future verification is faster, resumable, and auditable. It did not lower the preregistered gate and did not reinterpret the failed Stage 3 run as valid. CI green means this repair plumbing is healthy; Stage 3 remains failed because the final baseline replay compare artifact stayed below `95%`.
 
 ## 2. Iron Laws
 
