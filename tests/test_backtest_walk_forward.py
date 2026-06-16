@@ -1131,6 +1131,42 @@ def test_direction_agreement_compares_baseline_replay_runs(tmp_path: Path) -> No
     ]
 
 
+def test_direction_agreement_can_exclude_non_common_scored_steps(tmp_path: Path) -> None:
+    reference = tmp_path / "reference"
+    candidate = tmp_path / "candidate"
+    (reference / "baseline").mkdir(parents=True)
+    (candidate / "baseline").mkdir(parents=True)
+    _write_step_json(reference / "baseline" / "step_2020-01-01_aapl.json", "AAPL", "2020-01-01", "long")
+    _write_step_json(candidate / "baseline" / "step_2020-01-01_aapl.json", "AAPL", "2020-01-01", "long")
+    _write_step_json(reference / "baseline" / "step_2020-02-01_msft.json", "MSFT", "2020-02-01", "avoid")
+    (candidate / "baseline" / "step_2020-02-01_msft.json").write_text(
+        json.dumps(
+            {
+                "status": "provider_error",
+                "ticker": "MSFT",
+                "decision_date": "2020-02-01",
+                "provider_error": "transport timeout",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    default_result = direction_agreement(reference_run=reference, candidate_run=candidate)
+    paired_result = direction_agreement(
+        reference_run=reference,
+        candidate_run=candidate,
+        paired_success_only=True,
+    )
+
+    assert default_result["total"] == 2
+    assert default_result["same"] == 1
+    assert default_result["mismatches"][0]["reason"] == "missing_candidate_step"
+    assert paired_result["total"] == 1
+    assert paired_result["same"] == 1
+    assert paired_result["rate"] == 1.0
+    assert paired_result["common_scored_steps"] == 1
+
+
 def test_knowledge_cards_use_only_matured_feedback() -> None:
     feedback = [
         {

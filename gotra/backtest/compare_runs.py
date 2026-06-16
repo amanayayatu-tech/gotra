@@ -15,12 +15,15 @@ def direction_agreement(
     reference_run: Path,
     candidate_run: Path,
     arm: Arm = "baseline",
+    paired_success_only: bool = False,
 ) -> dict[str, Any]:
     reference = _load_scored_steps(reference_run / arm)
     candidate = _load_scored_steps(candidate_run / arm)
     same = 0
     mismatches: list[dict[str, Any]] = []
-    for key, reference_step in sorted(reference.items()):
+    keys = sorted(set(reference) & set(candidate)) if paired_success_only else sorted(reference)
+    for key in keys:
+        reference_step = reference[key]
         candidate_step = candidate.get(key)
         if candidate_step is None:
             mismatches.append(
@@ -48,10 +51,16 @@ def direction_agreement(
                 }
             )
     total = len(reference)
+    if paired_success_only:
+        total = len(keys)
     return {
         "arm": arm,
         "reference_run": str(reference_run),
         "candidate_run": str(candidate_run),
+        "paired_success_only": paired_success_only,
+        "reference_scored_steps": len(reference),
+        "candidate_scored_steps": len(candidate),
+        "common_scored_steps": len(set(reference) & set(candidate)),
         "same": same,
         "total": total,
         "rate": same / total if total else None,
@@ -76,6 +85,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--candidate-run", required=True)
     parser.add_argument("--arm", choices=["baseline", "alaya"], default="baseline")
     parser.add_argument("--threshold", type=float, default=0.95)
+    parser.add_argument(
+        "--paired-success-only",
+        action="store_true",
+        help="Compare only steps that are scored in both runs; provider_error/missing points are excluded.",
+    )
     return parser.parse_args(argv)
 
 
@@ -85,6 +99,7 @@ def main(argv: list[str] | None = None) -> int:
         reference_run=Path(args.reference_run),
         candidate_run=Path(args.candidate_run),
         arm=args.arm,
+        paired_success_only=args.paired_success_only,
     )
     result["threshold"] = args.threshold
     rate = result["rate"]
