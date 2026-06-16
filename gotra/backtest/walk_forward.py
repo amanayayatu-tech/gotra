@@ -48,10 +48,11 @@ LedgerBackend = Literal["json", "sqlite"]
 ParallelMode = Literal["off", "baseline", "ticker-chains", "both"]
 SAMPLED_PROMPT_VERSION = "bt-sampled-v1"
 FULL_PROMPT_VERSION = "bt-full-v1"
-DEFAULT_CODEX_RESPONSES_SAMPLE_TIMEOUT_SECONDS = 60
+DEFAULT_CODEX_RESPONSES_SAMPLE_TIMEOUT_SECONDS = 90
 DEFAULT_CODEX_RESPONSES_SAMPLE_RETRIES = 2
 DEFAULT_CODEX_RESPONSES_SAMPLE_CONCURRENCY = 2
 DEFAULT_CODEX_RESPONSES_PROVIDER_CONNECTION_LIMIT = 4
+DEFAULT_CODEX_RESPONSES_DEAD_ZONE_EPSILON_PCT = 0.3
 BT_CODEX_SYSTEM_PROMPT = """You are the Gotra Phase BT gpt-5.5 xhigh decision provider.
 
 Use only the JSON user prompt. Do not use web search, Perplexity, external APIs, files outside the
@@ -102,6 +103,7 @@ class BacktestConfig:
     codex_responses_sample_timeout_seconds: int | None = None
     codex_responses_sample_retries: int | None = None
     codex_responses_provider_connection_limit: int | None = None
+    codex_responses_dead_zone_epsilon_pct: float | None = None
 
 
 @dataclass(frozen=True)
@@ -304,6 +306,7 @@ class CodexDecisionProvider:
         sample_timeout_seconds: int | None = None,
         sample_retries: int | None = None,
         provider_connection_limit: int | None = None,
+        dead_zone_epsilon_pct: float | None = None,
     ) -> None:
         self.client = client
         self.max_retries = max_retries
@@ -326,6 +329,11 @@ class CodexDecisionProvider:
         self.provider_connection_limit = _resolve_codex_responses_provider_connection_limit(
             provider_connection_limit
         )
+        self.dead_zone_epsilon_pct = (
+            _resolve_codex_responses_dead_zone_epsilon_pct(dead_zone_epsilon_pct)
+            if provider_name == "codex_responses"
+            else 0.0
+        )
         self.sample_concurrency = _resolve_codex_responses_sample_concurrency(
             sample_count=self.sample_count,
             explicit=sample_concurrency,
@@ -342,6 +350,7 @@ class CodexDecisionProvider:
         sample_timeout_seconds: int | None,
         sample_retries: int | None,
         provider_connection_limit: int | None,
+        dead_zone_epsilon_pct: float | None,
         provider_concurrency: int,
         parallel_steps_enabled: bool,
     ) -> None:
@@ -356,6 +365,9 @@ class CodexDecisionProvider:
         self.sample_retries = _resolve_codex_responses_sample_retries(sample_retries)
         self.provider_connection_limit = _resolve_codex_responses_provider_connection_limit(
             provider_connection_limit
+        )
+        self.dead_zone_epsilon_pct = _resolve_codex_responses_dead_zone_epsilon_pct(
+            dead_zone_epsilon_pct
         )
         self.sample_concurrency = _resolve_codex_responses_sample_concurrency(
             sample_count=self.sample_count,
@@ -401,7 +413,8 @@ class CodexDecisionProvider:
         prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         cache_key = (
             f"{ticker}:{decision_date.isoformat()}:{arm}:{self.provider_name}:"
-            f"{_codex_cache_prompt_version(self.provider_name, self.sample_count)}:{prompt_hash}"
+            f"{_codex_cache_prompt_version(self.provider_name, self.sample_count, self.dead_zone_epsilon_pct)}:"
+            f"{prompt_hash}"
         )
         cached = cache.get(cache_key)
         token_estimate = estimate_tokens(BT_CODEX_SYSTEM_PROMPT + "\n" + prompt)
@@ -524,6 +537,7 @@ class CodexDecisionProvider:
             samples=samples,
             sample_count=self.sample_count,
             sample_concurrency=self.sample_concurrency,
+            dead_zone_epsilon_pct=self.dead_zone_epsilon_pct,
         )
 
     def _complete_denoising_samples(
@@ -916,6 +930,7 @@ def _configure_provider_for_run(*, provider: DecisionProvider, config: BacktestC
             sample_timeout_seconds=config.codex_responses_sample_timeout_seconds,
             sample_retries=config.codex_responses_sample_retries,
             provider_connection_limit=config.codex_responses_provider_connection_limit,
+            dead_zone_epsilon_pct=config.codex_responses_dead_zone_epsilon_pct,
             provider_concurrency=_effective_provider_concurrency(config),
             parallel_steps_enabled=_parallel_enabled(config),
         )
@@ -1691,6 +1706,9 @@ def _provider_metadata(provider: ProviderName, *, config: BacktestConfig | None 
         provider_connection_limit = _resolve_codex_responses_provider_connection_limit(
             config.codex_responses_provider_connection_limit if config is not None else None
         )
+        dead_zone_epsilon_pct = _resolve_codex_responses_dead_zone_epsilon_pct(
+            config.codex_responses_dead_zone_epsilon_pct if config is not None else None
+        )
         return {
             "model": os.getenv("JUDGE_LLM_MODEL") or os.getenv("LLM_MODEL") or "gpt-5.5",
             "reasoning_effort": os.getenv("CODEX_PROVIDER_REASONING_EFFORT")
@@ -1706,6 +1724,7 @@ def _provider_metadata(provider: ProviderName, *, config: BacktestConfig | None 
                 "sample_timeout_seconds": sample_timeout_seconds,
                 "single_sample_retries": sample_retries,
                 "provider_connection_limit": provider_connection_limit,
+                "dead_zone_epsilon_pct": dead_zone_epsilon_pct,
                 "vote_consistency": "modal_direction_fraction",
             },
         }
@@ -1858,6 +1877,17 @@ def _resolve_codex_responses_provider_connection_limit(explicit: int | None = No
     return DEFAULT_CODEX_RESPONSES_PROVIDER_CONNECTION_LIMIT
 
 
+def _resolve_codex_responses_dead_zone_epsilon_pct(explicit: float | None = None) -> float:
+    if explicit is not None:
+        return _non_negative_float(explicit, name="codex_responses_dead_zone_epsilon_pct")
+    value = os.getenv("BT_CODEX_RESPONSES_DEAD_ZONE_EPSILON_PCT") or os.getenv(
+        "CODEX_RESPONSES_DEAD_ZONE_EPSILON_PCT"
+    )
+    if value:
+        return _non_negative_float(value, name="CODEX_RESPONSES_DEAD_ZONE_EPSILON_PCT")
+    return DEFAULT_CODEX_RESPONSES_DEAD_ZONE_EPSILON_PCT
+
+
 def _positive_int(value: int | str, *, name: str) -> int:
     try:
         parsed = int(value)
@@ -1878,10 +1908,24 @@ def _non_negative_int(value: int | str, *, name: str) -> int:
     return parsed
 
 
-def _codex_cache_prompt_version(provider_name: ProviderName, sample_count: int) -> str:
+def _non_negative_float(value: float | str, *, name: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a non-negative number") from exc
+    if parsed < 0:
+        raise ValueError(f"{name} must be a non-negative number")
+    return parsed
+
+
+def _codex_cache_prompt_version(
+    provider_name: ProviderName,
+    sample_count: int,
+    dead_zone_epsilon_pct: float = 0.0,
+) -> str:
     if provider_name != "codex_responses":
         return FULL_PROMPT_VERSION
-    return f"{FULL_PROMPT_VERSION}:median-n{sample_count}"
+    return f"{FULL_PROMPT_VERSION}:median-n{sample_count}:deadzone-e{dead_zone_epsilon_pct:g}"
 
 
 def _cached_denoising(cached: dict[str, Any]) -> dict[str, Any] | None:
@@ -2221,12 +2265,17 @@ def _aggregate_denoising_samples(
     samples: list[ProviderSample],
     sample_count: int,
     sample_concurrency: int,
+    dead_zone_epsilon_pct: float = 0.0,
 ) -> tuple[dict[str, Any], int, str, dict[str, Any]]:
     if len(samples) != sample_count:
         raise ValueError(f"expected {sample_count} samples, got {len(samples)}")
     expected_values = [sample.expected_change_pct for sample in samples]
     median_expected = float(median(expected_values))
     sample_directions = [_direction_from_expected_change(value) for value in expected_values]
+    final_direction, final_expected = _dead_zone_decision_from_median(
+        median_expected,
+        epsilon_pct=dead_zone_epsilon_pct,
+    )
     vote_consistency = _vote_consistency(sample_directions)
     representative = min(
         samples,
@@ -2243,7 +2292,11 @@ def _aggregate_denoising_samples(
         "sample_count": sample_count,
         "successful_samples": len(samples),
         "sample_concurrency": sample_concurrency,
+        "dead_zone_epsilon_pct": _rounded(dead_zone_epsilon_pct),
         "median_expected_change_pct": _rounded(median_expected),
+        "dead_zone_applied": final_direction == "neutral",
+        "final_expected_change_pct": _rounded(final_expected),
+        "final_direction": final_direction,
         "sample_expected_change_pcts": [_rounded(value) for value in expected_values],
         "sample_directions": sample_directions,
         "vote_consistency": vote_consistency,
@@ -2252,8 +2305,8 @@ def _aggregate_denoising_samples(
     }
     return (
         {
-            "direction": _direction_from_expected_change(median_expected),
-            "expected_change_pct": _rounded(median_expected),
+            "direction": final_direction,
+            "expected_change_pct": _rounded(final_expected),
             "confidence": _rounded(median([sample.confidence for sample in samples])),
             "reasoning": (
                 f"median denoised {sample_count} codex_responses samples; representative sample: "
@@ -2264,6 +2317,12 @@ def _aggregate_denoising_samples(
         token_usage_source,
         denoising,
     )
+
+
+def _dead_zone_decision_from_median(median_expected: float, *, epsilon_pct: float) -> tuple[str, float]:
+    if epsilon_pct > 0 and abs(median_expected) <= epsilon_pct:
+        return "neutral", 0.0
+    return _direction_from_expected_change(median_expected), median_expected
 
 
 def _direction_from_expected_change(expected_change_pct: float) -> str:
@@ -2542,7 +2601,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--codex-responses-sample-timeout-seconds",
         type=int,
-        help="Hard timeout per individual codex_responses sample. Defaults to 60.",
+        help="Hard timeout per individual codex_responses sample. Defaults to 90.",
     )
     parser.add_argument(
         "--codex-responses-sample-retries",
@@ -2555,6 +2614,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Maximum concurrent codex_responses provider connections across step and sample "
             "parallelism. Defaults to 4."
+        ),
+    )
+    parser.add_argument(
+        "--codex-responses-dead-zone-epsilon-pct",
+        type=float,
+        help=(
+            "Dead-zone epsilon in expected_change_pct percentage-point units. Defaults to 0.3, "
+            "meaning 0.3%."
         ),
     )
     parser.add_argument("--resume", action="store_true")
@@ -2600,6 +2667,7 @@ def main(argv: list[str] | None = None) -> int:
             codex_responses_sample_timeout_seconds=args.codex_responses_sample_timeout_seconds,
             codex_responses_sample_retries=args.codex_responses_sample_retries,
             codex_responses_provider_connection_limit=args.codex_responses_provider_connection_limit,
+            codex_responses_dead_zone_epsilon_pct=args.codex_responses_dead_zone_epsilon_pct,
         )
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))

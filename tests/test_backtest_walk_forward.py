@@ -413,11 +413,13 @@ def test_codex_responses_provider_retries_sample_timeout_without_content_filteri
 
     assert client.calls == 4
     assert client.timeouts == [11, 11, 11, 11]
-    assert decision.expected_change_pct == 0.01
-    assert decision.direction == "long"
+    assert decision.expected_change_pct == 0.0
+    assert decision.direction == "neutral"
     assert decision.denoising is not None
     assert decision.denoising["sample_expected_change_pcts"] == [0.01, -3.0, 3.0]
     assert decision.denoising["sample_attempts"] == [2, 1, 1]
+    assert decision.denoising["median_expected_change_pct"] == 0.01
+    assert decision.denoising["dead_zone_applied"] is True
 
 
 def test_codex_responses_provider_errors_when_sample_retries_exhausted(tmp_path: Path) -> None:
@@ -545,6 +547,79 @@ def test_codex_responses_concurrent_path_preserves_median_estimator(
 
     assert decisions[0].expected_change_pct == decisions[1].expected_change_pct == 6.0
     assert decisions[0].direction == decisions[1].direction == "long"
+
+
+def test_codex_responses_dead_zone_estimator_handles_boundary_and_sign(
+    tmp_path: Path,
+) -> None:
+    cases = [
+        ([0.1, 0.2, 0.3], "neutral", 0.0, True),
+        ([-0.1, -0.2, -0.3], "neutral", 0.0, True),
+        ([0.1, 0.31, 0.5], "long", 0.31, False),
+        ([-0.1, -0.31, -0.5], "avoid", -0.31, False),
+    ]
+
+    for index, (values, direction, expected, dead_zone_applied) in enumerate(cases):
+        class FakeClient:
+            def __init__(self) -> None:
+                self.values = list(values)
+
+            def complete(self, **_kwargs):
+                return _decision_json(expected_change_pct=self.values.pop(0))
+
+        decision = CodexDecisionProvider(
+            client=FakeClient(),
+            provider_name="codex_responses",
+            sample_count=3,
+            sample_concurrency=1,
+            dead_zone_epsilon_pct=0.3,
+        ).decide(
+            ticker="AAPL",
+            arm="baseline",
+            decision_date=date(2020, 1, 1),
+            price_rows=_price_rows(start="2019-01-01", days=370),
+            feedback=[],
+            cache=DecisionCache(tmp_path / f"cache-{index}.json"),
+            budget=TokenBudget(max_tokens=100_000),
+        )
+
+        assert decision.direction == direction
+        assert decision.expected_change_pct == expected
+        assert decision.denoising is not None
+        assert decision.denoising["dead_zone_epsilon_pct"] == 0.3
+        assert decision.denoising["dead_zone_applied"] is dead_zone_applied
+
+
+def test_codex_responses_dead_zone_epsilon_zero_preserves_old_sign_behavior(
+    tmp_path: Path,
+) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.values = [-0.1, 0.01, 0.2]
+
+        def complete(self, **_kwargs):
+            return _decision_json(expected_change_pct=self.values.pop(0))
+
+    decision = CodexDecisionProvider(
+        client=FakeClient(),
+        provider_name="codex_responses",
+        sample_count=3,
+        sample_concurrency=1,
+        dead_zone_epsilon_pct=0.0,
+    ).decide(
+        ticker="AAPL",
+        arm="baseline",
+        decision_date=date(2020, 1, 1),
+        price_rows=_price_rows(start="2019-01-01", days=370),
+        feedback=[],
+        cache=DecisionCache(tmp_path / "cache.json"),
+        budget=TokenBudget(max_tokens=100_000),
+    )
+
+    assert decision.direction == "long"
+    assert decision.expected_change_pct == 0.01
+    assert decision.denoising is not None
+    assert decision.denoising["dead_zone_applied"] is False
 
 
 def test_codex_responses_n1_degenerates_to_single_sample_behavior(tmp_path: Path) -> None:
@@ -969,11 +1044,15 @@ def test_direction_agreement_compares_baseline_replay_runs(tmp_path: Path) -> No
     _write_step_json(candidate / "baseline" / "step_2020-01-01_aapl.json", "AAPL", "2020-01-01", "long")
     _write_step_json(reference / "baseline" / "step_2020-02-01_msft.json", "MSFT", "2020-02-01", "watch")
     _write_step_json(candidate / "baseline" / "step_2020-02-01_msft.json", "MSFT", "2020-02-01", "avoid")
+    _write_step_json(reference / "baseline" / "step_2020-03-01_nvda.json", "NVDA", "2020-03-01", "neutral")
+    _write_step_json(candidate / "baseline" / "step_2020-03-01_nvda.json", "NVDA", "2020-03-01", "neutral")
+    _write_step_json(reference / "baseline" / "step_2020-04-01_tsm.json", "TSM", "2020-04-01", "neutral")
+    _write_step_json(candidate / "baseline" / "step_2020-04-01_tsm.json", "TSM", "2020-04-01", "long")
 
     result = direction_agreement(reference_run=reference, candidate_run=candidate)
 
-    assert result["same"] == 1
-    assert result["total"] == 2
+    assert result["same"] == 2
+    assert result["total"] == 4
     assert result["rate"] == 0.5
     assert result["mismatches"] == [
         {
@@ -982,7 +1061,14 @@ def test_direction_agreement_compares_baseline_replay_runs(tmp_path: Path) -> No
             "reference_direction": "watch",
             "candidate_direction": "avoid",
             "reason": "direction_mismatch",
-        }
+        },
+        {
+            "ticker": "TSM",
+            "decision_date": "2020-04-01",
+            "reference_direction": "neutral",
+            "candidate_direction": "long",
+            "reason": "direction_mismatch",
+        },
     ]
 
 
@@ -1271,6 +1357,8 @@ def test_parse_args_accepts_codex_responses_denoising_config() -> None:
             "4",
             "--codex-responses-provider-connection-limit",
             "6",
+            "--codex-responses-dead-zone-epsilon-pct",
+            "0.25",
         ]
     )
 
@@ -1279,6 +1367,7 @@ def test_parse_args_accepts_codex_responses_denoising_config() -> None:
     assert args.codex_responses_sample_timeout_seconds == 45
     assert args.codex_responses_sample_retries == 4
     assert args.codex_responses_provider_connection_limit == 6
+    assert args.codex_responses_dead_zone_epsilon_pct == 0.25
 
 
 def test_codex_responses_connection_limit_caps_effective_parallelism() -> None:

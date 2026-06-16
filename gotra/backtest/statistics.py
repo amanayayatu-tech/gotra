@@ -13,8 +13,11 @@ from gotra.backtest.protocol import STYLE_WINDOWS, parse_date, style_window_for
 def summarize_steps(steps: list[dict[str, Any]]) -> dict[str, Any]:
     scored = [step for step in steps if step.get("status") == "scored"]
     by_arm: dict[str, list[float]] = defaultdict(list)
+    direction_counts_by_arm: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for step in scored:
-        by_arm[str(step["arm"])].append(float(step["mse"]))
+        arm = str(step["arm"])
+        by_arm[arm].append(float(step["mse"]))
+        direction_counts_by_arm[arm][str(step.get("decision_direction"))] += 1
 
     paired = paired_loss_differences(scored)
     h1 = convergence_result([step for step in scored if step.get("arm") == "alaya"])
@@ -27,6 +30,15 @@ def summarize_steps(steps: list[dict[str, Any]]) -> dict[str, Any]:
         },
         "paired_steps": len(paired),
         "differential_mse_mean": round(mean(paired), 6) if paired else None,
+        "neutral_share_by_arm": {
+            arm: round(counts.get("neutral", 0) / sum(counts.values()), 6)
+            if sum(counts.values())
+            else None
+            for arm, counts in sorted(direction_counts_by_arm.items())
+        },
+        "direction_counts_by_arm": {
+            arm: dict(sorted(counts.items())) for arm, counts in sorted(direction_counts_by_arm.items())
+        },
         "hypotheses": {
             "H1_convergence": h1,
             "H2_drift_resistance": h2,
