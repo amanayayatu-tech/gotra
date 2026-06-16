@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+import time
 from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from gotra.backtest.audit import audit_step
 from gotra.backtest.budget import TokenBudget
@@ -325,6 +328,223 @@ def test_codex_responses_provider_retries_failed_single_sample(tmp_path: Path) -
     assert decision.direction == "long"
     assert decision.denoising is not None
     assert decision.denoising["sample_attempts"] == [2, 1, 1]
+
+
+def test_codex_responses_provider_bounds_intra_decision_sample_concurrency(
+    tmp_path: Path,
+) -> None:
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.values = [10.0, -2.0, 4.0, 100.0, 6.0]
+
+        def complete(self, **_kwargs):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+                value = self.values.pop(0)
+            time.sleep(0.01)
+            with lock:
+                active -= 1
+            return _decision_json(expected_change_pct=value)
+
+    decision = CodexDecisionProvider(
+        client=FakeClient(),
+        provider_name="codex_responses",
+        sample_count=5,
+        sample_concurrency=2,
+        provider_connection_limit=2,
+    ).decide(
+        ticker="AAPL",
+        arm="baseline",
+        decision_date=date(2020, 1, 1),
+        price_rows=_price_rows(start="2019-01-01", days=370),
+        feedback=[],
+        cache=DecisionCache(tmp_path / "cache.json"),
+        budget=TokenBudget(max_tokens=100_000),
+    )
+
+    assert max_active == 2
+    assert decision.expected_change_pct == 6.0
+    assert decision.direction == "long"
+    assert decision.denoising is not None
+    assert decision.denoising["sample_concurrency"] == 2
+
+
+def test_codex_responses_provider_retries_sample_timeout_without_content_filtering(
+    tmp_path: Path,
+) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.timeouts: list[int] = []
+            self.values = [0.01, -3.0, 3.0]
+
+        def complete(self, **kwargs):
+            self.calls += 1
+            self.timeouts.append(int(kwargs["timeout_seconds"]))
+            if self.calls == 1:
+                raise TimeoutError("transport timeout")
+            value = self.values.pop(0)
+            direction = "watch" if value == 0.01 else "long" if value > 0 else "avoid"
+            return _decision_json(direction=direction, expected_change_pct=value)
+
+    client = FakeClient()
+    decision = CodexDecisionProvider(
+        client=client,
+        provider_name="codex_responses",
+        sample_count=3,
+        sample_concurrency=1,
+        sample_timeout_seconds=11,
+        sample_retries=2,
+    ).decide(
+        ticker="NVDA",
+        arm="baseline",
+        decision_date=date(2020, 1, 1),
+        price_rows=_price_rows(start="2019-01-01", days=370),
+        feedback=[],
+        cache=DecisionCache(tmp_path / "cache.json"),
+        budget=TokenBudget(max_tokens=100_000),
+    )
+
+    assert client.calls == 4
+    assert client.timeouts == [11, 11, 11, 11]
+    assert decision.expected_change_pct == 0.01
+    assert decision.direction == "long"
+    assert decision.denoising is not None
+    assert decision.denoising["sample_expected_change_pcts"] == [0.01, -3.0, 3.0]
+    assert decision.denoising["sample_attempts"] == [2, 1, 1]
+
+
+def test_codex_responses_provider_errors_when_sample_retries_exhausted(tmp_path: Path) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(self, **_kwargs):
+            self.calls += 1
+            raise TimeoutError("transport timeout")
+
+    client = FakeClient()
+    provider = CodexDecisionProvider(
+        client=client,
+        provider_name="codex_responses",
+        sample_count=3,
+        sample_concurrency=1,
+        sample_retries=1,
+    )
+
+    with pytest.raises(ProviderError) as exc_info:
+        provider.decide(
+            ticker="NVDA",
+            arm="baseline",
+            decision_date=date(2020, 1, 1),
+            price_rows=_price_rows(start="2019-01-01", days=370),
+            feedback=[],
+            cache=DecisionCache(tmp_path / "cache.json"),
+            budget=TokenBudget(max_tokens=100_000),
+        )
+
+    assert client.calls == 2
+    assert "sample 1 failed after 1 retries" in str(exc_info.value)
+
+
+def test_codex_responses_provider_uses_same_sampling_config_for_both_arms(
+    tmp_path: Path,
+) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.timeouts: list[int] = []
+            self.values = [-2.0, 3.0, 5.0]
+
+        def complete(self, **kwargs):
+            self.timeouts.append(int(kwargs["timeout_seconds"]))
+            return _decision_json(expected_change_pct=self.values.pop(0))
+
+    decisions = []
+    for arm in ("baseline", "alaya"):
+        client = FakeClient()
+        decisions.append(
+            CodexDecisionProvider(
+                client=client,
+                provider_name="codex_responses",
+                sample_count=3,
+                sample_concurrency=2,
+                sample_timeout_seconds=17,
+                sample_retries=2,
+                provider_connection_limit=4,
+            ).decide(
+                ticker="AAPL",
+                arm=arm,
+                decision_date=date(2020, 1, 1),
+                price_rows=_price_rows(start="2019-01-01", days=370),
+                feedback=[
+                    {
+                        "decision_date": "2019-12-01",
+                        "expected_change_pct": 1.0,
+                        "actual_change_pct": 2.0,
+                        "outcome_availability_date": "2019-12-31",
+                    }
+                ],
+                cache=DecisionCache(tmp_path / f"{arm}.json"),
+                budget=TokenBudget(max_tokens=100_000),
+            )
+        )
+        assert client.timeouts == [17, 17, 17]
+
+    baseline_denoising = decisions[0].denoising
+    alaya_denoising = decisions[1].denoising
+    assert baseline_denoising is not None
+    assert alaya_denoising is not None
+    assert baseline_denoising["sample_count"] == alaya_denoising["sample_count"] == 3
+    assert baseline_denoising["sample_concurrency"] == alaya_denoising["sample_concurrency"] == 2
+    assert baseline_denoising["sample_expected_change_pcts"] == alaya_denoising[
+        "sample_expected_change_pcts"
+    ]
+
+
+def test_codex_responses_concurrent_path_preserves_median_estimator(
+    tmp_path: Path,
+) -> None:
+    values = [10.0, -2.0, 4.0, 100.0, 6.0]
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.values = list(values)
+            self.lock = threading.Lock()
+
+        def complete(self, **_kwargs):
+            with self.lock:
+                value = self.values.pop(0)
+            time.sleep(0.01)
+            return _decision_json(expected_change_pct=value)
+
+    decisions = []
+    for sample_concurrency in (1, 3):
+        decisions.append(
+            CodexDecisionProvider(
+                client=FakeClient(),
+                provider_name="codex_responses",
+                sample_count=5,
+                sample_concurrency=sample_concurrency,
+                provider_connection_limit=3,
+            ).decide(
+                ticker="AAPL",
+                arm="baseline",
+                decision_date=date(2020, 1, 1),
+                price_rows=_price_rows(start="2019-01-01", days=370),
+                feedback=[],
+                cache=DecisionCache(tmp_path / f"{sample_concurrency}.json"),
+                budget=TokenBudget(max_tokens=100_000),
+            )
+        )
+
+    assert decisions[0].expected_change_pct == decisions[1].expected_change_pct == 6.0
+    assert decisions[0].direction == decisions[1].direction == "long"
 
 
 def test_codex_responses_n1_degenerates_to_single_sample_behavior(tmp_path: Path) -> None:
@@ -1045,11 +1265,38 @@ def test_parse_args_accepts_codex_responses_denoising_config() -> None:
             "7",
             "--codex-responses-sample-concurrency",
             "3",
+            "--codex-responses-sample-timeout-seconds",
+            "45",
+            "--codex-responses-sample-retries",
+            "4",
+            "--codex-responses-provider-connection-limit",
+            "6",
         ]
     )
 
     assert args.codex_responses_samples == 7
     assert args.codex_responses_sample_concurrency == 3
+    assert args.codex_responses_sample_timeout_seconds == 45
+    assert args.codex_responses_sample_retries == 4
+    assert args.codex_responses_provider_connection_limit == 6
+
+
+def test_codex_responses_connection_limit_caps_effective_parallelism() -> None:
+    config = BacktestConfig(
+        provider="codex_responses",
+        provider_concurrency=8,
+        parallel_mode="baseline",
+        codex_responses_samples=7,
+        codex_responses_sample_concurrency=3,
+        codex_responses_provider_connection_limit=4,
+    )
+
+    assert walk_forward._effective_provider_concurrency(config) == 4  # noqa: SLF001
+    metadata = walk_forward._parallel_metadata(config)  # noqa: SLF001
+    provider_metadata = walk_forward._provider_metadata("codex_responses", config=config)  # noqa: SLF001
+    assert metadata["provider_concurrency"] == 4
+    assert metadata["requested_provider_concurrency"] == 8
+    assert provider_metadata["denoising"]["sample_concurrency"] == 1
 
 
 def test_require_stage3_provider_allows_codex_responses(

@@ -7,6 +7,7 @@ from uuid import UUID
 import httpx
 import pytest
 
+from gotra.backtest import codex_responses_client as codex_client_module
 from gotra.backtest.codex_responses_client import CodexResponsesCompletionClient
 
 
@@ -314,6 +315,37 @@ def test_codex_responses_complete_forbidden_failure_is_sanitized(tmp_path: Path)
     assert "HTTP 403" in message
     assert "codex login" in message
     assert "test-access-token" not in message
+
+
+def test_codex_responses_complete_enforces_sse_deadline(tmp_path: Path, monkeypatch) -> None:
+    auth_path = _write_auth(tmp_path)
+    clock_values = iter([100.0, 102.0])
+    monkeypatch.setattr(codex_client_module.time, "monotonic", lambda: next(clock_values))
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=_sse_content(
+                {"type": "response.output_text.delta", "text": '{"ok": true}'},
+                {"type": "response.completed", "response": {}},
+                "[DONE]",
+            ),
+        )
+
+    client = CodexResponsesCompletionClient(
+        auth_json_path=auth_path,
+        base_url="https://example.test/responses",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        client.complete(
+            system_prompt="system",
+            user_prompt="user",
+            max_tokens=8,
+            timeout_seconds=1,
+            temperature=0.0,
+        )
 
 
 def test_codex_responses_complete_rejects_missing_auth_fields(tmp_path: Path) -> None:

@@ -48,6 +48,10 @@ LedgerBackend = Literal["json", "sqlite"]
 ParallelMode = Literal["off", "baseline", "ticker-chains", "both"]
 SAMPLED_PROMPT_VERSION = "bt-sampled-v1"
 FULL_PROMPT_VERSION = "bt-full-v1"
+DEFAULT_CODEX_RESPONSES_SAMPLE_TIMEOUT_SECONDS = 60
+DEFAULT_CODEX_RESPONSES_SAMPLE_RETRIES = 2
+DEFAULT_CODEX_RESPONSES_SAMPLE_CONCURRENCY = 2
+DEFAULT_CODEX_RESPONSES_PROVIDER_CONNECTION_LIMIT = 4
 BT_CODEX_SYSTEM_PROMPT = """You are the Gotra Phase BT gpt-5.5 xhigh decision provider.
 
 Use only the JSON user prompt. Do not use web search, Perplexity, external APIs, files outside the
@@ -95,6 +99,9 @@ class BacktestConfig:
     resume: bool = False
     codex_responses_samples: int | None = None
     codex_responses_sample_concurrency: int | None = None
+    codex_responses_sample_timeout_seconds: int | None = None
+    codex_responses_sample_retries: int | None = None
+    codex_responses_provider_connection_limit: int | None = None
 
 
 @dataclass(frozen=True)
@@ -294,6 +301,9 @@ class CodexDecisionProvider:
         provider_name: ProviderName = "codex_cli",
         sample_count: int | None = None,
         sample_concurrency: int | None = None,
+        sample_timeout_seconds: int | None = None,
+        sample_retries: int | None = None,
+        provider_connection_limit: int | None = None,
     ) -> None:
         self.client = client
         self.max_retries = max_retries
@@ -303,11 +313,25 @@ class CodexDecisionProvider:
             if provider_name == "codex_responses"
             else 1
         )
+        self.sample_timeout_seconds = (
+            _resolve_codex_responses_sample_timeout_seconds(sample_timeout_seconds)
+            if provider_name == "codex_responses"
+            else 240
+        )
+        self.sample_retries = (
+            _resolve_codex_responses_sample_retries(sample_retries)
+            if provider_name == "codex_responses"
+            else 1
+        )
+        self.provider_connection_limit = _resolve_codex_responses_provider_connection_limit(
+            provider_connection_limit
+        )
         self.sample_concurrency = _resolve_codex_responses_sample_concurrency(
             sample_count=self.sample_count,
             explicit=sample_concurrency,
-            provider_concurrency=self.sample_count,
+            provider_concurrency=1,
             parallel_steps_enabled=False,
+            provider_connection_limit=self.provider_connection_limit,
         )
 
     def configure_denoising(
@@ -315,6 +339,9 @@ class CodexDecisionProvider:
         *,
         sample_count: int | None,
         sample_concurrency: int | None,
+        sample_timeout_seconds: int | None,
+        sample_retries: int | None,
+        provider_connection_limit: int | None,
         provider_concurrency: int,
         parallel_steps_enabled: bool,
     ) -> None:
@@ -323,11 +350,19 @@ class CodexDecisionProvider:
             self.sample_concurrency = 1
             return
         self.sample_count = _resolve_codex_responses_sample_count(sample_count)
+        self.sample_timeout_seconds = _resolve_codex_responses_sample_timeout_seconds(
+            sample_timeout_seconds
+        )
+        self.sample_retries = _resolve_codex_responses_sample_retries(sample_retries)
+        self.provider_connection_limit = _resolve_codex_responses_provider_connection_limit(
+            provider_connection_limit
+        )
         self.sample_concurrency = _resolve_codex_responses_sample_concurrency(
             sample_count=self.sample_count,
             explicit=sample_concurrency,
             provider_concurrency=provider_concurrency,
             parallel_steps_enabled=parallel_steps_enabled,
+            provider_connection_limit=self.provider_connection_limit,
         )
 
     def preflight(self) -> None:
@@ -531,7 +566,7 @@ class CodexDecisionProvider:
         sample_index: int,
     ) -> ProviderSample:
         last_error = ""
-        for attempt in range(1, 3):
+        for attempt in range(1, self.sample_retries + 2):
             try:
                 return self._complete_one_sample(
                     prompt=prompt,
@@ -541,7 +576,9 @@ class CodexDecisionProvider:
                 )
             except Exception as exc:  # noqa: BLE001 - provider output is untrusted by design.
                 last_error = str(exc)
-        raise RuntimeError(f"sample {sample_index} failed after retry: {last_error}")
+        raise RuntimeError(
+            f"sample {sample_index} failed after {self.sample_retries} retries: {last_error}"
+        )
 
     def _complete_one_sample(
         self,
@@ -555,7 +592,7 @@ class CodexDecisionProvider:
             system_prompt=BT_CODEX_SYSTEM_PROMPT,
             user_prompt=prompt,
             max_tokens=700,
-            timeout_seconds=240,
+            timeout_seconds=self.sample_timeout_seconds,
             temperature=0.0,
         )
         text, provider_tokens = _completion_text_and_usage(completion)
@@ -827,15 +864,29 @@ def _cache_budget_ledger(
 
 
 def _parallel_enabled(config: BacktestConfig) -> bool:
-    return config.parallel_mode != "off" or config.provider_concurrency > 1
+    return config.parallel_mode != "off" or _effective_provider_concurrency(config) > 1
 
 
 def _parallel_metadata(config: BacktestConfig) -> dict[str, Any]:
-    return {
+    effective_provider_concurrency = _effective_provider_concurrency(config)
+    metadata = {
         "mode": config.parallel_mode,
-        "provider_concurrency": config.provider_concurrency,
+        "provider_concurrency": effective_provider_concurrency,
         "resume": config.resume,
     }
+    if effective_provider_concurrency != config.provider_concurrency:
+        metadata["requested_provider_concurrency"] = config.provider_concurrency
+    return metadata
+
+
+def _effective_provider_concurrency(config: BacktestConfig) -> int:
+    requested = max(1, int(config.provider_concurrency))
+    if config.provider != "codex_responses":
+        return requested
+    connection_limit = _resolve_codex_responses_provider_connection_limit(
+        config.codex_responses_provider_connection_limit
+    )
+    return min(requested, connection_limit)
 
 
 def _ledger_metadata(config: BacktestConfig, ledger: SQLiteLedger | None) -> dict[str, Any]:
@@ -862,7 +913,10 @@ def _configure_provider_for_run(*, provider: DecisionProvider, config: BacktestC
         provider.configure_denoising(
             sample_count=config.codex_responses_samples,
             sample_concurrency=config.codex_responses_sample_concurrency,
-            provider_concurrency=config.provider_concurrency,
+            sample_timeout_seconds=config.codex_responses_sample_timeout_seconds,
+            sample_retries=config.codex_responses_sample_retries,
+            provider_connection_limit=config.codex_responses_provider_connection_limit,
+            provider_concurrency=_effective_provider_concurrency(config),
             parallel_steps_enabled=_parallel_enabled(config),
         )
 
@@ -1001,6 +1055,7 @@ def _run_parallel(
         raise ValueError("parallel BT execution requires --ledger sqlite")
     if config.parallel_mode == "baseline" and config.arms != ("baseline",):
         raise ValueError("--parallel-mode baseline requires --arms baseline")
+    effective_provider_concurrency = _effective_provider_concurrency(config)
     if config.provider_concurrency < 1:
         raise ValueError("--provider-concurrency must be >= 1")
 
@@ -1022,7 +1077,7 @@ def _run_parallel(
             budget=budget,
             ledger=ledger,
         )
-        results = run_independent_tasks(tasks, worker, max_workers=config.provider_concurrency)
+        results = run_independent_tasks(tasks, worker, max_workers=effective_provider_concurrency)
     else:
         tasks = _ticker_group_tasks(config)
         worker = _parallel_step_worker(
@@ -1032,7 +1087,7 @@ def _run_parallel(
             budget=budget,
             ledger=ledger,
         )
-        results = run_ticker_chains(tasks, worker, max_workers=config.provider_concurrency)
+        results = run_ticker_chains(tasks, worker, max_workers=effective_provider_concurrency)
 
     steps = list(initial_steps)
     skipped = list(initial_skipped)
@@ -1615,11 +1670,26 @@ def _provider_metadata(provider: ProviderName, *, config: BacktestConfig | None 
         sample_count = _resolve_codex_responses_sample_count(
             config.codex_responses_samples if config is not None else None
         )
+        effective_provider_concurrency = (
+            _effective_provider_concurrency(config) if config is not None else sample_count
+        )
         sample_concurrency = _resolve_codex_responses_sample_concurrency(
             sample_count=sample_count,
             explicit=config.codex_responses_sample_concurrency if config is not None else None,
-            provider_concurrency=config.provider_concurrency if config is not None else sample_count,
+            provider_concurrency=effective_provider_concurrency,
             parallel_steps_enabled=_parallel_enabled(config) if config is not None else False,
+            provider_connection_limit=_resolve_codex_responses_provider_connection_limit(
+                config.codex_responses_provider_connection_limit if config is not None else None
+            ),
+        )
+        sample_timeout_seconds = _resolve_codex_responses_sample_timeout_seconds(
+            config.codex_responses_sample_timeout_seconds if config is not None else None
+        )
+        sample_retries = _resolve_codex_responses_sample_retries(
+            config.codex_responses_sample_retries if config is not None else None
+        )
+        provider_connection_limit = _resolve_codex_responses_provider_connection_limit(
+            config.codex_responses_provider_connection_limit if config is not None else None
         )
         return {
             "model": os.getenv("JUDGE_LLM_MODEL") or os.getenv("LLM_MODEL") or "gpt-5.5",
@@ -1633,7 +1703,9 @@ def _provider_metadata(provider: ProviderName, *, config: BacktestConfig | None 
                 "method": "median_expected_change_pct",
                 "sample_count": sample_count,
                 "sample_concurrency": sample_concurrency,
-                "single_sample_retry": 1,
+                "sample_timeout_seconds": sample_timeout_seconds,
+                "single_sample_retries": sample_retries,
+                "provider_connection_limit": provider_connection_limit,
                 "vote_consistency": "modal_direction_fraction",
             },
         }
@@ -1733,19 +1805,57 @@ def _resolve_codex_responses_sample_concurrency(
     explicit: int | None,
     provider_concurrency: int,
     parallel_steps_enabled: bool,
+    provider_connection_limit: int,
 ) -> int:
     if sample_count <= 1:
         return 1
     if explicit is not None:
-        return min(sample_count, _positive_int(explicit, name="codex_responses_sample_concurrency"))
-    value = os.getenv("BT_CODEX_RESPONSES_SAMPLE_CONCURRENCY") or os.getenv(
-        "CODEX_RESPONSES_SAMPLE_CONCURRENCY"
+        requested = _positive_int(explicit, name="codex_responses_sample_concurrency")
+    else:
+        value = os.getenv("BT_CODEX_RESPONSES_SAMPLE_CONCURRENCY") or os.getenv(
+            "CODEX_RESPONSES_SAMPLE_CONCURRENCY"
+        )
+        requested = (
+            _positive_int(value, name="CODEX_RESPONSES_SAMPLE_CONCURRENCY")
+            if value
+            else DEFAULT_CODEX_RESPONSES_SAMPLE_CONCURRENCY
+        )
+    active_decision_concurrency = max(1, int(provider_concurrency)) if parallel_steps_enabled else 1
+    capped_by_connection_limit = max(1, provider_connection_limit // active_decision_concurrency)
+    return min(sample_count, requested, capped_by_connection_limit)
+
+
+def _resolve_codex_responses_sample_timeout_seconds(explicit: int | None = None) -> int:
+    if explicit is not None:
+        return _positive_int(explicit, name="codex_responses_sample_timeout_seconds")
+    value = os.getenv("BT_CODEX_RESPONSES_SAMPLE_TIMEOUT_SECONDS") or os.getenv(
+        "CODEX_RESPONSES_SAMPLE_TIMEOUT_SECONDS"
     )
     if value:
-        return min(sample_count, _positive_int(value, name="CODEX_RESPONSES_SAMPLE_CONCURRENCY"))
-    if parallel_steps_enabled:
-        return 1
-    return min(sample_count, max(1, int(provider_concurrency)))
+        return _positive_int(value, name="CODEX_RESPONSES_SAMPLE_TIMEOUT_SECONDS")
+    return DEFAULT_CODEX_RESPONSES_SAMPLE_TIMEOUT_SECONDS
+
+
+def _resolve_codex_responses_sample_retries(explicit: int | None = None) -> int:
+    if explicit is not None:
+        return _non_negative_int(explicit, name="codex_responses_sample_retries")
+    value = os.getenv("BT_CODEX_RESPONSES_SAMPLE_RETRIES") or os.getenv(
+        "CODEX_RESPONSES_SAMPLE_RETRIES"
+    )
+    if value:
+        return _non_negative_int(value, name="CODEX_RESPONSES_SAMPLE_RETRIES")
+    return DEFAULT_CODEX_RESPONSES_SAMPLE_RETRIES
+
+
+def _resolve_codex_responses_provider_connection_limit(explicit: int | None = None) -> int:
+    if explicit is not None:
+        return _positive_int(explicit, name="codex_responses_provider_connection_limit")
+    value = os.getenv("BT_CODEX_RESPONSES_PROVIDER_CONNECTION_LIMIT") or os.getenv(
+        "CODEX_RESPONSES_PROVIDER_CONNECTION_LIMIT"
+    )
+    if value:
+        return _positive_int(value, name="CODEX_RESPONSES_PROVIDER_CONNECTION_LIMIT")
+    return DEFAULT_CODEX_RESPONSES_PROVIDER_CONNECTION_LIMIT
 
 
 def _positive_int(value: int | str, *, name: str) -> int:
@@ -1755,6 +1865,16 @@ def _positive_int(value: int | str, *, name: str) -> int:
         raise ValueError(f"{name} must be a positive integer") from exc
     if parsed < 1:
         raise ValueError(f"{name} must be a positive integer")
+    return parsed
+
+
+def _non_negative_int(value: int | str, *, name: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a non-negative integer") from exc
+    if parsed < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
     return parsed
 
 
@@ -2415,8 +2535,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--codex-responses-sample-concurrency",
         type=int,
         help=(
-            "Maximum parallel samples inside one codex_responses decision. Defaults to provider "
-            "concurrency for serial runs and 1 for parallel step runs."
+            "Requested parallel samples inside one codex_responses decision. Defaults to 2, capped "
+            "by --codex-responses-provider-connection-limit."
+        ),
+    )
+    parser.add_argument(
+        "--codex-responses-sample-timeout-seconds",
+        type=int,
+        help="Hard timeout per individual codex_responses sample. Defaults to 60.",
+    )
+    parser.add_argument(
+        "--codex-responses-sample-retries",
+        type=int,
+        help="Retries per failed individual codex_responses sample. Defaults to 2.",
+    )
+    parser.add_argument(
+        "--codex-responses-provider-connection-limit",
+        type=int,
+        help=(
+            "Maximum concurrent codex_responses provider connections across step and sample "
+            "parallelism. Defaults to 4."
         ),
     )
     parser.add_argument("--resume", action="store_true")
@@ -2459,6 +2597,9 @@ def main(argv: list[str] | None = None) -> int:
             resume=args.resume,
             codex_responses_samples=args.codex_responses_samples,
             codex_responses_sample_concurrency=args.codex_responses_sample_concurrency,
+            codex_responses_sample_timeout_seconds=args.codex_responses_sample_timeout_seconds,
+            codex_responses_sample_retries=args.codex_responses_sample_retries,
+            codex_responses_provider_connection_limit=args.codex_responses_provider_connection_limit,
         )
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))

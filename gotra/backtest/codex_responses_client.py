@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -90,6 +91,7 @@ class CodexResponsesCompletionClient:
             "session_id": str(uuid4()),
             "User-Agent": self.user_agent,
         }
+        deadline = time.monotonic() + timeout_seconds
 
         try:
             with httpx.Client(transport=self.transport, timeout=timeout_seconds) as client:
@@ -111,11 +113,13 @@ class CodexResponsesCompletionClient:
                             f"Codex Responses API request failed with HTTP {response.status_code}"
                             f"{detail}"
                         )
-                    content, usage = _parse_sse_response(response.iter_lines())
+                    content, usage = _parse_sse_response(response.iter_lines(), deadline=deadline)
         except httpx.TimeoutException as exc:
             raise RuntimeError("Codex Responses API request timed out") from exc
         except httpx.HTTPError as exc:
             raise RuntimeError(f"Codex Responses API request failed: {type(exc).__name__}") from exc
+        except TimeoutError as exc:
+            raise RuntimeError("Codex Responses API request timed out") from exc
 
         if not content:
             raise RuntimeError("Codex Responses API response did not contain output text")
@@ -232,12 +236,14 @@ def _extract_response_text(body: Any) -> str:
     return ""
 
 
-def _parse_sse_response(lines: Any) -> tuple[str, dict[str, Any] | None]:
+def _parse_sse_response(lines: Any, *, deadline: float | None = None) -> tuple[str, dict[str, Any] | None]:
     chunks: list[str] = []
     usage: dict[str, Any] | None = None
     completed_response: Any = None
 
     for raw_line in lines:
+        if deadline is not None and time.monotonic() > deadline:
+            raise TimeoutError("Codex Responses API SSE stream exceeded timeout")
         line = _decode_sse_line(raw_line)
         if not line or not line.startswith("data:"):
             continue
