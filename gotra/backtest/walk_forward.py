@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
@@ -307,6 +308,7 @@ class CodexDecisionProvider:
         sample_retries: int | None = None,
         provider_connection_limit: int | None = None,
         dead_zone_epsilon_pct: float | None = None,
+        provider_connection_limiter: threading.BoundedSemaphore | None = None,
     ) -> None:
         self.client = client
         self.max_retries = max_retries
@@ -329,6 +331,9 @@ class CodexDecisionProvider:
         self.provider_connection_limit = _resolve_codex_responses_provider_connection_limit(
             provider_connection_limit
         )
+        self.provider_connection_limiter = provider_connection_limiter or threading.BoundedSemaphore(
+            self.provider_connection_limit
+        )
         self.dead_zone_epsilon_pct = (
             _resolve_codex_responses_dead_zone_epsilon_pct(dead_zone_epsilon_pct)
             if provider_name == "codex_responses"
@@ -337,9 +342,6 @@ class CodexDecisionProvider:
         self.sample_concurrency = _resolve_codex_responses_sample_concurrency(
             sample_count=self.sample_count,
             explicit=sample_concurrency,
-            provider_concurrency=1,
-            parallel_steps_enabled=False,
-            provider_connection_limit=self.provider_connection_limit,
         )
 
     def configure_denoising(
@@ -351,8 +353,7 @@ class CodexDecisionProvider:
         sample_retries: int | None,
         provider_connection_limit: int | None,
         dead_zone_epsilon_pct: float | None,
-        provider_concurrency: int,
-        parallel_steps_enabled: bool,
+        provider_connection_limiter: threading.BoundedSemaphore | None,
     ) -> None:
         if self.provider_name != "codex_responses":
             self.sample_count = 1
@@ -366,15 +367,15 @@ class CodexDecisionProvider:
         self.provider_connection_limit = _resolve_codex_responses_provider_connection_limit(
             provider_connection_limit
         )
+        self.provider_connection_limiter = provider_connection_limiter or threading.BoundedSemaphore(
+            self.provider_connection_limit
+        )
         self.dead_zone_epsilon_pct = _resolve_codex_responses_dead_zone_epsilon_pct(
             dead_zone_epsilon_pct
         )
         self.sample_concurrency = _resolve_codex_responses_sample_concurrency(
             sample_count=self.sample_count,
             explicit=sample_concurrency,
-            provider_concurrency=provider_concurrency,
-            parallel_steps_enabled=parallel_steps_enabled,
-            provider_connection_limit=self.provider_connection_limit,
         )
 
     def preflight(self) -> None:
@@ -602,13 +603,15 @@ class CodexDecisionProvider:
         sample_index: int,
         attempts: int,
     ) -> ProviderSample:
-        completion = self._client().complete(
-            system_prompt=BT_CODEX_SYSTEM_PROMPT,
-            user_prompt=prompt,
-            max_tokens=700,
-            timeout_seconds=self.sample_timeout_seconds,
-            temperature=0.0,
-        )
+        limiter = self.provider_connection_limiter or nullcontext()
+        with limiter:
+            completion = self._client().complete(
+                system_prompt=BT_CODEX_SYSTEM_PROMPT,
+                user_prompt=prompt,
+                max_tokens=700,
+                timeout_seconds=self.sample_timeout_seconds,
+                temperature=0.0,
+            )
         text, provider_tokens = _completion_text_and_usage(completion)
         decision_payload = _parse_decision_json(text)
         billed_tokens = provider_tokens if provider_tokens is not None else token_estimate
@@ -903,6 +906,17 @@ def _effective_provider_concurrency(config: BacktestConfig) -> int:
     return min(requested, connection_limit)
 
 
+def _provider_connection_limiter_for_run(
+    config: BacktestConfig,
+) -> threading.BoundedSemaphore | None:
+    if config.provider != "codex_responses":
+        return None
+    connection_limit = _resolve_codex_responses_provider_connection_limit(
+        config.codex_responses_provider_connection_limit
+    )
+    return threading.BoundedSemaphore(connection_limit)
+
+
 def _ledger_metadata(config: BacktestConfig, ledger: SQLiteLedger | None) -> dict[str, Any]:
     return {
         "backend": config.ledger,
@@ -914,15 +928,25 @@ def _provider_for_run(
     *,
     config: BacktestConfig,
     ledger: SQLiteLedger | None,
+    provider_connection_limiter: threading.BoundedSemaphore | None = None,
 ) -> DecisionProvider:
     provider = _build_provider(config.provider)
-    _configure_provider_for_run(provider=provider, config=config)
+    _configure_provider_for_run(
+        provider=provider,
+        config=config,
+        provider_connection_limiter=provider_connection_limiter,
+    )
     if ledger is None:
         return provider
     return _LedgerProvider(provider=provider, ledger=ledger)
 
 
-def _configure_provider_for_run(*, provider: DecisionProvider, config: BacktestConfig) -> None:
+def _configure_provider_for_run(
+    *,
+    provider: DecisionProvider,
+    config: BacktestConfig,
+    provider_connection_limiter: threading.BoundedSemaphore | None = None,
+) -> None:
     if isinstance(provider, CodexDecisionProvider):
         provider.configure_denoising(
             sample_count=config.codex_responses_samples,
@@ -931,8 +955,7 @@ def _configure_provider_for_run(*, provider: DecisionProvider, config: BacktestC
             sample_retries=config.codex_responses_sample_retries,
             provider_connection_limit=config.codex_responses_provider_connection_limit,
             dead_zone_epsilon_pct=config.codex_responses_dead_zone_epsilon_pct,
-            provider_concurrency=_effective_provider_concurrency(config),
-            parallel_steps_enabled=_parallel_enabled(config),
+            provider_connection_limiter=provider_connection_limiter,
         )
 
 
@@ -1073,6 +1096,7 @@ def _run_parallel(
     effective_provider_concurrency = _effective_provider_concurrency(config)
     if config.provider_concurrency < 1:
         raise ValueError("--provider-concurrency must be >= 1")
+    provider_connection_limiter = _provider_connection_limiter_for_run(config)
 
     if config.parallel_mode == "baseline" or config.arms == ("baseline",):
         tasks = stable_step_plan(
@@ -1091,6 +1115,7 @@ def _run_parallel(
             cache=cache,
             budget=budget,
             ledger=ledger,
+            provider_connection_limiter=provider_connection_limiter,
         )
         results = run_independent_tasks(tasks, worker, max_workers=effective_provider_concurrency)
     else:
@@ -1101,6 +1126,7 @@ def _run_parallel(
             cache=cache,
             budget=budget,
             ledger=ledger,
+            provider_connection_limiter=provider_connection_limiter,
         )
         results = run_ticker_chains(tasks, worker, max_workers=effective_provider_concurrency)
 
@@ -1128,6 +1154,7 @@ def _parallel_step_worker(
     cache: Any,
     budget: Any,
     ledger: SQLiteLedger,
+    provider_connection_limiter: threading.BoundedSemaphore | None,
 ) -> Any:
     feedback_by_ticker: dict[str, list[dict[str, Any]]] = {ticker.symbol: [] for ticker in config.tickers}
 
@@ -1142,7 +1169,11 @@ def _parallel_step_worker(
         )
         if resumed_steps:
             return resumed_steps, skipped
-        provider = _provider_for_run(config=config, ledger=ledger)
+        provider = _provider_for_run(
+            config=config,
+            ledger=ledger,
+            provider_connection_limiter=provider_connection_limiter,
+        )
         ticker_steps = _run_ticker_step(
             ticker=task.ticker,
             decision_date=task.decision_date,
@@ -1685,17 +1716,9 @@ def _provider_metadata(provider: ProviderName, *, config: BacktestConfig | None 
         sample_count = _resolve_codex_responses_sample_count(
             config.codex_responses_samples if config is not None else None
         )
-        effective_provider_concurrency = (
-            _effective_provider_concurrency(config) if config is not None else sample_count
-        )
         sample_concurrency = _resolve_codex_responses_sample_concurrency(
             sample_count=sample_count,
             explicit=config.codex_responses_sample_concurrency if config is not None else None,
-            provider_concurrency=effective_provider_concurrency,
-            parallel_steps_enabled=_parallel_enabled(config) if config is not None else False,
-            provider_connection_limit=_resolve_codex_responses_provider_connection_limit(
-                config.codex_responses_provider_connection_limit if config is not None else None
-            ),
         )
         sample_timeout_seconds = _resolve_codex_responses_sample_timeout_seconds(
             config.codex_responses_sample_timeout_seconds if config is not None else None
@@ -1822,9 +1845,6 @@ def _resolve_codex_responses_sample_concurrency(
     *,
     sample_count: int,
     explicit: int | None,
-    provider_concurrency: int,
-    parallel_steps_enabled: bool,
-    provider_connection_limit: int,
 ) -> int:
     if sample_count <= 1:
         return 1
@@ -1839,9 +1859,7 @@ def _resolve_codex_responses_sample_concurrency(
             if value
             else DEFAULT_CODEX_RESPONSES_SAMPLE_CONCURRENCY
         )
-    active_decision_concurrency = max(1, int(provider_concurrency)) if parallel_steps_enabled else 1
-    capped_by_connection_limit = max(1, provider_connection_limit // active_decision_concurrency)
-    return min(sample_count, requested, capped_by_connection_limit)
+    return min(sample_count, requested)
 
 
 def _resolve_codex_responses_sample_timeout_seconds(explicit: int | None = None) -> int:
@@ -2586,6 +2604,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="off",
     )
     parser.add_argument(
+        "--provider-error-abort-consecutive",
+        type=int,
+        default=8,
+        help="Abort after this many consecutive provider_error steps. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--provider-error-abort-rate",
+        type=float,
+        default=0.10,
+        help="Abort when provider_error rate exceeds this value after warmup. Set 0 to disable.",
+    )
+    parser.add_argument(
         "--codex-responses-samples",
         type=int,
         help="Number of independent codex_responses samples per decision. Defaults to 5.",
@@ -2594,8 +2624,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--codex-responses-sample-concurrency",
         type=int,
         help=(
-            "Requested parallel samples inside one codex_responses decision. Defaults to 2, capped "
-            "by --codex-responses-provider-connection-limit."
+            "Requested parallel samples inside one codex_responses decision. Defaults to 2; total "
+            "provider calls are bounded by --codex-responses-provider-connection-limit."
         ),
     )
     parser.add_argument(
@@ -2661,6 +2691,8 @@ def main(argv: list[str] | None = None) -> int:
             ledger_path=Path(args.ledger_path) if args.ledger_path else None,
             provider_concurrency=args.provider_concurrency,
             parallel_mode=args.parallel_mode,
+            provider_error_abort_consecutive=args.provider_error_abort_consecutive,
+            provider_error_abort_rate=args.provider_error_abort_rate,
             resume=args.resume,
             codex_responses_samples=args.codex_responses_samples,
             codex_responses_sample_concurrency=args.codex_responses_sample_concurrency,

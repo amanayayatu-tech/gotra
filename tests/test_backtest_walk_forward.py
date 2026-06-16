@@ -375,6 +375,65 @@ def test_codex_responses_provider_bounds_intra_decision_sample_concurrency(
     assert decision.denoising["sample_concurrency"] == 2
 
 
+def test_codex_responses_provider_shares_connection_limit_across_parallel_providers(
+    tmp_path: Path,
+) -> None:
+    lock = threading.Lock()
+    limiter = threading.BoundedSemaphore(4)
+    active = 0
+    max_active = 0
+    errors: list[BaseException] = []
+
+    class FakeClient:
+        def __init__(self, values: list[float]) -> None:
+            self.values = values
+
+        def complete(self, **_kwargs):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+                value = self.values.pop(0)
+            time.sleep(0.02)
+            with lock:
+                active -= 1
+            return _decision_json(expected_change_pct=value)
+
+    def decide(index: int, values: list[float]) -> None:
+        try:
+            CodexDecisionProvider(
+                client=FakeClient(values),
+                provider_name="codex_responses",
+                sample_count=3,
+                sample_concurrency=3,
+                provider_connection_limit=4,
+                provider_connection_limiter=limiter,
+                dead_zone_epsilon_pct=0.0,
+            ).decide(
+                ticker="AAPL",
+                arm="baseline",
+                decision_date=date(2020, 1, 1),
+                price_rows=_price_rows(start="2019-01-01", days=370),
+                feedback=[],
+                cache=DecisionCache(tmp_path / f"cache-{index}.json"),
+                budget=TokenBudget(max_tokens=100_000),
+            )
+        except BaseException as exc:  # noqa: BLE001 - test thread forwards all failures.
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=decide, args=(1, [1.0, 2.0, 3.0])),
+        threading.Thread(target=decide, args=(2, [4.0, 5.0, 6.0])),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert max_active == 4
+
+
 def test_codex_responses_provider_retries_sample_timeout_without_content_filtering(
     tmp_path: Path,
 ) -> None:
@@ -1359,6 +1418,10 @@ def test_parse_args_accepts_codex_responses_denoising_config() -> None:
             "6",
             "--codex-responses-dead-zone-epsilon-pct",
             "0.25",
+            "--provider-error-abort-consecutive",
+            "0",
+            "--provider-error-abort-rate",
+            "0",
         ]
     )
 
@@ -1368,9 +1431,11 @@ def test_parse_args_accepts_codex_responses_denoising_config() -> None:
     assert args.codex_responses_sample_retries == 4
     assert args.codex_responses_provider_connection_limit == 6
     assert args.codex_responses_dead_zone_epsilon_pct == 0.25
+    assert args.provider_error_abort_consecutive == 0
+    assert args.provider_error_abort_rate == 0
 
 
-def test_codex_responses_connection_limit_caps_effective_parallelism() -> None:
+def test_codex_responses_connection_limit_uses_run_level_limiter() -> None:
     config = BacktestConfig(
         provider="codex_responses",
         provider_concurrency=8,
@@ -1385,7 +1450,8 @@ def test_codex_responses_connection_limit_caps_effective_parallelism() -> None:
     provider_metadata = walk_forward._provider_metadata("codex_responses", config=config)  # noqa: SLF001
     assert metadata["provider_concurrency"] == 4
     assert metadata["requested_provider_concurrency"] == 8
-    assert provider_metadata["denoising"]["sample_concurrency"] == 1
+    assert provider_metadata["denoising"]["sample_concurrency"] == 3
+    assert provider_metadata["denoising"]["provider_connection_limit"] == 4
 
 
 def test_require_stage3_provider_allows_codex_responses(
