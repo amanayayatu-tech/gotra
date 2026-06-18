@@ -42,7 +42,7 @@ from gotra.backtest.statistics import summarize_steps
 
 
 Arm = Literal["baseline", "alaya"]
-ProviderName = Literal["heuristic", "codex_cli", "codex_responses"]
+ProviderName = Literal["heuristic", "codex_cli", "codex_responses", "kimi"]
 RunMode = Literal["sampled", "full"]
 LedgerBackend = Literal["json", "sqlite"]
 ParallelMode = Literal["off", "baseline", "ticker-chains", "both"]
@@ -282,7 +282,7 @@ class HeuristicDecisionProvider:
 
 
 class CodexDecisionProvider:
-    """gpt-5.5/xhigh provider through the hardened Codex CLI client."""
+    """Shared JSON decision provider wrapper for completion clients."""
 
     network_enabled = False
 
@@ -300,7 +300,7 @@ class CodexDecisionProvider:
         self.provider_name = provider_name
         self.sample_count = (
             _resolve_codex_responses_sample_count(sample_count)
-            if provider_name == "codex_responses"
+            if _uses_median_denoising(provider_name)
             else 1
         )
         self.sample_concurrency = _resolve_codex_responses_sample_concurrency(
@@ -318,7 +318,7 @@ class CodexDecisionProvider:
         provider_concurrency: int,
         parallel_steps_enabled: bool,
     ) -> None:
-        if self.provider_name != "codex_responses":
+        if not _uses_median_denoising(self.provider_name):
             self.sample_count = 1
             self.sample_concurrency = 1
             return
@@ -489,6 +489,7 @@ class CodexDecisionProvider:
             samples=samples,
             sample_count=self.sample_count,
             sample_concurrency=self.sample_concurrency,
+            provider_name=self.provider_name,
         )
 
     def _complete_denoising_samples(
@@ -1191,6 +1192,13 @@ def _build_provider(name: ProviderName) -> DecisionProvider:
             client=CodexResponsesCompletionClient(),
             provider_name="codex_responses",
         )
+    if name == "kimi":
+        from gotra.backtest.kimi_client import KimiCompletionClient
+
+        return CodexDecisionProvider(
+            client=KimiCompletionClient(),
+            provider_name="kimi",
+        )
     raise ValueError(f"unsupported BT provider: {name}")
 
 
@@ -1255,7 +1263,7 @@ def _provider_health_initial_state(
 ) -> dict[str, Any]:
     enough_budget_for_preflight = budget.max_tokens is None or budget.max_tokens >= 50_000
     preflight_enabled = (
-        config.provider in {"codex_cli", "codex_responses"}
+        config.provider in {"codex_cli", "codex_responses", "kimi"}
         and config.provider_preflight
         and enough_budget_for_preflight
         and hasattr(provider, "preflight")
@@ -1277,7 +1285,7 @@ def _provider_abort_reason(
     steps: list[dict[str, Any]],
     consecutive_provider_errors: int,
 ) -> str:
-    if config.provider not in {"codex_cli", "codex_responses"}:
+    if config.provider not in {"codex_cli", "codex_responses", "kimi"}:
         return ""
     if (
         config.provider_error_abort_consecutive > 0
@@ -1637,6 +1645,32 @@ def _provider_metadata(provider: ProviderName, *, config: BacktestConfig | None 
                 "vote_consistency": "modal_direction_fraction",
             },
         }
+    if provider == "kimi":
+        from gotra.backtest.kimi_client import DEFAULT_KIMI_MODEL, DEFAULT_SOPHNET_BASE_URL
+
+        sample_count = _resolve_codex_responses_sample_count(
+            config.codex_responses_samples if config is not None else None
+        )
+        sample_concurrency = _resolve_codex_responses_sample_concurrency(
+            sample_count=sample_count,
+            explicit=config.codex_responses_sample_concurrency if config is not None else None,
+            provider_concurrency=config.provider_concurrency if config is not None else sample_count,
+            parallel_steps_enabled=_parallel_enabled(config) if config is not None else False,
+        )
+        return {
+            "model": DEFAULT_KIMI_MODEL,
+            "transport": "sophnet_chat_completions",
+            "base_url": DEFAULT_SOPHNET_BASE_URL,
+            "auth_source": "SOPHNET_API_KEY",
+            "temperature": 0.0,
+            "denoising": {
+                "method": "median_expected_change_pct",
+                "sample_count": sample_count,
+                "sample_concurrency": sample_concurrency,
+                "single_sample_retry": 1,
+                "vote_consistency": "modal_direction_fraction",
+            },
+        }
     return {
         "model": os.getenv("JUDGE_LLM_MODEL") or os.getenv("LLM_MODEL") or "gpt-5.5",
         "reasoning_effort": os.getenv("CODEX_PROVIDER_REASONING_EFFORT")
@@ -1703,6 +1737,30 @@ def _provider_determinism_metadata(
             "bit_level_reproducible": False,
             "blocking_reason": blocking_reason,
         }
+    if provider == "kimi":
+        measured_repro_ok = _env_flag("KIMI_MEASURED_REPRO_OK")
+        blocking_reason = (
+            ""
+            if measured_repro_ok
+            else (
+                "kimi exposes temperature=0 through SophNet, but Stage 3 eligibility still "
+                "depends on an empirically measured direction-agreement rate >=95% under a "
+                "preregistered replay. Stage 7 smoke evidence is provider/plumbing only."
+            )
+        )
+        return {
+            "provider": provider,
+            "required_for_stage3": require_stage3_provider,
+            "stage3_acceptance_eligible": measured_repro_ok,
+            "temperature_control": "supported_zero",
+            "top_p_control": False,
+            "seed_control": False,
+            "acceptance_metric": "direction_agreement>=0.95",
+            "acceptance_basis": "empirically_measured_direction_agreement",
+            "measured_repro_flag": "KIMI_MEASURED_REPRO_OK",
+            "bit_level_reproducible": False,
+            "blocking_reason": blocking_reason,
+        }
     raise ValueError(f"unsupported BT provider: {provider}")
 
 
@@ -1758,8 +1816,12 @@ def _positive_int(value: int | str, *, name: str) -> int:
     return parsed
 
 
+def _uses_median_denoising(provider_name: ProviderName) -> bool:
+    return provider_name in {"codex_responses", "kimi"}
+
+
 def _codex_cache_prompt_version(provider_name: ProviderName, sample_count: int) -> str:
-    if provider_name != "codex_responses":
+    if not _uses_median_denoising(provider_name):
         return FULL_PROMPT_VERSION
     return f"{FULL_PROMPT_VERSION}:median-n{sample_count}"
 
@@ -2101,6 +2163,7 @@ def _aggregate_denoising_samples(
     samples: list[ProviderSample],
     sample_count: int,
     sample_concurrency: int,
+    provider_name: ProviderName,
 ) -> tuple[dict[str, Any], int, str, dict[str, Any]]:
     if len(samples) != sample_count:
         raise ValueError(f"expected {sample_count} samples, got {len(samples)}")
@@ -2136,7 +2199,7 @@ def _aggregate_denoising_samples(
             "expected_change_pct": _rounded(median_expected),
             "confidence": _rounded(median([sample.confidence for sample in samples])),
             "reasoning": (
-                f"median denoised {sample_count} codex_responses samples; representative sample: "
+                f"median denoised {sample_count} {provider_name} samples; representative sample: "
                 f"{representative.reasoning}"
             ),
         },
@@ -2378,7 +2441,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mode", choices=["sampled", "full"], default="sampled")
     parser.add_argument(
         "--provider",
-        choices=["heuristic", "codex_cli", "codex_responses"],
+        choices=["heuristic", "codex_cli", "codex_responses", "kimi"],
         default="heuristic",
     )
     parser.add_argument("--start", default=DEFAULT_START.isoformat())

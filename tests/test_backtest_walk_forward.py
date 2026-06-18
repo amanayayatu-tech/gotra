@@ -6,6 +6,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from gotra.backtest.audit import audit_step
 from gotra.backtest.budget import TokenBudget
@@ -21,6 +22,7 @@ from gotra.backtest.walk_forward import (
     _last_agent_message_from_codex_jsonl,
     run_backtest,
 )
+from gotra.backtest.kimi_client import KimiCompletionClient
 import gotra.backtest.walk_forward as walk_forward
 
 
@@ -356,6 +358,42 @@ def test_codex_responses_n1_degenerates_to_single_sample_behavior(tmp_path: Path
     assert decision.expected_change_pct == -5.0
     assert decision.confidence == 0.55
     assert decision.denoising is None
+
+
+def test_kimi_provider_median_denoising_reuses_existing_sampling_config(tmp_path: Path) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.values = [1.0, 5.0, -1.0]
+            self.calls = 0
+
+        def complete(self, **_kwargs):
+            self.calls += 1
+            return {
+                "content": _decision_json(expected_change_pct=self.values.pop(0)),
+                "usage": {"total_tokens": 10},
+            }
+
+    client = FakeClient()
+    decision = CodexDecisionProvider(
+        client=client,
+        provider_name="kimi",
+        sample_count=3,
+        sample_concurrency=1,
+    ).decide(
+        ticker="AAPL",
+        arm="baseline",
+        decision_date=date(2020, 1, 1),
+        price_rows=_price_rows(start="2019-01-01", days=370),
+        feedback=[],
+        cache=DecisionCache(tmp_path / "cache.json"),
+        budget=TokenBudget(max_tokens=100_000),
+    )
+
+    assert client.calls == 3
+    assert decision.expected_change_pct == 1.0
+    assert decision.denoising is not None
+    assert decision.denoising["sample_count"] == 3
+    assert decision.reasoning.startswith("median denoised 3 kimi samples")
 
 
 def test_codex_provider_retries_invalid_json(tmp_path: Path) -> None:
@@ -1030,10 +1068,44 @@ def test_codex_responses_provider_is_stage3_eligible_when_empirically_flagged(
     assert walk_forward._provider_determinism_error(metadata) == ""  # noqa: SLF001
 
 
+def test_build_provider_returns_kimi_decision_provider() -> None:
+    provider = walk_forward._build_provider("kimi")  # noqa: SLF001
+
+    assert isinstance(provider, CodexDecisionProvider)
+    assert provider.provider_name == "kimi"
+    assert isinstance(provider.client, KimiCompletionClient)
+
+
+def test_kimi_provider_preflight_requires_sophnet_key(monkeypatch) -> None:
+    monkeypatch.delenv("SOPHNET_API_KEY", raising=False)
+    provider = walk_forward._build_provider("kimi")  # noqa: SLF001
+
+    with pytest.raises(RuntimeError, match="SOPHNET_API_KEY"):
+        provider.preflight()
+
+
+def test_kimi_provider_determinism_does_not_upgrade_smoke_to_stage3() -> None:
+    metadata = walk_forward._provider_determinism_metadata(  # noqa: SLF001
+        "kimi",
+        require_stage3_provider=True,
+    )
+
+    assert metadata["stage3_acceptance_eligible"] is False
+    assert metadata["temperature_control"] == "supported_zero"
+    assert metadata["acceptance_basis"] == "empirically_measured_direction_agreement"
+    assert "Stage 7 smoke evidence is provider/plumbing only" in metadata["blocking_reason"]
+
+
 def test_parse_args_accepts_codex_responses_provider() -> None:
     args = walk_forward.parse_args(["--provider", "codex_responses"])
 
     assert args.provider == "codex_responses"
+
+
+def test_parse_args_accepts_kimi_provider() -> None:
+    args = walk_forward.parse_args(["--provider", "kimi"])
+
+    assert args.provider == "kimi"
 
 
 def test_parse_args_accepts_codex_responses_denoising_config() -> None:
