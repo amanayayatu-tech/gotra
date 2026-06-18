@@ -422,15 +422,6 @@ def _score_point(
     start_row = _row_on_or_after(prices, point.decision_date)
     outcome_date = point.decision_date + timedelta(days=30)
     end_row = _row_on_or_after(prices, outcome_date)
-    prompt_payload = _build_codex_prompt_payload(
-        ticker=point.ticker,
-        decision_date=point.decision_date,
-        price_rows=decision_slice,
-        feedback=[],
-    )
-    prompt = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True, indent=2)
-    prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-    token_estimate = estimate_tokens(BT_CODEX_SYSTEM_PROMPT + "\n" + prompt)
     if decision_slice.empty or start_row is None or end_row is None:
         return {
             "schema": "gotra.bt.kimi_probe_step.v1",
@@ -442,11 +433,21 @@ def _score_point(
             "decision_date": point.decision_date.isoformat(),
             "provider": "kimi_sophnet",
             "provider_metadata": _provider_metadata(config=config),
-            "prompt_hash": prompt_hash,
+            "prompt_hash": "",
             "skip_reason": "insufficient_price_history",
             "future_data_allowed": False,
             "audit_actor": "backtest/kimi_probe",
         }
+
+    prompt_payload = _build_codex_prompt_payload(
+        ticker=point.ticker,
+        decision_date=point.decision_date,
+        price_rows=decision_slice,
+        feedback=[],
+    )
+    prompt = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True, indent=2)
+    prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    token_estimate = estimate_tokens(BT_CODEX_SYSTEM_PROMPT + "\n" + prompt)
 
     try:
         decision_payload, billed_tokens, token_usage_source, denoising = _complete_denoised(
@@ -565,6 +566,7 @@ def _complete_denoised(
         samples=samples,
         sample_count=config.sample_count,
         sample_concurrency=sample_concurrency,
+        provider_name="kimi_sophnet",
     )
     raw_median = float(median([sample.expected_change_pct for sample in samples]))
     final_direction, final_expected = dead_zone_decision_from_median(
