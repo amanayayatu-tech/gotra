@@ -176,6 +176,16 @@ provider_raw_content_sha256: f4d1cb3df6ba2ac51f86ddc26692a96542ba61fc8124c922a9d
 The raw provider response was retained as an artifact but is not quoted or
 printed in this document.
 
+Follow-up sanitized diagnosis on 2026-06-19:
+
+```text
+raw_json_valid: true
+forbidden_non_empty_fields: alaya_memory_refs
+sanitized_forbidden_value_sample: ["full_gotra"]
+interpretation: generic placeholder in a forbidden direct_llm ref field; not
+  price evidence and not a valid alaya feedback_ref.
+```
+
 ## Tiny Micro-Pilot C2
 
 Not entered.

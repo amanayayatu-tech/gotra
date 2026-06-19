@@ -705,8 +705,8 @@ def build_prompt_payload(
             "confidence": "number in [0, 1]",
             "reasoning": "string",
             "evidence_refs": "list",
-            "ksana_refs": "list; direct_llm must be empty",
-            "alaya_memory_refs": "list; only full_gotra may use matured refs",
+            "ksana_refs": arm_ksana_refs_contract(arm),
+            "alaya_memory_refs": arm_alaya_memory_refs_contract(arm, feedback),
             "risk_factors": "list",
             "abstain_reason": "string|null",
             "input_cutoff": decision_date.isoformat(),
@@ -790,6 +790,20 @@ def render_provider_prompt(payload: dict[str, Any]) -> str:
     forbidden_keys = ", ".join(INPUT_ECHO_FORBIDDEN_KEYS)
     allowed_keys = json.dumps(list(DECISION_JSON_ALLOWED_KEYS), ensure_ascii=False)
     arm_contract_text = json.dumps(arm_contract, ensure_ascii=False, sort_keys=True, indent=2)
+    output_contract_text = json.dumps(
+        payload.get("output_contract") or {},
+        ensure_ascii=False,
+        sort_keys=True,
+        indent=2,
+    )
+    ref_rules = arm_specific_ref_rules(payload)
+    ref_rules_text = "\n".join(f"- {rule}" for rule in ref_rules)
+    skeleton_text = json.dumps(
+        decision_json_skeleton(payload),
+        ensure_ascii=False,
+        sort_keys=True,
+        indent=2,
+    )
     input_packet_text = json.dumps(input_packet, ensure_ascii=False, sort_keys=True, indent=2)
     return "\n".join(
         [
@@ -825,6 +839,15 @@ def render_provider_prompt(payload: dict[str, Any]) -> str:
             "- full_gotra alaya_memory_refs must be a subset of alaya_feedback_history[].feedback_ref.",
             "- If alaya_feedback_history is empty, full_gotra alaya_memory_refs must be [].",
             "",
+            "ARM_SPECIFIC_REF_RULES:",
+            ref_rules_text,
+            "",
+            "OUTPUT_CONTRACT_JSON:",
+            output_contract_text,
+            "",
+            "DECISION_JSON_SKELETON_COPY_AND_FILL_VALUES:",
+            skeleton_text,
+            "",
             "ARM_CONTRACT:",
             arm_contract_text,
             "",
@@ -836,6 +859,85 @@ def render_provider_prompt(payload: dict[str, Any]) -> str:
             "FINAL ANSWER:",
         ]
     )
+
+
+def arm_ksana_refs_contract(arm: Arm) -> str:
+    if arm == "direct_llm":
+        return "MUST be exactly []; never put evidence refs, ksana labels, or placeholders here"
+    if arm == "ksana_formatting_only":
+        return "list of ksana formatting refs if used; alaya refs still forbidden"
+    return "list of ksana research refs if used; direct_llm rules do not apply"
+
+
+def arm_alaya_memory_refs_contract(arm: Arm, feedback: list[dict[str, Any]]) -> str:
+    if arm == "full_gotra":
+        refs = [str(item.get("feedback_ref")) for item in feedback if item.get("feedback_ref")]
+        if refs:
+            return "subset of visible alaya_feedback_history feedback_ref values: " + ", ".join(refs)
+        return "MUST be exactly []; no visible alaya_feedback_history feedback_ref values"
+    return "MUST be exactly []; only full_gotra may return alaya memory refs"
+
+
+def arm_specific_ref_rules(payload: dict[str, Any]) -> list[str]:
+    arm = normalize_arm(payload.get("arm"))
+    feedback = payload.get("alaya_feedback_history") or []
+    if arm == "direct_llm":
+        return [
+            'For direct_llm, output "ksana_refs": [] exactly.',
+            'For direct_llm, output "alaya_memory_refs": [] exactly.',
+            "For direct_llm, never write full_gotra, alaya, ksana, workflow labels, "
+            "or evidence refs inside ksana_refs/alaya_memory_refs.",
+            "For direct_llm, evidence_refs may cite only available evidence names; "
+            "they do not belong in ksana_refs or alaya_memory_refs.",
+        ]
+    if arm in {"ksana_formatting_only", "ksana_real_research"}:
+        return [
+            f'For {arm}, output "alaya_memory_refs": [] exactly.',
+            f"For {arm}, never write full_gotra, alaya, feedback, "
+            "or memory placeholders inside alaya_memory_refs.",
+        ]
+    visible_refs = [str(item.get("feedback_ref")) for item in feedback if item.get("feedback_ref")]
+    if not visible_refs:
+        return [
+            'For full_gotra with no visible feedback_ref values, output "alaya_memory_refs": [] exactly.',
+            "For full_gotra, never invent generic placeholders such as full_gotra, "
+            "alaya, or matured_feedback.",
+        ]
+    return [
+        "For full_gotra, alaya_memory_refs must be a subset of these visible feedback_ref values: "
+        + ", ".join(visible_refs),
+        "For full_gotra, output [] if none of the visible feedback_ref values are used.",
+        "For full_gotra, never invent generic placeholders such as full_gotra, "
+        "alaya, or matured_feedback.",
+    ]
+
+
+def decision_json_skeleton(payload: dict[str, Any]) -> dict[str, Any]:
+    arm = normalize_arm(payload.get("arm"))
+    if arm == "ksana_formatting_only":
+        ksana_refs: list[str] = ["ksana_formatting_contract"]
+    elif arm in {"ksana_real_research", "full_gotra"}:
+        ksana_refs = ["ksana_real_research_artifacts"]
+    else:
+        ksana_refs = []
+    return {
+        "schema": DECISION_SCHEMA,
+        "arm": arm,
+        "ticker": str(payload.get("ticker") or ""),
+        "decision_date": str(payload.get("decision_date") or ""),
+        "horizon_days": int(payload.get("horizon_days") or WINDOW_DAYS),
+        "direction": "neutral",
+        "expected_change_pct": 0.0,
+        "confidence": 0.0,
+        "reasoning": "Use available evidence only.",
+        "evidence_refs": ["adjusted_close_history"],
+        "ksana_refs": ksana_refs,
+        "alaya_memory_refs": [],
+        "risk_factors": [],
+        "abstain_reason": None,
+        "input_cutoff": str(payload.get("decision_date") or ""),
+        "future_data_allowed": False,
+    }
 
 
 def arm_prompt_contract(arm: Arm) -> dict[str, Any]:

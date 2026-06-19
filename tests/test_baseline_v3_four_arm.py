@@ -88,6 +88,31 @@ def test_four_arm_payload_boundaries_and_input_layers() -> None:
     assert full["alaya_knowledge_state"]["strong_knowledge_auto_approval_allowed"] is False
     assert "research_artifacts" not in price_only_real
     assert full["output_contract"]["schema"] == v3.DECISION_SCHEMA
+    assert direct["output_contract"]["ksana_refs"].startswith("MUST be exactly []")
+    assert direct["output_contract"]["alaya_memory_refs"].startswith("MUST be exactly []")
+
+
+def test_direct_llm_provider_prompt_requires_empty_ref_arrays() -> None:
+    payload = v3.build_prompt_payload(
+        arm="direct_llm",
+        input_layer="price_only_packet",
+        ticker="AAPL",
+        decision_date=date(2024, 1, 2),
+        price_rows=_price_rows(),
+        feedback=[],
+        provider="mock",
+        provider_model="local-deterministic",
+    )
+
+    prompt = v3.render_provider_prompt(payload)
+
+    assert 'For direct_llm, output "ksana_refs": [] exactly.' in prompt
+    assert 'For direct_llm, output "alaya_memory_refs": [] exactly.' in prompt
+    assert "never write full_gotra, alaya, ksana" in prompt
+    assert '"ksana_refs": []' in prompt
+    assert '"alaya_memory_refs": []' in prompt
+    assert '"ksana_refs": "MUST be exactly []' in prompt
+    assert '"alaya_memory_refs": "MUST be exactly []' in prompt
 
 
 def test_cache_key_contains_input_layer_and_definition_version() -> None:
@@ -197,6 +222,8 @@ def test_parse_ref_isolation_normalization_and_input_echo() -> None:
 
     direct_echo = _decision_payload()
     direct_echo["ksana_refs"] = ["not_allowed"]
+    direct_alaya_echo = _decision_payload()
+    direct_alaya_echo["alaya_memory_refs"] = ["full_gotra"]
     ksana_with_alaya = _decision_payload(arm="ksana_real_research")
     ksana_with_alaya["alaya_memory_refs"] = ["not_allowed"]
     try:
@@ -205,6 +232,13 @@ def test_parse_ref_isolation_normalization_and_input_echo() -> None:
         assert "direct_llm must not include" in str(exc)
     else:
         raise AssertionError("expected direct ref isolation failure")
+
+    try:
+        v3.parse_provider_decision(direct_alaya_echo)
+    except ValueError as exc:
+        assert "direct_llm must not include" in str(exc)
+    else:
+        raise AssertionError("expected direct alaya ref isolation failure")
 
     try:
         v3.parse_provider_decision(ksana_with_alaya)
