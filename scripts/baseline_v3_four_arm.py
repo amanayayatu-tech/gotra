@@ -87,6 +87,7 @@ DEEPSEEK_FLASH_MODEL = v2.DEEPSEEK_FLASH_MODEL
 DEFAULT_GLM_BASE_URL = v2.DEFAULT_GLM_BASE_URL
 DEEPSEEK_RATE_LIMITS = v2.DEEPSEEK_RATE_LIMITS
 RUN_ID_PREFIX = "baseline_v3_four_arm_"
+RUN_ID_PREFIX_V3_1 = "baseline_v3_1_"
 WINDOW_DAYS = 30
 DEFAULT_TICKERS = v2.V1_PILOT_TICKERS
 DEFAULT_DATES = v2.V1_PILOT_DATES
@@ -141,6 +142,7 @@ class RunConfig:
     scheduler_policy: str
     provider_max_tokens: int = 1200
     resume: bool = False
+    research_artifacts_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -723,13 +725,21 @@ def build_prompt_payload(
     provider: str,
     provider_model: str,
     scoring_segment: ScoringSegment = "scored",
+    research_artifacts_path: Path | None = None,
+    research_artifacts_override: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     latest = price_rows.iloc[-1]
-    research_artifacts = research_artifacts_for(
-        arm=arm,
-        input_layer=input_layer,
-        decision_date=decision_date,
-        price_rows=price_rows,
+    research_artifacts = (
+        research_artifacts_override
+        if research_artifacts_override is not None
+        else research_artifacts_for(
+            arm=arm,
+            input_layer=input_layer,
+            decision_date=decision_date,
+            price_rows=price_rows,
+            research_artifacts_path=research_artifacts_path,
+            ticker=ticker,
+        )
     )
     payload: dict[str, Any] = {
         "schema": PROMPT_SCHEMA,
@@ -801,14 +811,42 @@ def research_artifacts_for(
     input_layer: InputLayer,
     decision_date: date,
     price_rows: pd.DataFrame,
+    research_artifacts_path: Path | None = None,
+    ticker: str = "",
 ) -> list[dict[str, Any]]:
+    return research_artifact_filter_result(
+        arm=arm,
+        input_layer=input_layer,
+        decision_date=decision_date,
+        price_rows=price_rows,
+        research_artifacts_path=research_artifacts_path,
+        ticker=ticker,
+    )["accepted_artifacts"]
+
+
+def research_artifact_filter_result(
+    *,
+    arm: Arm,
+    input_layer: InputLayer,
+    decision_date: date,
+    price_rows: pd.DataFrame,
+    research_artifacts_path: Path | None = None,
+    ticker: str = "",
+) -> dict[str, Any]:
     if input_layer != "richer_research_packet":
-        return []
+        return empty_research_artifact_filter_result()
     if arm == "ksana_formatting_only":
-        return []
+        return empty_research_artifact_filter_result()
+    if research_artifacts_path:
+        return filter_external_research_artifacts(
+            load_research_artifact_fixture(research_artifacts_path),
+            decision_date=decision_date,
+            ticker=ticker,
+        )
     latest = price_rows.iloc[-1]
     source_date = str(latest["date"])
-    return [
+    return {
+        "accepted_artifacts": [
         {
             "name": "synthetic_news_context",
             "kind": "news_items",
@@ -825,7 +863,117 @@ def research_artifacts_for(
             "availability_date": min(parse_date(source_date), decision_date).isoformat(),
             "summary": "Synthetic snapshot used only to exercise richer packet plumbing.",
         },
-    ]
+        ],
+        "rejected_research_artifact_count": 0,
+        "rejected_research_future_data_count": 0,
+        "rejected_research_schema_count": 0,
+    }
+
+
+REQUIRED_RESEARCH_ARTIFACT_FIELDS = {
+    "ticker",
+    "source_name",
+    "source_url_or_id",
+    "publish_timestamp",
+    "availability_date",
+    "source_kind",
+    "retrieval_method",
+    "evidence_ref",
+    "summary",
+}
+FORBIDDEN_RESEARCH_ARTIFACT_FIELDS = {
+    "actual_change_pct",
+    "future_return",
+    "outcome",
+    "realized_after_decision",
+    "window_end_price",
+    "future_price",
+}
+
+
+def empty_research_artifact_filter_result() -> dict[str, Any]:
+    return {
+        "accepted_artifacts": [],
+        "rejected_research_artifact_count": 0,
+        "rejected_research_future_data_count": 0,
+        "rejected_research_schema_count": 0,
+    }
+
+
+def load_research_artifact_fixture(path: Path) -> list[dict[str, Any]]:
+    if path.suffix.lower() == ".jsonl":
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    if path.suffix.lower() == ".csv":
+        return [dict(row) for row in pd.read_csv(path).to_dict(orient="records")]
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict):
+        payload = payload.get("artifacts", [])
+    if not isinstance(payload, list):
+        raise ValueError("research artifact fixture must be a list or {'artifacts': [...]}")
+    return [dict(item) for item in payload if isinstance(item, dict)]
+
+
+def filter_external_research_artifacts(
+    artifacts: list[dict[str, Any]],
+    *,
+    decision_date: date,
+    ticker: str,
+) -> dict[str, Any]:
+    accepted: list[dict[str, Any]] = []
+    rejected_future = 0
+    rejected_schema = 0
+    for artifact in artifacts:
+        artifact_ticker = str(artifact.get("ticker") or "")
+        if artifact_ticker not in {ticker, "*"}:
+            continue
+        missing = REQUIRED_RESEARCH_ARTIFACT_FIELDS - set(artifact)
+        source_kind = str(artifact.get("source_kind") or "")
+        forbidden = sorted(FORBIDDEN_RESEARCH_ARTIFACT_FIELDS & set(artifact))
+        if missing or source_kind not in {"real", "unverified", "synthetic"}:
+            rejected_schema += 1
+            continue
+        if forbidden or parse_date(str(artifact["availability_date"])) > decision_date:
+            rejected_future += 1
+            continue
+        accepted.append(normalize_research_artifact(artifact))
+    return {
+        "accepted_artifacts": accepted,
+        "rejected_research_artifact_count": rejected_future + rejected_schema,
+        "rejected_research_future_data_count": rejected_future,
+        "rejected_research_schema_count": rejected_schema,
+    }
+
+
+def research_filter_diagnostics(result: dict[str, Any]) -> dict[str, int]:
+    return {
+        "rejected_research_artifact_count": int(result.get("rejected_research_artifact_count") or 0),
+        "rejected_research_future_data_count": int(
+            result.get("rejected_research_future_data_count") or 0
+        ),
+        "rejected_research_schema_count": int(result.get("rejected_research_schema_count") or 0),
+    }
+
+
+def normalize_research_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": str(artifact["evidence_ref"]),
+        "kind": "research_artifact",
+        "source": str(artifact["source_url_or_id"]),
+        "source_kind": str(artifact["source_kind"]),
+        "availability_date": str(artifact["availability_date"]),
+        "summary": str(artifact["summary"]),
+        "ticker": str(artifact["ticker"]),
+        "source_name": str(artifact["source_name"]),
+        "source_url_or_id": str(artifact["source_url_or_id"]),
+        "publish_timestamp": str(artifact["publish_timestamp"]),
+        "retrieval_method": str(artifact["retrieval_method"]),
+        "evidence_ref": str(artifact["evidence_ref"]),
+        "decision_date_scope": artifact.get("decision_date_scope"),
+    }
 
 
 def ksana_workflow_for(arm: Arm) -> dict[str, str]:
@@ -1117,6 +1265,12 @@ def build_scored_step(
     error = round(actual - decision.expected_change_pct, 6)
     decision_hit = direction_hit_for(predicted_direction=decision.direction, actual_change_pct=actual)
     feedback_ages = feedback_age_days(feedback=feedback, decision_date=point.decision_date)
+    strict_feedback = strict_feedback_diagnostics(
+        feedback=feedback if arm == "full_gotra" else [],
+        decision_date=point.decision_date,
+        arm=arm,
+        scoring_segment=scoring_segment,
+    )
     available_evidence_count = 1 + len(research_artifacts) + (len(feedback) if arm == "full_gotra" else 0)
     step = {
         "schema": STEP_SCHEMA,
@@ -1159,6 +1313,7 @@ def build_scored_step(
         "feedback_used_count": len(feedback) if arm == "full_gotra" else 0,
         "feedback_age_days_min": min(feedback_ages) if feedback_ages else None,
         "feedback_age_days_max": max(feedback_ages) if feedback_ages else None,
+        **strict_feedback,
         "quarantine_excluded_count": 0,
         "strong_knowledge_auto_approved": False,
         "research_artifacts": research_artifacts,
@@ -1315,6 +1470,7 @@ def decision_inputs(
                 "name": str(item.get("feedback_ref") or f"alaya_matured_feedback_{index}"),
                 "kind": "alaya_feedback",
                 "source": "prior_step_outcome",
+                "source_kind": str(item.get("source_kind") or "self_feedback"),
                 "availability_date": item["outcome_availability_date"],
             }
         )
@@ -1361,6 +1517,55 @@ def feedback_age_days(*, feedback: list[dict[str, Any]], decision_date: date) ->
             continue
         ages.append((decision_date - parse_date(str(item["outcome_availability_date"]))).days)
     return ages
+
+
+def strict_feedback_diagnostics(
+    *,
+    feedback: list[dict[str, Any]],
+    decision_date: date,
+    arm: Arm = "full_gotra",
+    scoring_segment: ScoringSegment = "scored",
+) -> dict[str, Any]:
+    if arm != "full_gotra" or scoring_segment != "scored":
+        return {
+            "self_feedback_available": False,
+            "visible_mature_feedback_count": 0,
+            "feedback_prior_wave_count": 0,
+            "feedback_real_unverified_count": 0,
+            "strict_feedback_eligible": False,
+            "true_independent_feedback_eligible": False,
+            "strict_feedback_insufficient_reason": "not_full_gotra_scored_segment",
+        }
+    ages = feedback_age_days(feedback=feedback, decision_date=decision_date)
+    prior_waves = {
+        str(item.get("prior_decision_date") or item.get("decision_date"))
+        for item in feedback
+        if item.get("prior_decision_date") or item.get("decision_date")
+    }
+    real_unverified_count = sum(
+        1 for item in feedback if str(item.get("source_kind") or "") in {"real", "unverified"}
+    )
+    count = len(feedback)
+    max_age = max(ages) if ages else None
+    reasons: list[str] = []
+    if count < 3:
+        reasons.append("visible_mature_feedback_count_lt_3")
+    if max_age is None or max_age < WINDOW_DAYS:
+        reasons.append("feedback_age_days_max_lt_horizon_days")
+    if len(prior_waves) < 2:
+        reasons.append("prior_wave_count_lt_2")
+    if real_unverified_count < 1:
+        reasons.append("no_real_or_unverified_feedback_source_kind")
+    eligible = not reasons
+    return {
+        "self_feedback_available": count > 0,
+        "visible_mature_feedback_count": count,
+        "feedback_prior_wave_count": len(prior_waves),
+        "feedback_real_unverified_count": real_unverified_count,
+        "strict_feedback_eligible": eligible,
+        "true_independent_feedback_eligible": eligible,
+        "strict_feedback_insufficient_reason": ",".join(reasons),
+    }
 
 
 def synthetic_evidence_count(research_artifacts: list[dict[str, Any]]) -> int:
@@ -1648,12 +1853,15 @@ def complete_step(
     started_at: float | None = None
     try:
         context = price_context_for(point, price_dir=config.price_dir)
-        research_artifacts = research_artifacts_for(
+        research_filter = research_artifact_filter_result(
             arm=arm,
             input_layer=point.input_layer,
             decision_date=point.decision_date,
             price_rows=context.price_rows,
+            research_artifacts_path=config.research_artifacts_path,
+            ticker=point.ticker,
         )
+        research_artifacts = list(research_filter["accepted_artifacts"])
         payload = build_prompt_payload(
             arm=arm,
             input_layer=point.input_layer,
@@ -1664,6 +1872,7 @@ def complete_step(
             provider=client.provider,
             provider_model=client.provider_model,
             scoring_segment=scoring_segment,
+            research_artifacts_override=research_artifacts,
         )
         prompt = render_provider_prompt(payload)
         diagnostics = prompt_request_diagnostics(prompt=prompt, config=config, arm=arm)
@@ -1730,6 +1939,8 @@ def complete_step(
             provider_transport=client.provider_transport,
             diagnostics=diagnostics,
         )
+        step.update(research_filter_diagnostics(research_filter))
+        step["product_metrics"] = product_metrics_for_step(step)
     except FileNotFoundError as exc:
         step = build_error_step(
             run_id=config.run_id,
@@ -2080,9 +2291,12 @@ def run_date_wave(
                 {
                     "feedback_ref": feedback_ref_for_step(step),
                     "ticker": ticker,
+                    "prior_decision_date": step["decision_date"],
                     "decision_date": step["decision_date"],
                     "input_layer": input_layer,
                     "outcome_availability_date": step["outcome_as_of"],
+                    "age_days": 0,
+                    "source_kind": "self_feedback",
                     "error": step["error"],
                     "mse": step["mse"],
                     "actual_change_pct": step["actual_change_pct"],
@@ -2106,12 +2320,18 @@ def feedback_ref_for_step(step: dict[str, Any]) -> str:
 
 
 def matured_feedback(items: list[dict[str, Any]], *, decision_date: date) -> list[dict[str, Any]]:
-    matured = [
-        dict(item)
-        for item in items
-        if item.get("outcome_availability_date")
-        and parse_date(str(item["outcome_availability_date"])) <= decision_date
-    ]
+    matured: list[dict[str, Any]] = []
+    for item in items:
+        if not item.get("outcome_availability_date"):
+            continue
+        outcome_date = parse_date(str(item["outcome_availability_date"]))
+        if outcome_date > decision_date:
+            continue
+        normalized = dict(item)
+        normalized["age_days"] = (decision_date - outcome_date).days
+        normalized.setdefault("prior_decision_date", normalized.get("decision_date"))
+        normalized.setdefault("source_kind", "self_feedback")
+        matured.append(normalized)
     return sorted(matured, key=lambda item: (str(item["decision_date"]), str(item.get("input_layer"))))
 
 
@@ -2311,6 +2531,18 @@ def summarize_run(
         for step in steps
         if step.get("status") == "scored" and int(step.get("provider_retry_count") or 0) > 0
     )
+    rejected_research_artifact_count = sum(
+        int(step.get("rejected_research_artifact_count") or 0) for step in steps
+    )
+    rejected_research_future_data_count = sum(
+        int(step.get("rejected_research_future_data_count") or 0) for step in steps
+    )
+    rejected_research_schema_count = sum(
+        int(step.get("rejected_research_schema_count") or 0) for step in steps
+    )
+    source_kind_counts = source_kind_counts_for_steps(steps)
+    strict_feedback_points = strict_feedback_eligible_count(steps)
+    true_independent_feedback_points = true_independent_feedback_eligible_count(steps)
     paired = paired_complete_count(steps)
     scored_points = total_scored_points(config)
     expected_steps = total_points * len(ARMS)
@@ -2392,6 +2624,7 @@ def summarize_run(
         "input_layers": list(config.input_layers),
         "warm_up_dates": config.warm_up_dates,
         "repeat_run_index": config.repeat_run_index,
+        "research_artifacts_path": str(config.research_artifacts_path or ""),
         "expected_points": total_points,
         "expected_scored_points": scored_points,
         "expected_steps": expected_steps,
@@ -2403,6 +2636,10 @@ def summarize_run(
         "paired_coverage": paired / scored_points if scored_points else 0.0,
         "future_data_violations": future_violations,
         "research_source_leak_count": research_source_leak_count,
+        "rejected_research_artifact_count": rejected_research_artifact_count,
+        "rejected_research_future_data_count": rejected_research_future_data_count,
+        "rejected_research_schema_count": rejected_research_schema_count,
+        "h1_research_evidence_status": h1_research_evidence_status(source_kind_counts),
         "provider_error_count": provider_errors,
         "provider_error_rate": provider_error_rate,
         "adaptive_concurrency": config.adaptive_concurrency,
@@ -2432,12 +2669,17 @@ def summarize_run(
         "full_gotra_scored_points": full_gotra_scored_count(steps),
         "full_gotra_feedback_available_scored_points": full_gotra_feedback_available_count(steps),
         "full_gotra_high_quality_feedback_scored_points": full_gotra_high_quality_feedback_count(steps),
+        "self_feedback_available_points": self_feedback_available_count(steps),
+        "strict_feedback_eligible_points": strict_feedback_points,
+        "true_independent_feedback_eligible_points": true_independent_feedback_points,
+        "h2_data_status": h2_data_status(true_independent_feedback_points),
+        "h2_data_insufficient_reason": h2_data_insufficient_reason(steps),
         "C4_feedback_eligible_paired_points": paired_diff_summary[
             "C4_real_research_minus_full_gotra_mse"
         ]["paired_points"],
         "feedback_path_exercised": full_gotra_feedback_available_count(steps) > 0,
         "synthetic_evidence_count": sum(int(step.get("synthetic_evidence_count") or 0) for step in steps),
-        "source_kind_counts": source_kind_counts_for_steps(steps),
+        "source_kind_counts": source_kind_counts,
         "reasoning_chars_by_arm": reasoning_chars_by_arm(steps),
         "circuit_breaker_triggered": circuit_breaker.triggered,
         "trigger_reason": circuit_breaker.trigger_reason,
@@ -2686,6 +2928,9 @@ def feedback_diagnostics(steps: list[dict[str, Any]]) -> dict[str, Any]:
                 "decision_date": step.get("decision_date"),
                 "input_layer": step.get("input_layer"),
                 "points": 0,
+                "self_feedback_available_points": 0,
+                "strict_feedback_eligible_points": 0,
+                "true_independent_feedback_eligible_points": 0,
                 "feedback_used_count_min": None,
                 "feedback_used_count_max": None,
                 "feedback_age_days_max_min": None,
@@ -2693,12 +2938,22 @@ def feedback_diagnostics(steps: list[dict[str, Any]]) -> dict[str, Any]:
             },
         )
         row["points"] += 1
+        row["self_feedback_available_points"] += 1 if step.get("self_feedback_available") else 0
+        row["strict_feedback_eligible_points"] += 1 if step.get("strict_feedback_eligible") else 0
+        row["true_independent_feedback_eligible_points"] += (
+            1 if step.get("true_independent_feedback_eligible") else 0
+        )
         update_min_max(row, "feedback_used_count", step.get("feedback_used_count"))
         update_min_max(row, "feedback_age_days_max", step.get("feedback_age_days_max"))
     return {
         "full_gotra_scored_points": len(full_scored),
         "feedback_available_points": full_gotra_feedback_available_count(steps),
         "high_quality_feedback_points": full_gotra_high_quality_feedback_count(steps),
+        "self_feedback_available_points": self_feedback_available_count(steps),
+        "strict_feedback_eligible_points": strict_feedback_eligible_count(steps),
+        "true_independent_feedback_eligible_points": true_independent_feedback_eligible_count(steps),
+        "h2_data_status": h2_data_status(true_independent_feedback_eligible_count(steps)),
+        "h2_data_insufficient_reason": h2_data_insufficient_reason(steps),
         "by_scored_date_input_layer": list(by_date_layer.values()),
     }
 
@@ -2963,6 +3218,68 @@ def full_gotra_high_quality_feedback_count(steps: list[dict[str, Any]]) -> int:
     )
 
 
+def self_feedback_available_count(steps: list[dict[str, Any]]) -> int:
+    return sum(
+        1
+        for step in steps
+        if step.get("status") == "scored"
+        and step.get("scoring_segment") == "scored"
+        and step.get("arm") == "full_gotra"
+        and bool(step.get("self_feedback_available"))
+    )
+
+
+def strict_feedback_eligible_count(steps: list[dict[str, Any]]) -> int:
+    return sum(
+        1
+        for step in steps
+        if step.get("status") == "scored"
+        and step.get("scoring_segment") == "scored"
+        and step.get("arm") == "full_gotra"
+        and bool(step.get("strict_feedback_eligible"))
+    )
+
+
+def true_independent_feedback_eligible_count(steps: list[dict[str, Any]]) -> int:
+    return sum(
+        1
+        for step in steps
+        if step.get("status") == "scored"
+        and step.get("scoring_segment") == "scored"
+        and step.get("arm") == "full_gotra"
+        and bool(step.get("true_independent_feedback_eligible"))
+    )
+
+
+def h1_research_evidence_status(source_kind_counts: dict[str, int]) -> str:
+    if source_kind_counts.get("real", 0) or source_kind_counts.get("unverified", 0):
+        return "RESEARCH_EVIDENCE_PRESENT_LOCAL_MOCK"
+    if source_kind_counts.get("synthetic", 0):
+        return "NOT_TESTED_SYNTHETIC_ONLY"
+    return "NOT_TESTED_NO_RICHER_RESEARCH_EVIDENCE"
+
+
+def h2_data_status(true_independent_feedback_points: int) -> str:
+    if true_independent_feedback_points > 0:
+        return "STRICT_FEEDBACK_ELIGIBLE_PRESENT"
+    return "DATA_INSUFFICIENT_FOR_H2_TRUE_INDEPENDENT_FEEDBACK"
+
+
+def h2_data_insufficient_reason(steps: list[dict[str, Any]]) -> str:
+    if true_independent_feedback_eligible_count(steps) > 0:
+        return ""
+    reasons = sorted(
+        {
+            reason
+            for step in steps
+            if step.get("arm") == "full_gotra"
+            for reason in str(step.get("strict_feedback_insufficient_reason") or "").split(",")
+            if reason and reason != "not_full_gotra_scored_segment"
+        }
+    )
+    return ",".join(reasons) or "no_full_gotra_scored_strict_feedback_points"
+
+
 def run_root_has_artifacts(run_root: Path) -> bool:
     return v2.run_root_has_artifacts(run_root)
 
@@ -3039,6 +3356,7 @@ def manifest_identity(config: RunConfig) -> dict[str, Any]:
         "scheduler_policy": config.scheduler_policy,
         "timeout_policy": timeout_policy_manifest(config),
         "provider_limits": provider_limit_metadata(config),
+        "research_artifacts_path": str(config.research_artifacts_path or ""),
     }
 
 
@@ -3074,6 +3392,7 @@ def write_manifest(run_root: Path, config: RunConfig) -> None:
         "provider_concurrency": config.provider_concurrency,
         "max_provider_concurrency": config.max_provider_concurrency,
         "scheduler_policy": config.scheduler_policy,
+        "research_artifacts_path": str(config.research_artifacts_path or ""),
         "timeout_policy": timeout_policy_manifest(config),
         "timeout_retries": config.timeout_retries,
         "timeout_retry_backoff_seconds": config.timeout_retry_backoff_seconds,
@@ -3119,8 +3438,8 @@ def append_ledger(run_root: Path, step: dict[str, Any]) -> None:
 
 
 def validate_run_id(run_id: str) -> None:
-    if not run_id.startswith(RUN_ID_PREFIX):
-        raise ValueError(f"run_id must start with {RUN_ID_PREFIX!r}")
+    if not run_id.startswith((RUN_ID_PREFIX, RUN_ID_PREFIX_V3_1)):
+        raise ValueError(f"run_id must start with {RUN_ID_PREFIX!r} or {RUN_ID_PREFIX_V3_1!r}")
     if "/" in run_id or ".." in run_id:
         raise ValueError("run_id must be a single path segment")
 
@@ -3245,6 +3564,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--token-budget", type=int, default=None)
     parser.add_argument("--runs-root", type=Path, default=Path("data/backtest/runs"))
     parser.add_argument("--price-dir", type=Path, default=Path("data/backtest/prices"))
+    parser.add_argument(
+        "--research-artifacts-path",
+        type=Path,
+        default=None,
+        help="Local JSON/JSONL/CSV research artifact fixture; no network retrieval is performed.",
+    )
     parser.add_argument("--env-file", default="")
     parser.add_argument("--resume", action="store_true")
     return parser
@@ -3333,6 +3658,7 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         timeout_retry_backoff_seconds=max(0.0, timeout_retry_backoff_seconds),
         scheduler_policy="per_date_feedback_snapshot_interleaved_point_layer_arm_v3",
         resume=bool(args.resume),
+        research_artifacts_path=args.research_artifacts_path,
     )
 
 

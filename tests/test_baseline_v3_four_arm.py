@@ -384,6 +384,92 @@ def test_product_metrics_evidence_coverage_rejects_unavailable_refs() -> None:
             assert 0.0 <= value <= 1.0
 
 
+def test_v3_1_research_artifact_fixture_filters_and_counts_future_leaks() -> None:
+    fixture = Path("tests/fixtures/baseline_v3_1_research_artifacts.json")
+    result = v3.filter_external_research_artifacts(
+        v3.load_research_artifact_fixture(fixture),
+        decision_date=date(2024, 1, 2),
+        ticker="AAPL",
+    )
+
+    refs = {item["evidence_ref"] for item in result["accepted_artifacts"]}
+    counts = v3.source_kind_counts_for_artifacts(result["accepted_artifacts"])
+
+    assert refs == {
+        "real:aapl:sec_q4",
+        "unverified:aapl:analyst_note",
+        "synthetic:aapl:packet",
+        "unverified:market:context",
+    }
+    assert counts["real"] == 1
+    assert counts["unverified"] == 2
+    assert counts["synthetic"] == 1
+    assert result["rejected_research_future_data_count"] == 1
+    assert result["rejected_research_schema_count"] == 0
+
+
+def test_v3_1_research_artifact_schema_validation_rejects_missing_fields() -> None:
+    result = v3.filter_external_research_artifacts(
+        [{"ticker": "AAPL", "source_kind": "real"}],
+        decision_date=date(2024, 1, 2),
+        ticker="AAPL",
+    )
+
+    assert result["accepted_artifacts"] == []
+    assert result["rejected_research_schema_count"] == 1
+
+
+def test_v3_1_strict_feedback_requires_multiple_waves_and_real_or_unverified_source() -> None:
+    base_feedback = [
+        {
+            "feedback_ref": "f1",
+            "decision_date": "2023-10-02",
+            "prior_decision_date": "2023-10-02",
+            "outcome_availability_date": "2023-11-02",
+            "source_kind": "self_feedback",
+        },
+        {
+            "feedback_ref": "f2",
+            "decision_date": "2023-11-01",
+            "prior_decision_date": "2023-11-01",
+            "outcome_availability_date": "2023-12-01",
+            "source_kind": "self_feedback",
+        },
+        {
+            "feedback_ref": "f3",
+            "decision_date": "2023-12-01",
+            "prior_decision_date": "2023-12-01",
+            "outcome_availability_date": "2023-12-15",
+            "source_kind": "self_feedback",
+        },
+    ]
+
+    self_only = v3.strict_feedback_diagnostics(
+        feedback=base_feedback,
+        decision_date=date(2024, 1, 31),
+    )
+    one_wave = v3.strict_feedback_diagnostics(
+        feedback=[
+            {**item, "prior_decision_date": "2023-10-02", "source_kind": "real"}
+            for item in base_feedback
+        ],
+        decision_date=date(2024, 1, 31),
+    )
+    eligible = v3.strict_feedback_diagnostics(
+        feedback=[{**base_feedback[0], "source_kind": "real"}, *base_feedback[1:]],
+        decision_date=date(2024, 1, 31),
+    )
+
+    assert self_only["strict_feedback_eligible"] is False
+    assert "no_real_or_unverified_feedback_source_kind" in self_only[
+        "strict_feedback_insufficient_reason"
+    ]
+    assert one_wave["strict_feedback_eligible"] is False
+    assert "prior_wave_count_lt_2" in one_wave["strict_feedback_insufficient_reason"]
+    assert eligible["strict_feedback_eligible"] is True
+    assert eligible["true_independent_feedback_eligible"] is True
+
+
 def _product_metric_step(*, evidence_refs: list[str], available_refs: list[str]) -> dict[str, object]:
     return {
         "schema": v3.STEP_SCHEMA,
@@ -907,6 +993,56 @@ def test_mock_run_writes_warm_up_feedback_and_v3_artifacts(tmp_path: Path) -> No
     assert direct_price["definition_version"] == v3.DEFINITION_VERSION
     assert direct_price["schema"] == v3.STEP_SCHEMA
     assert (run_root / "ledger.jsonl").exists()
+
+
+def test_v3_1_mock_run_reports_real_evidence_and_strict_feedback_diagnostics(tmp_path: Path) -> None:
+    for ticker in ("AAPL", "MSFT", "NVDA"):
+        _write_prices(tmp_path / "prices", ticker, days=520)
+    config = _config(
+        tmp_path,
+        run_id="baseline_v3_1_real_evidence_mock_impl_test",
+        tickers=("AAPL", "MSFT", "NVDA"),
+        dates=(
+            date(2024, 1, 2),
+            date(2024, 2, 1),
+            date(2024, 3, 1),
+            date(2024, 4, 2),
+        ),
+    )
+    config = replace(
+        config,
+        research_artifacts_path=Path("tests/fixtures/baseline_v3_1_research_artifacts.json"),
+    )
+
+    summary = v3.run_four_arm(config)
+    run_root = tmp_path / "runs" / "baseline_v3_1_real_evidence_mock_impl_test"
+    richer_step = json.loads(
+        (
+            run_root
+            / "ksana_real_research"
+            / "step_2024-02-01_aapl_richer_research_packet.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert summary["status"] == "MOCK_PASS"
+    assert summary["provider_call_status"] == "no real provider HTTP call"
+    assert summary["future_data_violations"] == 0
+    assert summary["research_source_leak_count"] == 0
+    assert summary["rejected_research_future_data_count"] > 0
+    assert summary["source_kind_counts"]["real"] > 0
+    assert summary["source_kind_counts"]["unverified"] > 0
+    assert summary["source_kind_counts"]["synthetic"] > 0
+    assert summary["h1_research_evidence_status"] == "RESEARCH_EVIDENCE_PRESENT_LOCAL_MOCK"
+    assert summary["self_feedback_available_points"] > 0
+    assert summary["true_independent_feedback_eligible_points"] == 0
+    assert summary["h2_data_status"] == "DATA_INSUFFICIENT_FOR_H2_TRUE_INDEPENDENT_FEEDBACK"
+    assert "no_real_or_unverified_feedback_source_kind" in summary[
+        "h2_data_insufficient_reason"
+    ]
+    assert richer_step["source_kind_counts"]["real"] == 1
+    assert richer_step["source_kind_counts"]["unverified"] == 2
+    assert richer_step["source_kind_counts"]["synthetic"] == 1
+    assert richer_step["rejected_research_future_data_count"] == 1
 
 
 def _price_rows(days: int = 220) -> pd.DataFrame:
