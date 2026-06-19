@@ -199,3 +199,40 @@ This result does not support:
 Treat C2 as a provider/runtime hardening item before scale-smoke. Do not enter
 formal-lite until the provider ladder has a clean C2 and subsequent scale-smoke
 under the preregistered boundaries.
+
+## Addendum: Runtime Timeout Hardening Follow-Up
+
+UTC: 2026-06-19T09:03:47Z
+
+Follow-up runtime hardening was completed after the C2 provider timeout blocker
+recorded above. The Kimi provider path now uses a bounded retry for retryable
+provider runtime failures while keeping schema contract, input echo,
+future-data, and invalid-response failures strict and non-retryable.
+
+Follow-up evidence:
+
+```text
+C2 rerun: baseline_v3_four_arm_micro_pilot_kimi26_runtime_retry_c2_20260619T075718Z
+C2 status: PROVIDER_PILOT_PASS
+C2 expected_steps: 96
+C2 actual_step_files: 96
+C2 schema_contract_error_count: 0
+C2 provider_error_count: 0
+C2 timeout_count: 0
+
+scale-smoke: baseline_v3_four_arm_scale_smoke_kimi26_runtime_retry_10x6_20260619T080822Z
+scale status: PROVIDER_PILOT_PASS
+scale expected_steps: 480
+scale actual_step_files: 480
+scale schema_contract_error_count: 0
+scale provider_error_count: 0
+scale timeout_count: 0
+scale retryable_provider_error_recovered_count: 2
+```
+
+See
+`docs/GOTRA_BASELINE_V3_PROVIDER_RUNTIME_TIMEOUT_HARDENING_RESULT_20260619T090347Z.md`
+for the full provider/runtime follow-up record. This addendum does not change
+the evidence boundary: it is provider/runtime smoke evidence only, not
+formal-lite, OOS, science/public, trading, or directional arm superiority
+evidence.

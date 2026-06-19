@@ -187,6 +187,7 @@ class ProviderDecision:
     provider_retry_count: int = 0
     provider_error_class: str = ""
     provider_temperature_fallback: bool = False
+    last_retryable_error_type: str = ""
     normalization_applied: bool = False
     normalization_steps: tuple[str, ...] = ()
     normalization_failure_reason: str = ""
@@ -283,15 +284,24 @@ class KimiDecisionClient:
         request_timeout_seconds: float,
         provider_base_url: str,
         provider_max_tokens: int,
+        timeout_retries: int = 1,
+        timeout_retry_backoff_seconds: float = 30,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.provider_model = model
         self.provider_base_url = provider_base_url
         self.provider_max_tokens = provider_max_tokens
+        self.timeout_retries = max(0, int(timeout_retries))
+        self.timeout_retry_backoff_seconds = max(0.0, float(timeout_retry_backoff_seconds))
         self.provider_max_tokens_applied = True
         self.provider_max_tokens_reason = "passed to KimiCompletionClient.complete"
         self.last_raw_content = ""
         self.request_timeout_seconds = request_timeout_seconds
-        self.client = KimiCompletionClient(model=model, base_url=provider_base_url)
+        self.client = KimiCompletionClient(
+            model=model,
+            base_url=provider_base_url,
+            transport=transport,
+        )
 
     def complete(
         self,
@@ -300,28 +310,84 @@ class KimiDecisionClient:
         request_timeout_seconds: float | None = None,
     ) -> ProviderDecision:
         prompt = render_provider_prompt(payload)
-        try:
-            completion = self.client.complete(
-                system_prompt=SYSTEM_PROMPT,
-                user_prompt=prompt,
-                max_tokens=self.provider_max_tokens,
-                timeout_seconds=int(request_timeout_seconds or self.request_timeout_seconds),
-                temperature=0.0,
-            )
-        except RuntimeError as exc:
-            message = str(exc)
-            provider_error_class = "HTTP_429" if "HTTP 429" in message else "provider_http_error"
-            if "timed out" in message.lower():
-                provider_error_class = "TimeoutException"
-            elif "not valid JSON" in message or "did not contain message content" in message:
-                provider_error_class = "InvalidResponse"
-            raise ProviderRequestError(
-                message,
-                provider_error_class=provider_error_class,
-                provider_attempts=1,
-            ) from exc
+        attempts = 0
+        retry_count = 0
+        last_retryable_error_type = ""
+        while True:
+            attempts += 1
+            try:
+                completion = self.client.complete(
+                    system_prompt=SYSTEM_PROMPT,
+                    user_prompt=prompt,
+                    max_tokens=self.provider_max_tokens,
+                    timeout_seconds=int(request_timeout_seconds or self.request_timeout_seconds),
+                    temperature=0.0,
+                )
+                break
+            except RuntimeError as exc:
+                message = str(exc)
+                provider_error_class = kimi_runtime_error_class(message)
+                if not kimi_runtime_error_is_retryable(message, provider_error_class):
+                    raise ProviderRequestError(
+                        message,
+                        provider_error_class=provider_error_class,
+                        provider_attempts=attempts,
+                        provider_retry_count=retry_count,
+                    ) from exc
+                last_retryable_error_type = provider_error_class
+                if retry_count >= self.timeout_retries:
+                    error = ProviderRequestError(
+                        message,
+                        provider_error_class=provider_error_class,
+                        provider_attempts=attempts,
+                        provider_retry_count=retry_count,
+                    )
+                    error.last_retryable_error_type = last_retryable_error_type
+                    raise error from exc
+                retry_count += 1
+                if self.timeout_retry_backoff_seconds > 0:
+                    time.sleep(self.timeout_retry_backoff_seconds)
         self.last_raw_content = str(completion.get("content", ""))
-        return _parse_raw_provider_content(raw_content=self.last_raw_content, attempts=1)
+        decision = _parse_raw_provider_content(
+            raw_content=self.last_raw_content,
+            attempts=attempts,
+            retry_count=retry_count,
+        )
+        return replace(decision, last_retryable_error_type=last_retryable_error_type)
+
+
+def kimi_runtime_error_class(message: str) -> str:
+    lowered = message.lower()
+    if "http 429" in lowered:
+        return "HTTP_429"
+    if "timed out" in lowered or "timeout" in lowered:
+        return "TimeoutException"
+    if "not valid json" in lowered or "did not contain message content" in lowered:
+        return "InvalidResponse"
+    return "provider_http_error"
+
+
+def kimi_runtime_error_is_retryable(message: str, provider_error_class: str) -> bool:
+    lowered = message.lower()
+    if provider_error_class == "TimeoutException":
+        return True
+    if provider_error_class == "provider_http_error":
+        retryable_markers = (
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+            "proxyerror",
+            "proxy error",
+            "connecterror",
+            "connect error",
+            "readerror",
+            "read error",
+            "remoteprotocolerror",
+            "network",
+        )
+        return any(marker in lowered for marker in retryable_markers)
+    return False
 
 
 class GlmSophnetDecisionClient(v2.GlmSophnetDecisionClient):
@@ -1490,7 +1556,15 @@ def diagnostics_from_exception(
     exc: Exception,
     started_at: float | None,
 ) -> dict[str, Any]:
-    return v2.diagnostics_from_exception(diagnostics=diagnostics, exc=exc, started_at=started_at)
+    updated = v2.diagnostics_from_exception(
+        diagnostics=diagnostics,
+        exc=exc,
+        started_at=started_at,
+    )
+    last_retryable_error_type = str(getattr(exc, "last_retryable_error_type", "") or "")
+    if last_retryable_error_type:
+        updated["last_retryable_error_type"] = last_retryable_error_type
+    return updated
 
 
 def raw_content_artifact_fields(
@@ -1600,6 +1674,7 @@ def complete_step(
             diagnostics["provider_retry_count"] = decision.provider_retry_count
             diagnostics["provider_error_class"] = decision.provider_error_class
             diagnostics["provider_temperature_fallback"] = decision.provider_temperature_fallback
+            diagnostics["last_retryable_error_type"] = decision.last_retryable_error_type
             diagnostics["normalization_applied"] = decision.normalization_applied
             diagnostics["normalization_steps"] = list(decision.normalization_steps)
             diagnostics["normalization_failure_reason"] = decision.normalization_failure_reason
@@ -1794,6 +1869,8 @@ def run_four_arm(config: RunConfig) -> dict[str, Any]:
             request_timeout_seconds=config.max_request_timeout_seconds,
             provider_base_url=config.provider_base_url,
             provider_max_tokens=config.provider_max_tokens,
+            timeout_retries=config.timeout_retries,
+            timeout_retry_backoff_seconds=config.timeout_retry_backoff_seconds,
         )
 
     points = [
@@ -2197,6 +2274,11 @@ def summarize_run(
     auth_missing_count = count_error_type(steps, "auth_missing")
     provider_http_error_count = count_error_type(steps, "provider_http_error")
     price_missing_count = count_error_type(steps, "price_missing")
+    retryable_provider_error_recovered_count = sum(
+        1
+        for step in steps
+        if step.get("status") == "scored" and int(step.get("provider_retry_count") or 0) > 0
+    )
     paired = paired_complete_count(steps)
     scored_points = total_scored_points(config)
     expected_steps = total_points * len(ARMS)
@@ -2307,6 +2389,9 @@ def summarize_run(
         "future_data_violation_count": future_violations,
         "auth_missing_count": auth_missing_count,
         "provider_http_error_count": provider_http_error_count,
+        "retryable_provider_error_recovered_count": retryable_provider_error_recovered_count,
+        "unrecovered_provider_timeout_count": timeout_count,
+        "unrecovered_provider_http_error_count": provider_http_error_count,
         "price_missing_count": price_missing_count,
         "normalization_counts": normalization_counts(steps),
         "raw_content_saved_count": sum(
@@ -2477,6 +2562,18 @@ def request_diagnostics_by_arm(steps: list[dict[str, Any]]) -> dict[str, Any]:
                     for step in arm_steps
                     if step.get("provider_error_class")
                 }
+            ),
+            "last_retryable_error_types": sorted(
+                {
+                    str(step.get("last_retryable_error_type"))
+                    for step in arm_steps
+                    if step.get("last_retryable_error_type")
+                }
+            ),
+            "retryable_provider_error_recovered_count": sum(
+                1
+                for step in arm_steps
+                if step.get("status") == "scored" and int(step.get("provider_retry_count") or 0) > 0
             ),
             "normalization_applied_count": sum(
                 1 for step in arm_steps if step.get("normalization_applied")

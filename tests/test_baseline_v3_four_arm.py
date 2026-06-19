@@ -590,6 +590,169 @@ def test_glm_provider_max_tokens_is_sent_in_request_body(monkeypatch) -> None:
     assert client.provider_max_tokens_applied is True
 
 
+def test_kimi_retryable_timeout_recovers_with_attempt_metadata() -> None:
+    client = v3.KimiDecisionClient(
+        model="Kimi-K2.6",
+        request_timeout_seconds=1,
+        provider_base_url="mock://kimi",
+        provider_max_tokens=77,
+        timeout_retries=1,
+        timeout_retry_backoff_seconds=0,
+    )
+    calls = 0
+
+    def complete_once_after_timeout(**_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("SophNet Kimi request timed out")
+        return {"content": json.dumps(_decision_payload())}
+
+    client.client.complete = complete_once_after_timeout  # type: ignore[method-assign]
+
+    decision = client.complete(
+        v3.build_prompt_payload(
+            arm="direct_llm",
+            input_layer="price_only_packet",
+            ticker="AAPL",
+            decision_date=date(2024, 1, 2),
+            price_rows=_price_rows(),
+            feedback=[],
+            provider="kimi",
+            provider_model="Kimi-K2.6",
+        )
+    )
+
+    assert calls == 2
+    assert decision.provider_attempts == 2
+    assert decision.provider_retry_count == 1
+    assert decision.last_retryable_error_type == "TimeoutException"
+
+
+def test_kimi_schema_and_input_echo_errors_are_not_retried() -> None:
+    schema_client = v3.KimiDecisionClient(
+        model="Kimi-K2.6",
+        request_timeout_seconds=1,
+        provider_base_url="mock://kimi",
+        provider_max_tokens=77,
+        timeout_retries=1,
+        timeout_retry_backoff_seconds=0,
+    )
+    echo_client = v3.KimiDecisionClient(
+        model="Kimi-K2.6",
+        request_timeout_seconds=1,
+        provider_base_url="mock://kimi",
+        provider_max_tokens=77,
+        timeout_retries=1,
+        timeout_retry_backoff_seconds=0,
+    )
+    schema_calls = 0
+    echo_calls = 0
+    bad_schema = _decision_payload()
+    bad_schema["future_data_allowed"] = True
+
+    def complete_bad_schema(**_kwargs: object) -> dict[str, object]:
+        nonlocal schema_calls
+        schema_calls += 1
+        return {"content": json.dumps(bad_schema)}
+
+    def complete_input_echo(**_kwargs: object) -> dict[str, object]:
+        nonlocal echo_calls
+        echo_calls += 1
+        return {"content": '{"arm_contract": {"task": "x"}, "research_artifacts": [{"name": "x"}]'}
+
+    schema_client.client.complete = complete_bad_schema  # type: ignore[method-assign]
+    echo_client.client.complete = complete_input_echo  # type: ignore[method-assign]
+    payload = v3.build_prompt_payload(
+        arm="direct_llm",
+        input_layer="price_only_packet",
+        ticker="AAPL",
+        decision_date=date(2024, 1, 2),
+        price_rows=_price_rows(),
+        feedback=[],
+        provider="kimi",
+        provider_model="Kimi-K2.6",
+    )
+
+    with pytest.raises(v3.ProviderRequestError, match="future_data_allowed must be false") as schema_exc:
+        schema_client.complete(payload)
+    with pytest.raises(v3.ProviderRequestError, match="echoed the input packet") as echo_exc:
+        echo_client.complete(payload)
+
+    assert schema_calls == 1
+    assert echo_calls == 1
+    assert schema_exc.value.provider_retry_count == 0
+    assert echo_exc.value.provider_retry_count == 0
+    assert schema_exc.value.provider_error_class == "SchemaContractError"
+    assert echo_exc.value.provider_error_class == "InputEchoError"
+
+
+def test_failed_runtime_retry_is_not_scored_or_cached(tmp_path: Path) -> None:
+    _write_prices(tmp_path / "prices", "AAPL", days=500)
+    run_root = tmp_path / "runs" / "baseline_v3_four_arm_retry_fail"
+    run_root.mkdir(parents=True)
+    for arm in v3.ARMS:
+        (run_root / arm).mkdir(parents=True)
+
+    class TimeoutClient:
+        provider = "kimi"
+        provider_model = "Kimi-K2.6"
+        provider_base_url = "mock://kimi"
+        provider_transport = "sophnet_chat_completions"
+        last_raw_content = ""
+
+        def complete(self, *_args: object, **_kwargs: object) -> v3.ProviderDecision:
+            error = v3.ProviderRequestError(
+                "SophNet Kimi request timed out",
+                provider_error_class="TimeoutException",
+                provider_attempts=2,
+                provider_retry_count=1,
+            )
+            error.last_retryable_error_type = "TimeoutException"
+            raise error
+
+    cache = v3.LocalJsonCache(run_root / "cache.json")
+    step = v3.complete_step(
+        config=_config(tmp_path, run_id="baseline_v3_four_arm_retry_fail"),
+        run_root=run_root,
+        cache=cache,
+        client=TimeoutClient(),  # type: ignore[arg-type]
+        point=v3.DecisionPoint("AAPL", date(2024, 1, 2), "price_only_packet"),
+        arm="ksana_real_research",
+        feedback=[],
+    )
+
+    assert step["status"] == "provider_error"
+    assert step["error_type"] == "provider_timeout"
+    assert step["provider_attempts"] == 2
+    assert step["provider_retry_count"] == 1
+    assert step["last_retryable_error_type"] == "TimeoutException"
+    assert cache.values == {}
+
+
+def test_summary_records_retry_recovery_diagnostics(tmp_path: Path) -> None:
+    step = _step("AAPL", "2024-02-01", "price_only_packet", "direct_llm", mse=1.0)
+    step["provider_attempts"] = 2
+    step["provider_retry_count"] = 1
+    step["last_retryable_error_type"] = "TimeoutException"
+
+    summary = v3.summarize_run(
+        config=replace(_config(tmp_path), input_layers=("price_only_packet",), warm_up_dates=0),
+        steps=[step],
+        total_points=1,
+        provider_preflight_error="",
+        stop_reason="",
+        max_provider_concurrency_used=1,
+        downgrade_events=[],
+    )
+
+    assert summary["retryable_provider_error_recovered_count"] == 1
+    assert summary["unrecovered_provider_timeout_count"] == 0
+    direct_diag = summary["request_diagnostics_by_arm"]["direct_llm"]
+    assert direct_diag["retryable_provider_error_recovered_count"] == 1
+    assert direct_diag["last_retryable_error_types"] == ["TimeoutException"]
+
+
 def test_mock_run_writes_warm_up_feedback_and_v3_artifacts(tmp_path: Path) -> None:
     _write_prices(tmp_path / "prices", "AAPL", days=520)
     config = _config(
