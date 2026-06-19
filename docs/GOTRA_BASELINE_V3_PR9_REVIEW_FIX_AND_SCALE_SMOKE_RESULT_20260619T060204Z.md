@@ -208,3 +208,44 @@ interpreted as arm superiority or inferiority.
 Stabilize provider runtime before scale-smoke. Do not enter medium scale-smoke
 until tiny micro-pilot completes with provider error counters at 0 and paired
 coverage at the required threshold.
+
+## Addendum: PR9 Comment Closure and Runtime Retry 2026-06-19T06:12:25Z
+
+PR #9 inline comments were re-audited against current head `a31743f`. All 9
+comments are verified resolved by the current implementation and tests. Seven
+comments are stale GitHub threads on old commit
+`89b326fe41e2c3f83b7621e96b3d926b3632c765` with `line:null`; two comments still
+map to current `a31743f` lines, but current code validates `full_gotra`
+`alaya_memory_refs` against visible feedback refs and reports calibration/Brier
+and abstain metrics in per-arm summaries.
+
+Local checks were rerun:
+
+```text
+py_compile: PASS
+ruff: PASS
+pytest tests/test_baseline_v3_four_arm.py: 21 passed
+git diff --check: PASS
+```
+
+Fresh conservative Kimi canary retry was attempted:
+
+```text
+run_id: baseline_v3_four_arm_canary_kimi26_runtime_retry_20260619T061200Z
+status: PROVIDER_BLOCKED_PRE_HTTP
+provider_call_status: no real provider HTTP call
+provider_preflight_error: PROVIDER_BLOCKED_PRE_HTTP: SOPHNET_API_KEY=not_set
+auth_missing_count: 32
+schema_error_count: 0
+input_echo_error_count: 0
+http_429_count: 0
+timeout_count: 0
+future_data_violations: 0
+research_source_leak_count: 0
+```
+
+This addendum extends the previous provider-runtime blocker evidence with a
+current local provider-auth preflight blocker. It is not a provider runtime
+health pass/fail because no real HTTP call was made. Tiny micro-pilot C1, tiny
+micro-pilot C2, and medium scale-smoke were not entered. Formal-lite acceptance,
+OOS validation, science/public claims, and trading claims remain not entered.
