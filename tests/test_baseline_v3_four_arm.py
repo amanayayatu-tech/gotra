@@ -7,6 +7,7 @@ from pathlib import Path
 
 import httpx
 import pandas as pd
+import pytest
 
 from gotra.backtest.statistics import cluster_bootstrap_ci, paired_loss_differences_v3
 from scripts import baseline_v3_four_arm as v3
@@ -76,6 +77,7 @@ def test_four_arm_payload_boundaries_and_input_layers() -> None:
     assert "ksana_research_workflow" not in direct
     assert "alaya_feedback_history" not in direct
     assert direct["research_artifacts"]
+    assert "never ksana" in direct["input_policy"]["direct_llm_richer_packet_contract"]
     assert "ksana_research_workflow" in formatting
     assert "research_artifacts" not in formatting
     assert "alaya_feedback_history" not in formatting
@@ -134,6 +136,22 @@ def test_strict_decision_json_rejects_unknown_keys_without_invention() -> None:
         assert "reasoning is required" in str(exc)
     else:
         raise AssertionError("expected missing-field schema failure")
+
+
+def test_decision_json_requires_json_numbers_not_strings_or_percentages() -> None:
+    string_expected = _decision_payload()
+    string_expected["expected_change_pct"] = "1.25"
+    string_confidence = _decision_payload()
+    string_confidence["confidence"] = "0.72"
+    percent_confidence = _decision_payload()
+    percent_confidence["confidence"] = 72
+
+    with pytest.raises(ValueError, match="expected_change_pct must be a JSON number"):
+        v3.parse_provider_decision(string_expected)
+    with pytest.raises(ValueError, match="confidence must be a JSON number"):
+        v3.parse_provider_decision(string_confidence)
+    with pytest.raises(ValueError, match="confidence out of range"):
+        v3.parse_provider_decision(percent_confidence)
 
 
 def test_research_source_leak_and_future_data_guards() -> None:
@@ -246,9 +264,22 @@ def test_statistics_v3_pairs_by_arm_input_layer_and_segment() -> None:
     assert richer == {"AAPL": [5.0]}
     first = cluster_bootstrap_ci(price_only, iters=200, seed=7)
     second = cluster_bootstrap_ci(price_only, iters=200, seed=7)
+    one_cluster = cluster_bootstrap_ci(
+        {"AAPL": [5.0, 6.0]},
+        iters=200,
+        seed=7,
+        left_arm="direct_llm",
+        right_arm="ksana_real_research",
+    )
     assert first == second
     assert first["n_clusters"] == 2
     assert first["mean_loss_diff"] == 5.5
+    assert first["statistical_test_completed"] is True
+    assert "right_arm_better_significant" in first
+    assert one_cluster["statistical_test_completed"] is False
+    assert one_cluster["right_arm_better_significant"] is False
+    assert one_cluster["passed"] is False
+    assert one_cluster["insufficient_reason"] == "not_enough_clusters"
 
 
 def test_product_metrics_for_constructed_step() -> None:
@@ -271,7 +302,7 @@ def test_product_metrics_for_constructed_step() -> None:
         "risk_factors": ["fixture risk"],
         "available_evidence_count": 2,
         "feedback_used_count": 1,
-        "alaya_memory_refs": ["matured_feedback"],
+        "alaya_memory_refs": ["feedback:aapl:richer_research_packet:2024-01-02"],
     }
 
     metrics = v3.product_metrics_for_step(step)
@@ -307,6 +338,27 @@ def test_matured_feedback_filters_future_outcomes() -> None:
     matured = v3.matured_feedback(feedback, decision_date=date(2024, 3, 1))
 
     assert [item["decision_date"] for item in matured] == ["2024-01-02"]
+
+
+def test_full_gotra_alaya_refs_must_match_available_feedback_refs() -> None:
+    decision = replace(
+        v3.parse_provider_decision(_decision_payload(arm="full_gotra")),
+        alaya_memory_refs=["feedback:aapl:price_only_packet:2024-01-02"],
+    )
+
+    with pytest.raises(v3.ProviderRequestError, match="invalid alaya_memory_refs"):
+        v3.validate_alaya_memory_refs(decision, arm="full_gotra", feedback=[])
+    with pytest.raises(v3.ProviderRequestError, match="invalid alaya_memory_refs"):
+        v3.validate_alaya_memory_refs(
+            decision,
+            arm="full_gotra",
+            feedback=[{"feedback_ref": "feedback:aapl:richer_research_packet:2024-01-02"}],
+        )
+    v3.validate_alaya_memory_refs(
+        decision,
+        arm="full_gotra",
+        feedback=[{"feedback_ref": "feedback:aapl:price_only_packet:2024-01-02"}],
+    )
 
 
 def test_provider_decision_identity_mismatch_is_not_scored_or_cached(tmp_path: Path) -> None:
@@ -358,6 +410,75 @@ def test_mock_pass_fails_when_price_missing_prevents_scored_coverage(tmp_path: P
     assert summary["price_missing_count"] > 0
     assert summary["scored_step_count"] == 0
     assert summary["paired_coverage"] == 0.0
+
+
+def test_mock_pass_requires_positive_scored_coverage(tmp_path: Path) -> None:
+    _write_prices(tmp_path / "prices", "AAPL", days=500)
+
+    summary = v3.run_four_arm(
+        _config(
+            tmp_path,
+            run_id="baseline_v3_four_arm_mock_zero_scored",
+            tickers=("AAPL",),
+            dates=(date(2024, 1, 2),),
+        )
+    )
+
+    assert summary["status"] == "DATA_INSUFFICIENT"
+    assert summary["expected_scored_points"] == 0
+    assert summary["paired_complete_points"] == 0
+
+
+def test_pilot_stop_reason_uses_unattempted_scored_points() -> None:
+    steps: list[dict[str, object]] = []
+    for index in range(20):
+        ticker = f"T{index:02d}"
+        decision_date = f"2024-02-{index + 1:02d}"
+        for arm in v3.ARMS:
+            if index >= 18 and arm == "full_gotra":
+                steps.append(
+                    _error_step(
+                        ticker,
+                        decision_date,
+                        "price_only_packet",
+                        arm,
+                        error_type="provider_timeout",
+                    )
+                )
+            else:
+                steps.append(_step(ticker, decision_date, "price_only_packet", arm, mse=1.0))
+
+    assert v3.pilot_stop_reason(steps=steps, total_points=20) == "paired coverage no longer feasible"
+
+
+def test_hac_runs_within_clusters_not_flattened_across_tickers() -> None:
+    steps: list[dict[str, object]] = []
+    for ticker in ("AAPL", "MSFT"):
+        for decision_date in ("2024-02-01", "2024-03-01"):
+            steps.append(_step(ticker, decision_date, "price_only_packet", "direct_llm", mse=5.0))
+            steps.append(_step(ticker, decision_date, "price_only_packet", "ksana_real_research", mse=3.0))
+
+    hac = v3.statistical_tests(steps)["price_only_packet"]["C3_direct_minus_real_research"]["hac"]
+
+    assert hac["statistical_test_completed"] is False
+    assert hac["reason"] == "not_enough_time_points"
+    assert hac["n"] == 4
+
+
+def test_c4_pairing_uses_feedback_eligible_points_only() -> None:
+    steps = [
+        _step("AAPL", "2024-02-01", "price_only_packet", "ksana_real_research", mse=5.0),
+        _step("AAPL", "2024-02-01", "price_only_packet", "full_gotra", mse=4.0),
+        _step("AAPL", "2024-03-01", "price_only_packet", "ksana_real_research", mse=6.0),
+        _step("AAPL", "2024-03-01", "price_only_packet", "full_gotra", mse=2.0),
+    ]
+    steps[3]["feedback_used_count"] = 1
+
+    c4 = v3.paired_diffs(steps)["C4_real_research_minus_full_gotra_mse"]
+
+    assert c4["feedback_eligible_only"] is True
+    assert c4["paired_points"] == 1
+    assert c4["mse_delta_left_minus_right"] == 4.0
 
 
 def test_nonpositive_step_months_rejected() -> None:
@@ -467,6 +588,13 @@ def test_mock_run_writes_warm_up_feedback_and_v3_artifacts(tmp_path: Path) -> No
             / "step_2024-02-01_aapl_richer_research_packet.json"
         ).read_text(encoding="utf-8")
     )
+    later_price_step = json.loads(
+        (
+            run_root
+            / "full_gotra"
+            / "step_2024-02-01_aapl_price_only_packet.json"
+        ).read_text(encoding="utf-8")
+    )
     direct_price = json.loads(
         (
             run_root
@@ -483,10 +611,14 @@ def test_mock_run_writes_warm_up_feedback_and_v3_artifacts(tmp_path: Path) -> No
     assert summary["future_data_violations"] == 0
     assert summary["research_source_leak_count"] == 0
     assert summary["synthetic_evidence_count"] > 0
+    assert summary["source_kind_counts"]["synthetic"] > 0
     assert summary["provider_max_tokens"] == 1600
     assert summary["provider_max_tokens_applied"] is False
     assert summary["scored_step_count"] == summary["expected_steps"]
+    assert summary["full_gotra_scored_points"] == 6
     assert summary["decision_schema"] == v3.DECISION_SCHEMA
+    assert summary["metrics"]["direct_llm"]["calibration"]["confidence_count"] == 6
+    assert summary["metrics"]["direct_llm"]["calibration"]["brier_score_direction"] is not None
     assert "C3_direct_minus_real_research" in summary["statistical_tests"]["richer_research_packet"]
     assert manifest["schema"] == v3.MANIFEST_SCHEMA
     assert manifest["definition_version"] == v3.DEFINITION_VERSION
@@ -496,9 +628,15 @@ def test_mock_run_writes_warm_up_feedback_and_v3_artifacts(tmp_path: Path) -> No
     assert warm_step["scoring_segment"] == "warm_up"
     assert later_step["scoring_segment"] == "scored"
     assert later_step["feedback_used_count"] > 0
-    assert later_step["alaya_memory_refs"] == ["matured_feedback"]
+    assert later_step["alaya_memory_refs"] == [
+        "feedback:aapl:richer_research_packet:2024-01-02"
+    ]
+    assert later_price_step["alaya_memory_refs"] == [
+        "feedback:aapl:price_only_packet:2024-01-02"
+    ]
     assert later_step["research_artifact_count"] == 2
     assert later_step["synthetic_evidence_count"] == 2
+    assert later_step["source_kind_counts"]["synthetic"] == 2
     assert "richer_research_packet" in later_step["cache_key"]
     assert direct_price["ksana_workflow_enabled"] is False
     assert direct_price["alaya_feedback_enabled"] is False
@@ -588,6 +726,29 @@ def _step(
         "mae": 1.0,
         "policy_a_return_pct": 0.0,
         "direction_hit": True,
+        "confidence": 0.7,
+        "actual_change_pct": 1.0,
+        "abstain_reason": None,
+        "feedback_used_count": 0,
+    }
+
+
+def _error_step(
+    ticker: str,
+    decision_date: str,
+    input_layer: str,
+    arm: str,
+    *,
+    error_type: str,
+) -> dict[str, object]:
+    return {
+        "status": "provider_error",
+        "error_type": error_type,
+        "ticker": ticker,
+        "decision_date": decision_date,
+        "input_layer": input_layer,
+        "scoring_segment": "scored",
+        "arm": arm,
     }
 
 
@@ -604,7 +765,7 @@ def _decision_payload(
         "decision_date": "2024-01-02",
         "horizon_days": 30,
         "direction": direction,
-        "expected_change_pct": "1.25",
+        "expected_change_pct": 1.25,
         "confidence": confidence,
         "reasoning": "Valid adjusted_close_history.",
         "evidence_refs": ["adjusted_close_history"],

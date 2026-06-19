@@ -139,8 +139,9 @@ def paired_loss_differences_v3(
     *,
     input_layer: str | None = None,
     segment: str = "scored",
+    cluster_by_input_layer: bool = False,
 ) -> dict[str, list[float]]:
-    """Return v3 paired MSE loss differences grouped by ticker.
+    """Return v3 paired MSE loss differences grouped by ticker or ticker/layer.
 
     The sign convention is ``left_mse - right_mse``. Positive values therefore
     mean the right arm has lower MSE on that paired point.
@@ -159,11 +160,12 @@ def paired_loss_differences_v3(
         decision_date = str(step.get("decision_date"))
         by_key[(ticker, decision_date, step_layer)][str(step.get("arm"))] = float(step["mse"])
 
-    by_ticker: dict[str, list[float]] = defaultdict(list)
-    for (ticker, _decision_date, _step_layer), values in sorted(by_key.items()):
+    by_cluster: dict[str, list[float]] = defaultdict(list)
+    for (ticker, _decision_date, step_layer), values in sorted(by_key.items()):
         if left in values and right in values:
-            by_ticker[ticker].append(round(values[left] - values[right], 12))
-    return {ticker: values for ticker, values in sorted(by_ticker.items()) if values}
+            cluster = f"{ticker}|{step_layer}" if cluster_by_input_layer else ticker
+            by_cluster[cluster].append(round(values[left] - values[right], 12))
+    return {cluster: values for cluster, values in sorted(by_cluster.items()) if values}
 
 
 def cluster_bootstrap_ci(
@@ -172,15 +174,29 @@ def cluster_bootstrap_ci(
     iters: int = 10000,
     seed: int,
     alpha: float = 0.05,
+    left_arm: str = "",
+    right_arm: str = "",
 ) -> dict[str, Any]:
     """Cluster bootstrap CI over ticker-level paired loss differences."""
 
     clusters = [(ticker, list(values)) for ticker, values in sorted(loss_diffs_by_ticker.items()) if values]
     flat = [value for _ticker, values in clusters for value in values]
-    if not clusters or not flat:
+    if len(clusters) < 2 or not flat:
         return {
-            "passed": None,
-            "reason": "not_enough_paired_steps",
+            "statistical_test_completed": False,
+            "right_arm_better_significant": False,
+            "passed": False,
+            "passed_field_semantics": "deprecated_alias_for_right_arm_better_significant",
+            "reason": "not_enough_clusters" if clusters else "not_enough_paired_steps",
+            "insufficient_reason": "not_enough_clusters" if clusters else "not_enough_paired_steps",
+            "left_arm": left_arm,
+            "right_arm": right_arm,
+            "winner_arm": "",
+            "effect_direction": "undetermined",
+            "mean_loss_diff": round(mean(flat), 6) if flat else None,
+            "ci_low": None,
+            "ci_high": None,
+            "p_value": None,
             "n_clusters": len(clusters),
             "n": len(flat),
             "iters": int(iters),
@@ -204,8 +220,27 @@ def cluster_bootstrap_ci(
     less_equal_zero = sum(1 for value in bootstrap_means if value <= 0) / len(bootstrap_means)
     greater_equal_zero = sum(1 for value in bootstrap_means if value >= 0) / len(bootstrap_means)
     p_value = min(1.0, 2 * min(less_equal_zero, greater_equal_zero))
+    right_arm_better_significant = point > 0 and lower > 0
+    if point > 0:
+        effect_direction = "right_arm_better"
+        winner_arm = right_arm
+    elif point < 0:
+        effect_direction = "left_arm_better"
+        winner_arm = left_arm
+    else:
+        effect_direction = "neutral"
+        winner_arm = ""
     return {
-        "passed": point > 0 and lower > 0,
+        "statistical_test_completed": True,
+        "right_arm_better_significant": right_arm_better_significant,
+        "passed": right_arm_better_significant,
+        "passed_field_semantics": "deprecated_alias_for_right_arm_better_significant",
+        "reason": "",
+        "insufficient_reason": "",
+        "left_arm": left_arm,
+        "right_arm": right_arm,
+        "winner_arm": winner_arm,
+        "effect_direction": effect_direction,
         "mean_loss_diff": round(point, 6),
         "ci_low": round(lower, 6),
         "ci_high": round(upper, 6),

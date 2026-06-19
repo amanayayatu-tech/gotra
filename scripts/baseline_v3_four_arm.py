@@ -246,6 +246,9 @@ class MockDecisionClient:
         elif arm in {"ksana_real_research", "full_gotra"}:
             ksana_refs = ["ksana_real_research_artifacts"]
         feedback = payload.get("alaya_feedback_history") or []
+        alaya_memory_refs = [
+            str(item["feedback_ref"]) for item in feedback if item.get("feedback_ref")
+        ]
         return ProviderDecision(
             schema=DECISION_SCHEMA,
             arm=arm,
@@ -261,7 +264,7 @@ class MockDecisionClient:
             ),
             evidence_refs=evidence_refs,
             ksana_refs=ksana_refs,
-            alaya_memory_refs=["matured_feedback"] if arm == "full_gotra" and feedback else [],
+            alaya_memory_refs=alaya_memory_refs if arm == "full_gotra" else [],
             risk_factors=["local_mock_not_provider_evidence"],
             abstain_reason=None,
             input_cutoff=str(payload["decision_date"]),
@@ -480,6 +483,16 @@ def normalize_input_layer(value: Any) -> InputLayer:
     return normalized  # type: ignore[return-value]
 
 
+def json_number_field(payload: dict[str, Any], field: str) -> float:
+    value = payload[field]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a JSON number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{field} must be finite")
+    return number
+
+
 def parse_provider_decision(value: str | dict[str, Any]) -> ProviderDecision:
     normalization_metadata = default_normalization_metadata()
     if isinstance(value, str):
@@ -507,10 +520,8 @@ def parse_provider_decision(value: str | dict[str, Any]) -> ProviderDecision:
     parse_date(decision_date)
     horizon_days = int(payload.get("horizon_days"))
     direction = normalize_direction(payload.get("direction"))
-    expected = float(payload["expected_change_pct"])
-    confidence = float(payload["confidence"])
-    if confidence > 1.0:
-        confidence = confidence / 100.0
+    expected = json_number_field(payload, "expected_change_pct")
+    confidence = json_number_field(payload, "confidence")
     if not 0 <= confidence <= 1:
         raise ValueError(f"confidence out of range: {confidence}")
     evidence_refs = payload.get("evidence_refs")
@@ -668,6 +679,11 @@ def build_prompt_payload(
             "decision_inputs_available_on_or_before": decision_date.isoformat(),
             "input_layer": input_layer,
             "richer_research_enabled": input_layer == "richer_research_packet",
+            "direct_llm_richer_packet_contract": (
+                "direct_llm receives raw time-bounded research_artifacts when "
+                "input_layer=richer_research_packet, but never ksana workflow output "
+                "or alaya feedback"
+            ),
             "actual_outcome_visible": False,
             "network_research_enabled": False,
         },
@@ -805,7 +821,9 @@ def render_provider_prompt(payload: dict[str, Any]) -> str:
             "- confidence must be a JSON number in [0, 1], not a word or percentage.",
             "- future_data_allowed must be false.",
             "- ksana_refs must be empty for direct_llm.",
-            "- alaya_memory_refs must be empty except for full_gotra matured refs.",
+            "- alaya_memory_refs must be empty except for full_gotra.",
+            "- full_gotra alaya_memory_refs must be a subset of alaya_feedback_history[].feedback_ref.",
+            "- If alaya_feedback_history is empty, full_gotra alaya_memory_refs must be [].",
             "",
             "ARM_CONTRACT:",
             arm_contract_text,
@@ -977,6 +995,7 @@ def build_scored_step(
         "research_artifacts": research_artifacts,
         "research_artifact_count": len(research_artifacts),
         "synthetic_evidence_count": synthetic_evidence_count(research_artifacts),
+        "source_kind_counts": source_kind_counts_for_artifacts(research_artifacts),
         "available_evidence_count": available_evidence_count,
         "research_source_leak": False,
         "prompt_hash": prompt_hash,
@@ -1064,6 +1083,7 @@ def build_error_step(
         "research_artifacts": [],
         "research_artifact_count": 0,
         "synthetic_evidence_count": 0,
+        "source_kind_counts": source_kind_counts_for_artifacts([]),
         "available_evidence_count": 0,
         "research_source_leak": error_type == "research_source_leak",
         "prompt_hash": prompt_hash,
@@ -1123,7 +1143,7 @@ def decision_inputs(
     for index, item in enumerate(feedback):
         inputs.append(
             {
-                "name": f"alaya_matured_feedback_{index}",
+                "name": str(item.get("feedback_ref") or f"alaya_matured_feedback_{index}"),
                 "kind": "alaya_feedback",
                 "source": "prior_step_outcome",
                 "availability_date": item["outcome_availability_date"],
@@ -1176,6 +1196,30 @@ def feedback_age_days(*, feedback: list[dict[str, Any]], decision_date: date) ->
 
 def synthetic_evidence_count(research_artifacts: list[dict[str, Any]]) -> int:
     return sum(1 for item in research_artifacts if str(item.get("source_kind")) == "synthetic")
+
+
+def source_kind_counts_for_artifacts(research_artifacts: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {"real": 0, "synthetic": 0, "unverified": 0, "price_derived": 0, "unknown": 0}
+    for item in research_artifacts:
+        source_kind = str(item.get("source_kind") or "unknown")
+        if source_kind not in counts:
+            source_kind = "unknown"
+        counts[source_kind] += 1
+    return counts
+
+
+def source_kind_counts_for_steps(steps: list[dict[str, Any]]) -> dict[str, int]:
+    counts = source_kind_counts_for_artifacts([])
+    for step in steps:
+        step_counts = step.get("source_kind_counts")
+        if isinstance(step_counts, dict):
+            for key, value in step_counts.items():
+                counts[str(key) if str(key) in counts else "unknown"] += int(value or 0)
+            continue
+        for artifact in step.get("research_artifacts") or []:
+            source_kind = str(artifact.get("source_kind") or "unknown")
+            counts[source_kind if source_kind in counts else "unknown"] += 1
+    return counts
 
 
 def product_metrics_for_step(step: dict[str, Any]) -> dict[str, float]:
@@ -1429,6 +1473,7 @@ def complete_step(
         if cached is not None:
             decision = parse_provider_decision(cached)
             validate_provider_decision_identity(decision, point=point, arm=arm)
+            validate_alaya_memory_refs(decision, arm=arm, feedback=feedback)
             cache_hit = True
         else:
             started_at = time.monotonic()
@@ -1440,6 +1485,12 @@ def complete_step(
                 decision,
                 point=point,
                 arm=arm,
+                raw_content=str(getattr(client, "last_raw_content", "") or ""),
+            )
+            validate_alaya_memory_refs(
+                decision,
+                arm=arm,
+                feedback=feedback,
                 raw_content=str(getattr(client, "last_raw_content", "") or ""),
             )
             diagnostics["request_duration_seconds"] = round(time.monotonic() - started_at, 6)
@@ -1577,6 +1628,32 @@ def validate_provider_decision_identity(
     )
 
 
+def validate_alaya_memory_refs(
+    decision: ProviderDecision,
+    *,
+    arm: Arm,
+    feedback: list[dict[str, Any]],
+    raw_content: str = "",
+) -> None:
+    if arm != "full_gotra":
+        return
+    refs = [str(item) for item in decision.alaya_memory_refs]
+    if not refs:
+        return
+    allowed_refs = {str(item.get("feedback_ref")) for item in feedback if item.get("feedback_ref")}
+    invalid_refs = sorted(ref for ref in refs if ref not in allowed_refs)
+    if not allowed_refs or invalid_refs:
+        raise ProviderRequestError(
+            "invalid alaya_memory_refs: "
+            + ",".join(invalid_refs or refs)
+            + f"; available_feedback_refs={len(allowed_refs)}",
+            provider_error_class="SchemaContractError",
+            provider_attempts=decision.provider_attempts,
+            provider_retry_count=decision.provider_retry_count,
+            raw_content=raw_content,
+        )
+
+
 def run_four_arm(config: RunConfig) -> dict[str, Any]:
     validate_run_id(config.run_id)
     run_root = config.runs_root / config.run_id
@@ -1624,7 +1701,9 @@ def run_four_arm(config: RunConfig) -> dict[str, Any]:
         for input_layer in config.input_layers
     ]
     steps: list[dict[str, Any]] = []
-    feedback_by_ticker: dict[str, list[dict[str, Any]]] = {ticker: [] for ticker in config.tickers}
+    feedback_by_key: dict[tuple[str, InputLayer], list[dict[str, Any]]] = {
+        (ticker, input_layer): [] for ticker in config.tickers for input_layer in config.input_layers
+    }
     provider_preflight_error = provider_preflight_blocker(config)
     concurrency_used = config.provider_concurrency
     downgrade_events: list[dict[str, Any]] = []
@@ -1666,7 +1745,7 @@ def run_four_arm(config: RunConfig) -> dict[str, Any]:
                 cache=cache,
                 client=client,
                 points=wave_points,
-                feedback_by_ticker=feedback_by_ticker,
+                feedback_by_key=feedback_by_key,
                 concurrency=concurrency_used,
                 circuit_breaker=circuit_breaker,
                 prior_steps=steps,
@@ -1713,7 +1792,7 @@ def run_date_wave(
     cache: LocalJsonCache,
     client: MockDecisionClient | KimiDecisionClient | GlmSophnetDecisionClient,
     points: list[DecisionPoint],
-    feedback_by_ticker: dict[str, list[dict[str, Any]]],
+    feedback_by_key: dict[tuple[str, InputLayer], list[dict[str, Any]]],
     concurrency: int,
     circuit_breaker: CircuitBreakerState,
     prior_steps: list[dict[str, Any]],
@@ -1723,9 +1802,9 @@ def run_date_wave(
     if not points:
         return steps
     decision_date = points[0].decision_date
-    feedback_snapshot_by_ticker = {
-        point.ticker: matured_feedback(
-            feedback_by_ticker.get(point.ticker, []),
+    feedback_snapshot_by_key = {
+        (point.ticker, point.input_layer): matured_feedback(
+            feedback_by_key.get((point.ticker, point.input_layer), []),
             decision_date=decision_date,
         )
         for point in points
@@ -1734,7 +1813,9 @@ def run_date_wave(
         ArmTask(
             point=point,
             arm=arm,
-            feedback=feedback_snapshot_by_ticker.get(point.ticker, []) if arm == "full_gotra" else [],
+            feedback=feedback_snapshot_by_key.get((point.ticker, point.input_layer), [])
+            if arm == "full_gotra"
+            else [],
         )
         for point in points
         for arm in ARMS
@@ -1782,10 +1863,14 @@ def run_date_wave(
 
     for step in sorted(steps, key=step_sort_key):
         if step.get("arm") == "full_gotra" and step.get("status") == "scored":
-            feedback_by_ticker.setdefault(str(step["ticker"]), []).append(
+            ticker = str(step["ticker"])
+            input_layer = normalize_input_layer(step["input_layer"])
+            feedback_by_key.setdefault((ticker, input_layer), []).append(
                 {
+                    "feedback_ref": feedback_ref_for_step(step),
+                    "ticker": ticker,
                     "decision_date": step["decision_date"],
-                    "input_layer": step["input_layer"],
+                    "input_layer": input_layer,
                     "outcome_availability_date": step["outcome_as_of"],
                     "error": step["error"],
                     "mse": step["mse"],
@@ -1796,6 +1881,17 @@ def run_date_wave(
                 }
             )
     return sorted(steps, key=step_sort_key)
+
+
+def feedback_ref_for_step(step: dict[str, Any]) -> str:
+    return ":".join(
+        [
+            "feedback",
+            ticker_slug(str(step["ticker"])),
+            str(step["input_layer"]),
+            str(step["decision_date"]),
+        ]
+    )
 
 
 def matured_feedback(items: list[dict[str, Any]], *, decision_date: date) -> list[dict[str, Any]]:
@@ -1901,8 +1997,11 @@ def pilot_stop_reason(*, steps: list[dict[str, Any]], total_points: int) -> str:
     if len(steps) >= 20 and provider_errors / max(1, len(steps)) > 0.05:
         return "provider_error_rate > 0.05"
     complete = paired_complete_count(steps)
-    remaining = max(0, scored_point_count_from_total_steps(steps, total_points) - complete)
-    denominator = max(1, scored_point_count_from_total_steps(steps, total_points))
+    denominator = scored_point_count_from_total_steps(steps, total_points)
+    if denominator <= 0:
+        return ""
+    attempted = attempted_scored_point_count(steps)
+    remaining = max(0, denominator - attempted)
     if (complete + remaining) / denominator < 0.95:
         return "paired coverage no longer feasible"
     return ""
@@ -1917,6 +2016,15 @@ def scored_point_count_from_total_steps(steps: list[dict[str, Any]], total_point
         if step.get("scoring_segment") == "warm_up"
     }
     return max(0, total_points - len(warm_points))
+
+
+def attempted_scored_point_count(steps: list[dict[str, Any]]) -> int:
+    attempted = {
+        paired_key(step)
+        for step in steps
+        if step.get("scoring_segment") == "scored"
+    }
+    return len(attempted)
 
 
 def consecutive_provider_errors(steps: list[dict[str, Any]]) -> int:
@@ -1993,18 +2101,21 @@ def summarize_run(
     provider_error_rate = provider_errors / expected_steps if expected_steps else 0.0
     scored_step_count = schema_pass
     if config.mode == "mock":
-        status = (
-            "MOCK_PASS"
-            if provider_errors == 0
+        mock_clean = (
+            provider_errors == 0
             and future_violations == 0
             and schema_errors == 0
             and research_source_leak_count == 0
             and price_missing_count == 0
             and len(steps) == expected_steps
             and scored_step_count == expected_steps
-            and paired == scored_points
-            else "HARNESS_NEEDS_FIX"
         )
+        if mock_clean and scored_points > 0 and paired > 0 and paired == scored_points:
+            status = "MOCK_PASS"
+        elif mock_clean and (scored_points == 0 or paired == 0):
+            status = "DATA_INSUFFICIENT"
+        else:
+            status = "HARNESS_NEEDS_FIX"
     elif config.mode == "provider-canary":
         if provider_preflight_error.startswith("PROVIDER_BLOCKED_PRE_HTTP"):
             status = "PROVIDER_BLOCKED_PRE_HTTP"
@@ -2034,6 +2145,8 @@ def summarize_run(
             )
     provider_limits = provider_limit_metadata(config)
     provider_tokens = provider_max_tokens_metadata(config)
+    paired_diff_summary = paired_diffs(steps)
+    statistical_test_summary = statistical_tests(steps)
     return {
         "schema": SUMMARY_SCHEMA,
         "definition_version": DEFINITION_VERSION,
@@ -2097,10 +2210,15 @@ def summarize_run(
         "raw_content_saved_count": sum(
             1 for step in steps if step.get("provider_raw_content_path")
         ),
+        "full_gotra_scored_points": full_gotra_scored_count(steps),
         "full_gotra_feedback_available_scored_points": full_gotra_feedback_available_count(steps),
         "full_gotra_high_quality_feedback_scored_points": full_gotra_high_quality_feedback_count(steps),
+        "C4_feedback_eligible_paired_points": paired_diff_summary[
+            "C4_real_research_minus_full_gotra_mse"
+        ]["paired_points"],
         "feedback_path_exercised": full_gotra_feedback_available_count(steps) > 0,
         "synthetic_evidence_count": sum(int(step.get("synthetic_evidence_count") or 0) for step in steps),
+        "source_kind_counts": source_kind_counts_for_steps(steps),
         "reasoning_chars_by_arm": reasoning_chars_by_arm(steps),
         "circuit_breaker_triggered": circuit_breaker.triggered,
         "trigger_reason": circuit_breaker.trigger_reason,
@@ -2110,8 +2228,8 @@ def summarize_run(
         "request_diagnostics_by_arm": request_diagnostics_by_arm(steps),
         "metrics": metrics_by_arm(steps),
         "product_metrics": product_metrics_by_arm(steps),
-        "paired_diffs": paired_diffs(steps),
-        "statistical_tests": statistical_tests(steps),
+        "paired_diffs": paired_diff_summary,
+        "statistical_tests": statistical_test_summary,
         "root_failure": root_failure(steps),
         "evidence_layer": evidence_layer_summary(),
     }
@@ -2171,6 +2289,7 @@ def metrics_by_arm(steps: list[dict[str, Any]]) -> dict[str, Any]:
                 "mse": None,
                 "mae": None,
                 "policy_a_cumulative_return_pct": None,
+                "calibration": calibration_and_abstain_metrics([]),
             }
             continue
         direction_hits = [1 if step.get("direction_hit") else 0 for step in scored]
@@ -2180,8 +2299,60 @@ def metrics_by_arm(steps: list[dict[str, Any]]) -> dict[str, Any]:
             "mse": mean_float(step["mse"] for step in scored),
             "mae": mean_float(step["mae"] for step in scored),
             "policy_a_cumulative_return_pct": policy_a_cumulative_return(scored),
+            "calibration": calibration_and_abstain_metrics(scored),
         }
     return output
+
+
+def calibration_and_abstain_metrics(scored: list[dict[str, Any]]) -> dict[str, Any]:
+    confidence_rows = [
+        (float(step["confidence"]), 1.0 if step.get("direction_hit") else 0.0)
+        for step in scored
+        if isinstance(step.get("confidence"), (int, float))
+        and not isinstance(step.get("confidence"), bool)
+        and step.get("direction_hit") is not None
+    ]
+    brier = (
+        round(mean_float((confidence - hit) ** 2 for confidence, hit in confidence_rows), 6)
+        if confidence_rows
+        else None
+    )
+    bins: list[dict[str, Any]] = []
+    for index in range(5):
+        lower = index / 5
+        upper = (index + 1) / 5
+        if index == 4:
+            rows = [(confidence, hit) for confidence, hit in confidence_rows if lower <= confidence <= upper]
+        else:
+            rows = [(confidence, hit) for confidence, hit in confidence_rows if lower <= confidence < upper]
+        bins.append(
+            {
+                "lower": round(lower, 2),
+                "upper": round(upper, 2),
+                "count": len(rows),
+                "mean_confidence": mean_float(confidence for confidence, _hit in rows),
+                "direction_hit_rate": mean_float(hit for _confidence, hit in rows),
+            }
+        )
+    abstain_steps = [step for step in scored if str(step.get("abstain_reason") or "").strip()]
+    non_abstain_steps = [step for step in scored if step not in abstain_steps]
+    return {
+        "confidence_count": len(confidence_rows),
+        "brier_score_direction": brier,
+        "calibration_bins": bins,
+        "abstain_count": len(abstain_steps),
+        "abstain_rate": round(len(abstain_steps) / len(scored), 6) if scored else 0.0,
+        "abstain_realized_abs_change_mean": mean_float(
+            abs(float(step["actual_change_pct"]))
+            for step in abstain_steps
+            if step.get("actual_change_pct") is not None
+        ),
+        "non_abstain_realized_abs_change_mean": mean_float(
+            abs(float(step["actual_change_pct"]))
+            for step in non_abstain_steps
+            if step.get("actual_change_pct") is not None
+        ),
+    }
 
 
 def request_diagnostics_by_arm(steps: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2277,13 +2448,32 @@ def paired_diffs(steps: list[dict[str, Any]]) -> dict[str, Any]:
     }
     output: dict[str, Any] = {}
     for name, (left, right) in pairs.items():
-        diffs_by_ticker = paired_loss_differences_v3(steps, left, right)
+        feedback_eligible_only = name == "C4_real_research_minus_full_gotra_mse"
+        eligible_steps = feedback_eligible_steps_for_c4(steps) if feedback_eligible_only else steps
+        diffs_by_ticker = paired_loss_differences_v3(eligible_steps, left, right)
         flat = [value for values in diffs_by_ticker.values() for value in values]
         output[name] = {
             "paired_points": len(flat),
             "mse_delta_left_minus_right": mean_float(flat),
+            "feedback_eligible_only": feedback_eligible_only,
         }
     return output
+
+
+def feedback_eligible_paired_keys(steps: list[dict[str, Any]]) -> set[tuple[str, str, str]]:
+    return {
+        paired_key(step)
+        for step in steps
+        if step.get("arm") == "full_gotra"
+        and step.get("status") == "scored"
+        and step.get("scoring_segment") == "scored"
+        and int(step.get("feedback_used_count") or 0) > 0
+    }
+
+
+def feedback_eligible_steps_for_c4(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    keys = feedback_eligible_paired_keys(steps)
+    return [step for step in steps if paired_key(step) in keys]
 
 
 def statistical_tests(steps: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2302,36 +2492,72 @@ def statistical_tests(steps: list[dict[str, Any]]) -> dict[str, Any]:
         for name, (left, right) in comparisons.items():
             eligible_steps = steps
             if name == "C4_real_research_minus_full_gotra":
-                keys = {
-                    paired_key(step)
-                    for step in steps
-                    if step.get("arm") == "full_gotra"
-                    and step.get("status") == "scored"
-                    and step.get("scoring_segment") == "scored"
-                    and int(step.get("feedback_used_count") or 0) > 0
-                }
-                eligible_steps = [step for step in steps if paired_key(step) in keys]
-            diffs_by_ticker = paired_loss_differences_v3(
+                eligible_steps = feedback_eligible_steps_for_c4(steps)
+            bootstrap_diffs_by_ticker = paired_loss_differences_v3(
                 eligible_steps,
                 left,
                 right,
                 input_layer=layer_filter,
             )
-            flat = [value for values in diffs_by_ticker.values() for value in values]
+            hac_diffs_by_cluster = paired_loss_differences_v3(
+                eligible_steps,
+                left,
+                right,
+                input_layer=layer_filter,
+                cluster_by_input_layer=layer_filter is None,
+            )
+            flat = [value for values in bootstrap_diffs_by_ticker.values() for value in values]
             layer_output[name] = {
                 "left": left,
                 "right": right,
                 "loss_diff_convention": "left_mse_minus_right_mse",
+                "feedback_eligible_only": name == "C4_real_research_minus_full_gotra",
                 "paired_points": len(flat),
-                "hac": hac_mean_test(flat),
+                "hac": hac_by_cluster(hac_diffs_by_cluster),
                 "cluster_bootstrap": cluster_bootstrap_ci(
-                    diffs_by_ticker,
+                    bootstrap_diffs_by_ticker,
                     iters=10000,
                     seed=20260619,
+                    left_arm=left,
+                    right_arm=right,
                 ),
             }
         output[layer_name] = layer_output
     return output
+
+
+def hac_by_cluster(loss_diffs_by_cluster: dict[str, list[float]]) -> dict[str, Any]:
+    flat = [value for values in loss_diffs_by_cluster.values() for value in values]
+    cluster_results: dict[str, Any] = {}
+    completed_cluster_count = 0
+    for cluster, values in sorted(loss_diffs_by_cluster.items()):
+        result = hac_mean_test(values)
+        cluster_results[cluster] = result
+        if result.get("reason") != "not_enough_paired_steps":
+            completed_cluster_count += 1
+    if completed_cluster_count == 0:
+        return {
+            "statistical_test_completed": False,
+            "passed": None,
+            "reason": "not_enough_time_points",
+            "n_clusters": len(loss_diffs_by_cluster),
+            "completed_cluster_count": 0,
+            "n": len(flat),
+            "mean_loss_diff": mean_float(flat),
+            "cluster_results": cluster_results,
+            "aggregation": "within_cluster_only",
+        }
+    return {
+        "statistical_test_completed": True,
+        "passed": None,
+        "reason": "cluster_level_results_only",
+        "n_clusters": len(loss_diffs_by_cluster),
+        "completed_cluster_count": completed_cluster_count,
+        "n": len(flat),
+        "mean_loss_diff": mean_float(flat),
+        "cluster_results": cluster_results,
+        "aggregation": "within_cluster_only",
+    }
 
 
 def paired_key(step: dict[str, Any]) -> tuple[str, str, str]:
@@ -2363,6 +2589,16 @@ def full_gotra_feedback_available_count(steps: list[dict[str, Any]]) -> int:
         and step.get("scoring_segment") == "scored"
         and step.get("arm") == "full_gotra"
         and int(step.get("feedback_used_count") or 0) > 0
+    )
+
+
+def full_gotra_scored_count(steps: list[dict[str, Any]]) -> int:
+    return sum(
+        1
+        for step in steps
+        if step.get("status") == "scored"
+        and step.get("scoring_segment") == "scored"
+        and step.get("arm") == "full_gotra"
     )
 
 
