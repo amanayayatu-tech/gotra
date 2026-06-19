@@ -12,6 +12,7 @@ import json
 import math
 import os
 from pathlib import Path
+import sys
 import threading
 import time
 from typing import Any, Literal
@@ -31,7 +32,7 @@ from scripts import baseline_v2_three_arm_pilot as v2
 
 
 Arm = Literal["direct_llm", "ksana_formatting_only", "ksana_real_research", "full_gotra"]
-Mode = Literal["mock", "provider-canary", "provider-pilot"]
+Mode = Literal["mock", "provider-canary", "provider-pilot", "recompute"]
 InputLayer = Literal["price_only_packet", "richer_research_packet"]
 ScoringSegment = Literal["warm_up", "scored"]
 
@@ -1390,12 +1391,39 @@ def source_kind_counts_for_steps(steps: list[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
+def available_evidence_ref_names(step: dict[str, Any]) -> set[str]:
+    names = {
+        str(item.get("name"))
+        for item in step.get("decision_inputs") or []
+        if isinstance(item, dict) and item.get("name")
+    }
+    if names:
+        return names
+    count = int(step.get("available_evidence_count") or 0)
+    return {str(item) for item in step.get("evidence_refs") or []} if count else set()
+
+
+def evidence_ref_coverage_diagnostics(step: dict[str, Any]) -> dict[str, int | float]:
+    evidence_refs = [str(item) for item in step.get("evidence_refs") or []]
+    available_refs = available_evidence_ref_names(step)
+    unique_refs = set(evidence_refs)
+    valid_refs = unique_refs & available_refs
+    invalid_refs = unique_refs - available_refs
+    duplicate_count = max(0, len(evidence_refs) - len(unique_refs))
+    coverage = len(valid_refs) / len(available_refs) if available_refs else 0.0
+    return {
+        "evidence_coverage": round(max(0.0, min(1.0, coverage)), 6),
+        "evidence_coverage_valid_ref_count": len(valid_refs),
+        "evidence_coverage_available_ref_count": len(available_refs),
+        "evidence_coverage_invalid_ref_count": len(invalid_refs),
+        "evidence_coverage_duplicate_ref_count": duplicate_count,
+    }
+
+
 def product_metrics_for_step(step: dict[str, Any]) -> dict[str, float]:
     evidence_refs = [str(item) for item in step.get("evidence_refs") or []]
     reasoning = str(step.get("reasoning") or "")
-    available_evidence_count = int(step.get("available_evidence_count") or 0)
-    refs_used = len(evidence_refs)
-    evidence_coverage = refs_used / available_evidence_count if available_evidence_count else 0.0
+    coverage = evidence_ref_coverage_diagnostics(step)
     reasoning_auditability = 0.0
     if evidence_refs and reasoning:
         matched = sum(1 for ref in evidence_refs if ref in reasoning)
@@ -1437,7 +1465,11 @@ def product_metrics_for_step(step: dict[str, Any]) -> dict[str, float]:
         1 if step.get("confidence") is not None else 0,
     ]
     return {
-        "evidence_coverage": round(evidence_coverage, 6),
+        "evidence_coverage": coverage["evidence_coverage"],
+        "evidence_coverage_valid_ref_count": coverage["evidence_coverage_valid_ref_count"],
+        "evidence_coverage_available_ref_count": coverage["evidence_coverage_available_ref_count"],
+        "evidence_coverage_invalid_ref_count": coverage["evidence_coverage_invalid_ref_count"],
+        "evidence_coverage_duplicate_ref_count": coverage["evidence_coverage_duplicate_ref_count"],
         "reasoning_auditability": round(reasoning_auditability, 6),
         "error_attribution_quality": round(error_attribution_quality, 6),
         "ledger_completeness": round(present / len(required_fields), 6),
@@ -2612,19 +2644,137 @@ def product_metrics_by_arm(steps: list[dict[str, Any]]) -> dict[str, Any]:
             and step.get("status") == "scored"
             and step.get("scoring_segment") == "scored"
         ]
+        recomputed = [product_metrics_for_step(step) for step in scored]
         metric_names = sorted(
             {
                 str(name)
-                for step in scored
-                for name in (step.get("product_metrics") or {}).keys()
+                for metrics in recomputed
+                for name in metrics.keys()
             }
         )
         output[arm] = {
-            name: mean_float((step.get("product_metrics") or {}).get(name) for step in scored)
+            name: mean_float(metrics.get(name) for metrics in recomputed)
             for name in metric_names
         }
         output[arm]["scored_steps"] = len(scored)
     return output
+
+
+def load_scored_steps_from_run(run_root: Path) -> list[dict[str, Any]]:
+    steps: list[dict[str, Any]] = []
+    for path in sorted(run_root.glob("*/step_*.json")):
+        step = json.loads(path.read_text(encoding="utf-8"))
+        if step.get("status") == "scored":
+            steps.append(step)
+    return steps
+
+
+def feedback_diagnostics(steps: list[dict[str, Any]]) -> dict[str, Any]:
+    full_scored = [
+        step
+        for step in steps
+        if step.get("arm") == "full_gotra"
+        and step.get("status") == "scored"
+        and step.get("scoring_segment") == "scored"
+    ]
+    by_date_layer: dict[str, dict[str, Any]] = {}
+    for step in full_scored:
+        key = f"{step.get('decision_date')}|{step.get('input_layer')}"
+        row = by_date_layer.setdefault(
+            key,
+            {
+                "decision_date": step.get("decision_date"),
+                "input_layer": step.get("input_layer"),
+                "points": 0,
+                "feedback_used_count_min": None,
+                "feedback_used_count_max": None,
+                "feedback_age_days_max_min": None,
+                "feedback_age_days_max_max": None,
+            },
+        )
+        row["points"] += 1
+        update_min_max(row, "feedback_used_count", step.get("feedback_used_count"))
+        update_min_max(row, "feedback_age_days_max", step.get("feedback_age_days_max"))
+    return {
+        "full_gotra_scored_points": len(full_scored),
+        "feedback_available_points": full_gotra_feedback_available_count(steps),
+        "high_quality_feedback_points": full_gotra_high_quality_feedback_count(steps),
+        "by_scored_date_input_layer": list(by_date_layer.values()),
+    }
+
+
+def update_min_max(row: dict[str, Any], field: str, value: Any) -> None:
+    if value is None:
+        return
+    number = int(value)
+    min_key = f"{field}_min"
+    max_key = f"{field}_max"
+    row[min_key] = number if row[min_key] is None else min(row[min_key], number)
+    row[max_key] = number if row[max_key] is None else max(row[max_key], number)
+
+
+def hac_table_rows(stat_tests: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for bucket in ("all", "price_only_packet", "richer_research_packet"):
+        for comparison, item in (stat_tests.get(bucket) or {}).items():
+            hac = item.get("hac") or {}
+            cluster_results = [
+                result
+                for result in (hac.get("cluster_results") or {}).values()
+                if isinstance(result, dict)
+            ]
+            z_values = [
+                float(result["z_score"])
+                for result in cluster_results
+                if isinstance(result.get("z_score"), (int, float))
+                and not isinstance(result.get("z_score"), bool)
+            ]
+            p_values = [
+                float(result["p_value"])
+                for result in cluster_results
+                if isinstance(result.get("p_value"), (int, float))
+                and not isinstance(result.get("p_value"), bool)
+            ]
+            rows.append(
+                {
+                    "bucket": bucket,
+                    "comparison": comparison,
+                    "paired_points": item.get("paired_points"),
+                    "hac_status": (
+                        "completed"
+                        if hac.get("statistical_test_completed")
+                        else str(hac.get("reason") or "insufficient")
+                    ),
+                    "hac_aggregation": hac.get("aggregation"),
+                    "hac_mean_loss_diff": hac.get("mean_loss_diff"),
+                    "hac_n": hac.get("n"),
+                    "hac_n_clusters": hac.get("n_clusters"),
+                    "hac_completed_cluster_count": hac.get("completed_cluster_count"),
+                    "hac_reason": hac.get("reason"),
+                    "hac_cluster_z_min": min(z_values) if z_values else None,
+                    "hac_cluster_z_max": max(z_values) if z_values else None,
+                    "hac_cluster_p_min": min(p_values) if p_values else None,
+                    "hac_cluster_p_max": max(p_values) if p_values else None,
+                    "hac_cluster_p_below_0_05_count": sum(1 for value in p_values if value < 0.05),
+                }
+            )
+    return rows
+
+
+def recompute_run_report(run_root: Path) -> dict[str, Any]:
+    steps = load_scored_steps_from_run(run_root)
+    stat_tests = statistical_tests(steps)
+    return {
+        "schema": "gotra.baseline_v3.recompute_report.v1",
+        "run_root": str(run_root),
+        "scored_step_count": len(steps),
+        "product_metrics": product_metrics_by_arm(steps),
+        "feedback_diagnostics": feedback_diagnostics(steps),
+        "source_kind_counts": source_kind_counts_for_steps(steps),
+        "paired_diffs": paired_diffs(steps),
+        "hac_table": hac_table_rows(stat_tests),
+        "statistical_tests": stat_tests,
+    }
 
 
 def reasoning_chars_by_arm(steps: list[dict[str, Any]]) -> dict[str, Any]:
@@ -3046,7 +3196,22 @@ def default_run_id(mode: Mode) -> str:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=["mock", "provider-canary", "provider-pilot"], required=True)
+    parser.add_argument(
+        "--mode",
+        choices=["mock", "provider-canary", "provider-pilot", "recompute"],
+        required=True,
+    )
+    parser.add_argument(
+        "--from-run",
+        type=Path,
+        default=None,
+        help="Existing run directory for offline --mode recompute; never calls a provider.",
+    )
+    parser.add_argument(
+        "--no-network",
+        action="store_true",
+        help="Required marker for --mode recompute to make the no-provider boundary explicit.",
+    )
     parser.add_argument("--run-id", default="")
     parser.add_argument("--provider", choices=["glm_sophnet", "kimi"], default=DEFAULT_PROVIDER)
     parser.add_argument("--provider-model", default=DEFAULT_GLM_MODEL)
@@ -3177,6 +3342,13 @@ def normalize_sophnet_api_key_env() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    if args.mode == "recompute":
+        if args.from_run is None or not args.no_network:
+            print("--mode recompute requires --from-run and --no-network", file=sys.stderr)
+            return 2
+        report = recompute_run_report(args.from_run)
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
     summary = run_four_arm(config_from_args(args))
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     return (

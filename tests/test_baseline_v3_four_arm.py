@@ -319,7 +319,73 @@ def test_statistics_v3_pairs_by_arm_input_layer_and_segment() -> None:
 
 
 def test_product_metrics_for_constructed_step() -> None:
-    step = {
+    step = _product_metric_step(
+        evidence_refs=["adjusted_close_history", "synthetic_news_context"],
+        available_refs=["adjusted_close_history", "synthetic_news_context"],
+    )
+
+    metrics = v3.product_metrics_for_step(step)
+
+    assert metrics["evidence_coverage"] == 1.0
+    assert metrics["evidence_coverage_valid_ref_count"] == 2
+    assert metrics["evidence_coverage_invalid_ref_count"] == 0
+    assert metrics["evidence_coverage_duplicate_ref_count"] == 0
+    assert metrics["reasoning_auditability"] == 1.0
+    assert metrics["error_attribution_quality"] == 1.0
+    assert metrics["claim_specificity"] == 1.0
+    assert metrics["risk_disclosure_quality"] == 1.0
+
+
+def test_product_metrics_evidence_coverage_deduplicates_refs() -> None:
+    step = _product_metric_step(
+        evidence_refs=[
+            "adjusted_close_history",
+            "synthetic_news_context",
+            "synthetic_news_context",
+        ],
+        available_refs=[
+            "adjusted_close_history",
+            "synthetic_news_context",
+            "synthetic_fundamentals_snapshot",
+        ],
+    )
+
+    metrics = v3.product_metrics_for_step(step)
+
+    assert metrics["evidence_coverage"] == 0.666667
+    assert metrics["evidence_coverage_valid_ref_count"] == 2
+    assert metrics["evidence_coverage_available_ref_count"] == 3
+    assert metrics["evidence_coverage_invalid_ref_count"] == 0
+    assert metrics["evidence_coverage_duplicate_ref_count"] == 1
+
+
+def test_product_metrics_evidence_coverage_rejects_unavailable_refs() -> None:
+    step = _product_metric_step(
+        evidence_refs=[
+            "adjusted_close_history",
+            "return_21d_pct",
+            "future_alpha_leak",
+            "return_21d_pct",
+        ],
+        available_refs=["adjusted_close_history", "synthetic_news_context"],
+    )
+
+    metrics = v3.product_metrics_for_step(step)
+
+    assert metrics["evidence_coverage"] == 0.5
+    assert metrics["evidence_coverage_valid_ref_count"] == 1
+    assert metrics["evidence_coverage_available_ref_count"] == 2
+    assert metrics["evidence_coverage_invalid_ref_count"] == 2
+    assert metrics["evidence_coverage_duplicate_ref_count"] == 1
+    for key, value in metrics.items():
+        if key.endswith("_count"):
+            assert value >= 0
+        else:
+            assert 0.0 <= value <= 1.0
+
+
+def _product_metric_step(*, evidence_refs: list[str], available_refs: list[str]) -> dict[str, object]:
+    return {
         "schema": v3.STEP_SCHEMA,
         "definition_version": v3.DEFINITION_VERSION,
         "run_id": "baseline_v3_four_arm_mock_product",
@@ -334,20 +400,13 @@ def test_product_metrics_for_constructed_step() -> None:
         "expected_change_pct": 2.5,
         "confidence": 0.7,
         "reasoning": "Used adjusted_close_history and synthetic_news_context.",
-        "evidence_refs": ["adjusted_close_history", "synthetic_news_context"],
+        "evidence_refs": evidence_refs,
         "risk_factors": ["fixture risk"],
-        "available_evidence_count": 2,
+        "available_evidence_count": len(available_refs),
+        "decision_inputs": [{"name": ref, "kind": "fixture"} for ref in available_refs],
         "feedback_used_count": 1,
         "alaya_memory_refs": ["feedback:aapl:richer_research_packet:2024-01-02"],
     }
-
-    metrics = v3.product_metrics_for_step(step)
-
-    assert metrics["evidence_coverage"] == 1.0
-    assert metrics["reasoning_auditability"] == 1.0
-    assert metrics["error_attribution_quality"] == 1.0
-    assert metrics["claim_specificity"] == 1.0
-    assert metrics["risk_disclosure_quality"] == 1.0
 
 
 def test_short_counts_as_downside_hit() -> None:
