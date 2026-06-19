@@ -313,7 +313,9 @@ def test_statistics_v3_pairs_by_arm_input_layer_and_segment() -> None:
     assert one_cluster["statistical_test_completed"] is False
     assert one_cluster["right_arm_better_significant"] is False
     assert one_cluster["passed"] is False
-    assert one_cluster["insufficient_reason"] == "not_enough_clusters"
+    assert one_cluster["reason"] == "not_enough_paired_steps"
+    assert one_cluster["insufficient_reason"] == "not_enough_paired_steps"
+    assert one_cluster["n_clusters"] == 1
 
 
 def test_product_metrics_for_constructed_step() -> None:
@@ -816,6 +818,8 @@ def test_mock_run_writes_warm_up_feedback_and_v3_artifacts(tmp_path: Path) -> No
     assert summary["decision_schema"] == v3.DECISION_SCHEMA
     assert summary["metrics"]["direct_llm"]["calibration"]["confidence_count"] == 6
     assert summary["metrics"]["direct_llm"]["calibration"]["brier_score_direction"] is not None
+    assert summary["metrics"]["direct_llm"]["calibration"]["abstain_count"] == 0
+    assert summary["metrics"]["direct_llm"]["calibration"]["calibration_bins"]
     assert "C3_direct_minus_real_research" in summary["statistical_tests"]["richer_research_packet"]
     assert manifest["schema"] == v3.MANIFEST_SCHEMA
     assert manifest["definition_version"] == v3.DEFINITION_VERSION
@@ -831,6 +835,8 @@ def test_mock_run_writes_warm_up_feedback_and_v3_artifacts(tmp_path: Path) -> No
     assert later_price_step["alaya_memory_refs"] == [
         "feedback:aapl:price_only_packet:2024-01-02"
     ]
+    assert "richer_research_packet" not in later_price_step["alaya_memory_refs"][0]
+    assert "price_only_packet" not in later_step["alaya_memory_refs"][0]
     assert later_step["research_artifact_count"] == 2
     assert later_step["synthetic_evidence_count"] == 2
     assert later_step["source_kind_counts"]["synthetic"] == 2
