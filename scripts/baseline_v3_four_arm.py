@@ -12,6 +12,8 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -89,6 +91,13 @@ DEEPSEEK_RATE_LIMITS = v2.DEEPSEEK_RATE_LIMITS
 RUN_ID_PREFIX = "baseline_v3_four_arm_"
 RUN_ID_PREFIX_V3_1 = "baseline_v3_1_"
 RUN_ID_PREFIX_V3_2 = "baseline_v3_2_"
+RUN_ID_PREFIX_V3_4 = "baseline_v3_4_"
+CODEX_CLI_BACKEND = "codex_cli_llm_backend"
+DEFAULT_CODEX_CLI_MODEL = "gpt-5.5"
+DEFAULT_CODEX_CLI_REASONING = "low"
+DETERMINISTIC_REFERENCE_SCHEMA = (
+    "gotra.baseline_v3_4b.deterministic_price_only_reference.v1"
+)
 WINDOW_DAYS = 30
 DEFAULT_TICKERS = v2.V1_PILOT_TICKERS
 DEFAULT_DATES = v2.V1_PILOT_DATES
@@ -145,6 +154,8 @@ class RunConfig:
     resume: bool = False
     research_artifacts_path: Path | None = None
     feedback_artifacts_path: Path | None = None
+    codex_cli_reasoning_setting: str = DEFAULT_CODEX_CLI_REASONING
+    codex_cli_binary: str = "codex"
 
 
 @dataclass(frozen=True)
@@ -198,6 +209,12 @@ class ProviderDecision:
     normalization_applied: bool = False
     normalization_steps: tuple[str, ...] = ()
     normalization_failure_reason: str = ""
+    backend_name: str = ""
+    codex_cli_version: str = ""
+    codex_cli_model: str = ""
+    codex_cli_reasoning_setting: str = ""
+    output_transcript_path: str = ""
+    parsed_decision_hash: str = ""
 
 
 class MockDecisionClient:
@@ -503,6 +520,227 @@ class GlmSophnetDecisionClient(v2.GlmSophnetDecisionClient):
             ) from exc
 
 
+class CodexCliBackendDecisionClient:
+    provider = CODEX_CLI_BACKEND
+    provider_transport = CODEX_CLI_BACKEND
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        reasoning_setting: str,
+        run_root: Path,
+        provider_max_tokens: int,
+        codex_binary: str = "codex",
+        project_root: Path | None = None,
+        completion_client: Any | None = None,
+        codex_cli_version_text: str | None = None,
+    ) -> None:
+        self.provider_model = model or DEFAULT_CODEX_CLI_MODEL
+        self.provider_base_url = "local://codex-cli"
+        self.provider_max_tokens = max(1, int(provider_max_tokens))
+        self.codex_cli_reasoning_setting = reasoning_setting or DEFAULT_CODEX_CLI_REASONING
+        self.codex_cli_binary = codex_binary
+        self.project_root = project_root or Path.cwd()
+        self.run_root = run_root
+        self.completion_client = completion_client
+        self.codex_cli_version = codex_cli_version_text or codex_cli_version(codex_binary)
+        self.provider_max_tokens_applied = True
+        self.provider_max_tokens_reason = "prompt guidance passed to Codex CLI backend"
+        self.provider_temperature_applied = False
+        self.provider_temperature_reason = "Codex CLI backend has prompt guidance only"
+        self.last_raw_content = ""
+
+    def complete(
+        self,
+        payload: dict[str, Any],
+        *,
+        request_timeout_seconds: float | None = None,
+    ) -> ProviderDecision:
+        prompt = render_provider_prompt(payload)
+        transcript_path = codex_cli_transcript_path(self.run_root, payload)
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        timeout_seconds = int(request_timeout_seconds or 900)
+        if self.completion_client is not None:
+            raw_content = str(
+                self.completion_client.complete(
+                    system_prompt=SYSTEM_PROMPT,
+                    user_prompt=prompt,
+                    max_tokens=self.provider_max_tokens,
+                    timeout_seconds=timeout_seconds,
+                    temperature=0.0,
+                )
+            )
+            transcript_path.write_text(
+                redact_sensitive_text(raw_content),
+                encoding="utf-8",
+            )
+        else:
+            raw_content = self._complete_with_codex_cli(
+                prompt=prompt,
+                transcript_path=transcript_path,
+                timeout_seconds=timeout_seconds,
+            )
+        self.last_raw_content = raw_content
+        try:
+            decision = _parse_raw_provider_content(
+                raw_content=raw_content,
+                attempts=1,
+                retry_count=0,
+            )
+        except ProviderRequestError as exc:
+            exc.output_transcript_path = str(transcript_path)
+            exc.codex_cli_version = self.codex_cli_version
+            exc.codex_cli_model = self.provider_model
+            exc.codex_cli_reasoning_setting = self.codex_cli_reasoning_setting
+            raise
+        parsed_hash = stable_json_hash(decision_to_cache_payload(decision))
+        return replace(
+            decision,
+            backend_name=CODEX_CLI_BACKEND,
+            codex_cli_version=self.codex_cli_version,
+            codex_cli_model=self.provider_model,
+            codex_cli_reasoning_setting=self.codex_cli_reasoning_setting,
+            output_transcript_path=str(transcript_path),
+            parsed_decision_hash=parsed_hash,
+        )
+
+    def _complete_with_codex_cli(
+        self,
+        *,
+        prompt: str,
+        transcript_path: Path,
+        timeout_seconds: int,
+    ) -> str:
+        if not shutil.which(self.codex_cli_binary):
+            raise ProviderRequestError(
+                "codex CLI is not installed or not on PATH",
+                provider_error_class="CodexCliBackendBlocked",
+            )
+        provider_prompt = build_codex_cli_backend_prompt(
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt=prompt,
+            max_tokens=self.provider_max_tokens,
+        )
+        command = [
+            self.codex_cli_binary,
+            "--ask-for-approval",
+            "never",
+            "exec",
+            "--ignore-user-config",
+            "-c",
+            f'model_reasoning_effort="{self.codex_cli_reasoning_setting}"',
+            "--cd",
+            str(self.project_root),
+            "--sandbox",
+            "read-only",
+            "--output-last-message",
+            str(transcript_path),
+        ]
+        if self.provider_model:
+            command.extend(["--model", self.provider_model])
+        command.append(provider_prompt)
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+                cwd=self.project_root,
+                env=os.environ.copy(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ProviderRequestError(
+                "Codex CLI backend timed out",
+                provider_error_class="TimeoutException",
+            ) from exc
+        except FileNotFoundError as exc:
+            raise ProviderRequestError(
+                "codex CLI is not installed or not on PATH",
+                provider_error_class="CodexCliBackendBlocked",
+            ) from exc
+        if completed.returncode != 0:
+            detail = redact_error((completed.stderr or completed.stdout or "").strip())
+            raise ProviderRequestError(
+                "Codex CLI backend failed"
+                + (f": {detail[:500]}" if detail else ""),
+                provider_error_class="CodexCliBackendBlocked",
+            )
+        raw_content = ""
+        if transcript_path.exists():
+            raw_content = transcript_path.read_text(encoding="utf-8").strip()
+        if not raw_content:
+            raw_content = (completed.stdout or "").strip()
+            if raw_content:
+                transcript_path.write_text(
+                    redact_sensitive_text(raw_content),
+                    encoding="utf-8",
+                )
+        if not transcript_path.exists() or not raw_content:
+            raise ProviderRequestError(
+                "Codex CLI backend did not capture an output transcript",
+                provider_error_class="CodexCliBackendBlocked",
+            )
+        return raw_content
+
+
+def build_codex_cli_backend_prompt(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+) -> str:
+    return f"""You are Codex CLI acting as the {CODEX_CLI_BACKEND} decision backend for GOTRA v3.4.
+
+Hard constraints:
+- Do not modify files, run commands, call web search, call APIs, or inspect secrets.
+- Use only the supplied prompt context. Do not add external market data.
+- Return exactly one strict JSON object matching the requested decision schema.
+- Do not wrap JSON in Markdown fences and do not add prose before or after it.
+- Keep the response within roughly {max_tokens} tokens.
+
+<system_prompt>
+{system_prompt}
+</system_prompt>
+
+<user_prompt>
+{user_prompt}
+</user_prompt>
+"""
+
+
+def codex_cli_transcript_path(run_root: Path, payload: dict[str, Any]) -> Path:
+    arm = normalize_arm(payload.get("arm"))
+    input_layer = normalize_input_layer(payload.get("input_layer"))
+    decision_date = str(payload.get("decision_date"))
+    ticker = ticker_slug(str(payload.get("ticker")))
+    return (
+        run_root
+        / "codex_cli_transcripts"
+        / arm
+        / f"transcript_{decision_date}_{ticker}_{input_layer}.txt"
+    )
+
+
+def codex_cli_version(codex_binary: str = "codex") -> str:
+    if not shutil.which(codex_binary):
+        return ""
+    try:
+        completed = subprocess.run(
+            [codex_binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:  # noqa: BLE001 - preflight reports a backend blocker.
+        return ""
+    if completed.returncode != 0:
+        return ""
+    return (completed.stdout or completed.stderr or "").strip().splitlines()[0]
+
+
 def _parse_raw_provider_content(
     *,
     raw_content: str,
@@ -728,6 +966,11 @@ def cache_key_for(
             prompt_hash,
         ]
     )
+
+
+def stable_json_hash(value: dict[str, Any]) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def kimi_provider_temperature(_model: str) -> float:
@@ -1550,6 +1793,276 @@ def direction_hit_for(*, predicted_direction: str, actual_change_pct: float) -> 
     return predicted_direction == actual
 
 
+def deterministic_price_only_baseline_decision(
+    *,
+    ticker: str,
+    decision_date: date,
+    price_rows: pd.DataFrame,
+) -> dict[str, Any]:
+    dated = price_rows.copy()
+    dated["_gotra_decision_visible_date"] = pd.to_datetime(dated["date"]).dt.date
+    visible = dated[dated["_gotra_decision_visible_date"] <= decision_date].drop(
+        columns=["_gotra_decision_visible_date"]
+    )
+    future_rows_excluded = int(len(dated) - len(visible))
+    if visible.empty:
+        raise ValueError("deterministic price-only baseline has no pre-decision price rows")
+    features = price_features(visible)
+    expected = round(
+        max(
+            min(
+                0.35 * features["return_21d_pct"] + 0.25 * features["return_63d_pct"],
+                25.0,
+            ),
+            -25.0,
+        ),
+        4,
+    )
+    direction = "long" if expected >= 2.0 else "avoid" if expected <= -2.0 else "neutral"
+    confidence = round(min(0.8, 0.45 + abs(expected) / 70), 4)
+    latest = visible.iloc[-1]
+    return {
+        "schema": "gotra.baseline_v3_4.deterministic_price_only_baseline.v1",
+        "baseline": "deterministic_price_only_baseline",
+        "ticker": ticker,
+        "decision_date": decision_date.isoformat(),
+        "input_cutoff": decision_date.isoformat(),
+        "latest_visible_price_date": str(latest["date"]),
+        "visible_price_rows": int(len(visible)),
+        "future_rows_excluded": future_rows_excluded,
+        "direction": direction,
+        "expected_change_pct": expected,
+        "confidence": confidence,
+        "future_data_allowed": False,
+        "llm_used": False,
+    }
+
+
+def deterministic_price_only_reference_for_run(
+    *,
+    config: RunConfig,
+    run_root: Path,
+) -> dict[str, Any]:
+    reference_dir = run_root / "deterministic_price_only_baseline"
+    reference_dir.mkdir(parents=True, exist_ok=True)
+    records: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, int]] = set()
+    raw_mirrored_count = 0
+    for decision_date in config.dates:
+        if scoring_segment_for(config, decision_date) != "scored":
+            continue
+        for ticker in config.tickers:
+            key = (ticker, decision_date.isoformat(), WINDOW_DAYS)
+            if key in seen:
+                continue
+            seen.add(key)
+            raw_mirrored_count += len(config.input_layers)
+            point = DecisionPoint(ticker, decision_date, "price_only_packet")
+            try:
+                context = price_context_for(point, price_dir=config.price_dir)
+                full_price_rows = read_price_cache(ticker, price_dir=config.price_dir)
+                record = deterministic_price_only_reference_record(
+                    run_id=config.run_id,
+                    ticker=ticker,
+                    decision_date=decision_date,
+                    context=context,
+                    full_price_rows=full_price_rows,
+                    input_layers=config.input_layers,
+                )
+                records.append(record)
+                path = reference_dir / (
+                    f"reference_{decision_date.isoformat()}_{ticker_slug(ticker)}.json"
+                )
+                path.write_text(
+                    json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+            except Exception as exc:  # noqa: BLE001 - local price cache can be incomplete.
+                errors.append(
+                    {
+                        "ticker": ticker,
+                        "decision_date": decision_date.isoformat(),
+                        "error_type": exc.__class__.__name__,
+                        "error_message": redact_error(str(exc)),
+                    }
+                )
+    scored = [record for record in records if record.get("status") == "scored"]
+    future_violations = [
+        record for record in scored if record.get("future_data_violation")
+    ]
+    if errors or future_violations:
+        status = "REFERENCE_NEEDS_FIX"
+    elif scored:
+        status = "REFERENCE_READY"
+    else:
+        status = "REFERENCE_DATA_INSUFFICIENT"
+    latest_dates = [
+        str(record.get("latest_visible_price_date"))
+        for record in scored
+        if record.get("latest_visible_price_date")
+    ]
+    return {
+        "schema": DETERMINISTIC_REFERENCE_SCHEMA,
+        "status": status,
+        "artifact_dir": str(reference_dir),
+        "count": len(scored),
+        "unique_scored_point_count": len(scored),
+        "raw_mirrored_count": raw_mirrored_count,
+        "input_layer_count": len(config.input_layers),
+        "metrics": deterministic_price_only_reference_metrics(scored),
+        "future_data_violations": len(future_violations),
+        "latest_visible_price_date_max": max(latest_dates) if latest_dates else "",
+        "error_count": len(errors),
+        "errors": errors[:10],
+        "llm_used": False,
+        "provider_or_backend_called": False,
+        "clean_historical_reference_status": (
+            "PRESENT_DETERMINISTIC_PRICE_ONLY_BASELINE"
+            if status == "REFERENCE_READY"
+            else "MISSING_OR_BLOCKED_DETERMINISTIC_PRICE_ONLY_BASELINE"
+        ),
+    }
+
+
+def deterministic_price_only_reference_record(
+    *,
+    run_id: str,
+    ticker: str,
+    decision_date: date,
+    context: PriceContext,
+    full_price_rows: pd.DataFrame,
+    input_layers: tuple[InputLayer, ...],
+) -> dict[str, Any]:
+    decision = deterministic_price_only_baseline_decision(
+        ticker=ticker,
+        decision_date=decision_date,
+        price_rows=full_price_rows,
+    )
+    actual = change_pct(float(context.start_row["adj_close"]), float(context.end_row["adj_close"]))
+    error = round(actual - float(decision["expected_change_pct"]), 6)
+    latest_visible_date = parse_date(str(decision["latest_visible_price_date"]))
+    future_data_violation = latest_visible_date > decision_date
+    direction_hit = direction_hit_for(
+        predicted_direction=str(decision["direction"]),
+        actual_change_pct=actual,
+    )
+    return {
+        "schema": DETERMINISTIC_REFERENCE_SCHEMA,
+        "run_id": run_id,
+        "status": "scored",
+        "baseline": "deterministic_price_only_baseline",
+        "reference_key": f"{ticker}|{decision_date.isoformat()}|{WINDOW_DAYS}",
+        "ticker": ticker,
+        "decision_date": decision_date.isoformat(),
+        "horizon_days": WINDOW_DAYS,
+        "window_end_date": context.outcome_date.isoformat(),
+        "outcome_as_of": str(context.end_row["date"]),
+        "input_layers_represented": list(input_layers),
+        "input_layer_mirrored_equivalent_count": len(input_layers),
+        "direction": decision["direction"],
+        "expected_change_pct": decision["expected_change_pct"],
+        "confidence": decision["confidence"],
+        "input_cutoff": decision["input_cutoff"],
+        "latest_visible_price_date": decision["latest_visible_price_date"],
+        "visible_price_rows": decision["visible_price_rows"],
+        "future_rows_excluded": decision["future_rows_excluded"],
+        "future_data_allowed": False,
+        "future_data_violation": future_data_violation,
+        "llm_used": False,
+        "provider_or_backend_called": False,
+        "actual_change_pct": actual,
+        "actual_direction": actual_direction(actual),
+        "direction_hit": direction_hit,
+        "error": error,
+        "mse": round(error * error, 6),
+        "mae": round(abs(error), 6),
+        "policy_a_return_pct": actual if decision["direction"] == "long" else 0.0,
+        "abstain_reason": "",
+        "decision_inputs": decision_inputs(
+            context.price_rows,
+            research_artifacts=[],
+            feedback=[],
+        ),
+        "outcome_inputs": outcome_inputs(context.end_row),
+    }
+
+
+def deterministic_price_only_reference_metrics(
+    records: list[dict[str, Any]]
+) -> dict[str, Any]:
+    if not records:
+        return {
+            "scored_steps": 0,
+            "direction_hit_rate": None,
+            "mse": None,
+            "mae": None,
+            "policy_a_cumulative_return_pct": None,
+            "calibration": calibration_and_abstain_metrics([]),
+        }
+    direction_hits = [1 if record.get("direction_hit") else 0 for record in records]
+    return {
+        "scored_steps": len(records),
+        "direction_hit_rate": sum(direction_hits) / len(direction_hits),
+        "mse": mean_float(record["mse"] for record in records),
+        "mae": mean_float(record["mae"] for record in records),
+        "policy_a_cumulative_return_pct": policy_a_cumulative_return(records),
+        "calibration": calibration_and_abstain_metrics(records),
+    }
+
+
+def deterministic_price_only_reference_empty() -> dict[str, Any]:
+    return {
+        "schema": DETERMINISTIC_REFERENCE_SCHEMA,
+        "status": "REFERENCE_NOT_COMPUTED",
+        "artifact_dir": "",
+        "count": 0,
+        "unique_scored_point_count": 0,
+        "raw_mirrored_count": 0,
+        "input_layer_count": 0,
+        "metrics": deterministic_price_only_reference_metrics([]),
+        "future_data_violations": 0,
+        "latest_visible_price_date_max": "",
+        "error_count": 0,
+        "errors": [],
+        "llm_used": False,
+        "provider_or_backend_called": False,
+        "clean_historical_reference_status": "MISSING_OR_BLOCKED_DETERMINISTIC_PRICE_ONLY_BASELINE",
+    }
+
+
+def deterministic_reference_summary_fields(reference: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "deterministic_price_only_baseline_status": reference["status"],
+        "deterministic_price_only_baseline_count": reference["count"],
+        "deterministic_price_only_baseline_unique_scored_point_count": reference[
+            "unique_scored_point_count"
+        ],
+        "deterministic_price_only_baseline_raw_mirrored_count": reference[
+            "raw_mirrored_count"
+        ],
+        "deterministic_price_only_baseline_input_layer_count": reference[
+            "input_layer_count"
+        ],
+        "deterministic_price_only_baseline_metrics": reference["metrics"],
+        "deterministic_price_only_baseline_future_data_violations": reference[
+            "future_data_violations"
+        ],
+        "deterministic_price_only_baseline_latest_visible_price_date_max": reference[
+            "latest_visible_price_date_max"
+        ],
+        "deterministic_price_only_baseline_artifact_dir": reference["artifact_dir"],
+        "deterministic_price_only_baseline_error_count": reference["error_count"],
+        "deterministic_price_only_baseline_errors": reference["errors"],
+        "deterministic_price_only_baseline_llm_used": reference["llm_used"],
+        "deterministic_price_only_baseline_provider_or_backend_called": reference[
+            "provider_or_backend_called"
+        ],
+        "clean_historical_reference_status": reference["clean_historical_reference_status"],
+        "deterministic_price_only_baseline": reference,
+    }
+
+
 def scoring_segment_for(config: RunConfig, decision_date: date) -> ScoringSegment:
     ordered_dates = sorted(config.dates)
     warm_up_dates = set(ordered_dates[: max(0, config.warm_up_dates)])
@@ -1692,6 +2205,7 @@ def build_error_step(
         "research_source_leak",
         "feedback_source_leak",
         "auth_missing",
+        "codex_cli_backend_blocked",
     }
     step: dict[str, Any] = {
         "schema": STEP_SCHEMA,
@@ -1766,6 +2280,8 @@ def build_error_step(
 
 
 def classify_exception(exc: Exception) -> str:
+    if str(getattr(exc, "provider_error_class", "") or "") == "CodexCliBackendBlocked":
+        return "codex_cli_backend_blocked"
     return v2.classify_exception(exc)
 
 
@@ -2144,6 +2660,11 @@ def provider_max_tokens_metadata(config: RunConfig) -> dict[str, Any]:
             "provider_max_tokens_applied": False,
             "provider_max_tokens_reason": "local mock does not call provider token API",
         }
+    if config.provider == CODEX_CLI_BACKEND:
+        return {
+            "provider_max_tokens_applied": True,
+            "provider_max_tokens_reason": "prompt guidance passed to Codex CLI backend",
+        }
     if config.provider in {"glm_sophnet", "kimi"}:
         return {
             "provider_max_tokens_applied": True,
@@ -2157,6 +2678,12 @@ def provider_max_tokens_metadata(config: RunConfig) -> dict[str, Any]:
 
 def provider_temperature_metadata(config: RunConfig) -> dict[str, Any]:
     temperature = provider_temperature_for(config.provider, config.provider_model)
+    if config.provider == CODEX_CLI_BACKEND:
+        return {
+            "provider_temperature": None,
+            "provider_temperature_applied": False,
+            "provider_temperature_reason": "Codex CLI backend has prompt guidance only",
+        }
     if temperature is None:
         return {
             "provider_temperature": None,
@@ -2176,6 +2703,22 @@ def provider_temperature_metadata(config: RunConfig) -> dict[str, Any]:
     }
 
 
+def codex_cli_backend_metadata(config: RunConfig) -> dict[str, Any]:
+    if config.provider != CODEX_CLI_BACKEND:
+        return {
+            "backend_name": "",
+            "codex_cli_version": "",
+            "codex_cli_model": "",
+            "codex_cli_reasoning_setting": "",
+        }
+    return {
+        "backend_name": CODEX_CLI_BACKEND,
+        "codex_cli_version": codex_cli_version(config.codex_cli_binary),
+        "codex_cli_model": config.provider_model,
+        "codex_cli_reasoning_setting": config.codex_cli_reasoning_setting,
+    }
+
+
 def default_request_diagnostics(
     *,
     timeout_seconds: float,
@@ -2191,6 +2734,12 @@ def default_request_diagnostics(
     diagnostics["provider_temperature"] = None
     diagnostics["provider_temperature_applied"] = False
     diagnostics["provider_temperature_reason"] = ""
+    diagnostics["backend_name"] = ""
+    diagnostics["codex_cli_version"] = ""
+    diagnostics["codex_cli_model"] = ""
+    diagnostics["codex_cli_reasoning_setting"] = ""
+    diagnostics["output_transcript_path"] = ""
+    diagnostics["parsed_decision_hash"] = ""
     return diagnostics
 
 
@@ -2210,6 +2759,7 @@ def prompt_request_diagnostics(*, prompt: str, config: RunConfig, arm: Arm) -> d
     diagnostics["provider_max_tokens"] = config.provider_max_tokens
     diagnostics.update(provider_max_tokens_metadata(config))
     diagnostics.update(provider_temperature_metadata(config))
+    diagnostics.update(codex_cli_backend_metadata(config))
     return diagnostics
 
 
@@ -2227,6 +2777,17 @@ def diagnostics_from_exception(
     last_retryable_error_type = str(getattr(exc, "last_retryable_error_type", "") or "")
     if last_retryable_error_type:
         updated["last_retryable_error_type"] = last_retryable_error_type
+    for field in (
+        "output_transcript_path",
+        "codex_cli_version",
+        "codex_cli_model",
+        "codex_cli_reasoning_setting",
+    ):
+        value = str(getattr(exc, field, "") or "")
+        if value:
+            updated[field] = value
+            if field != "output_transcript_path":
+                updated["backend_name"] = CODEX_CLI_BACKEND
     return updated
 
 
@@ -2264,7 +2825,7 @@ def complete_step(
     config: RunConfig,
     run_root: Path,
     cache: LocalJsonCache,
-    client: MockDecisionClient | KimiDecisionClient | GlmSophnetDecisionClient,
+    client: MockDecisionClient | KimiDecisionClient | GlmSophnetDecisionClient | CodexCliBackendDecisionClient,
     point: DecisionPoint,
     arm: Arm,
     feedback: list[dict[str, Any]],
@@ -2319,6 +2880,8 @@ def complete_step(
             decision = parse_provider_decision(cached)
             validate_provider_decision_identity(decision, point=point, arm=arm)
             validate_alaya_memory_refs(decision, arm=arm, feedback=feedback)
+            if config.provider == CODEX_CLI_BACKEND:
+                diagnostics["parsed_decision_hash"] = stable_json_hash(cached)
             cache_hit = True
         else:
             started_at = time.monotonic()
@@ -2350,6 +2913,12 @@ def complete_step(
             diagnostics["normalization_applied"] = decision.normalization_applied
             diagnostics["normalization_steps"] = list(decision.normalization_steps)
             diagnostics["normalization_failure_reason"] = decision.normalization_failure_reason
+            diagnostics["backend_name"] = decision.backend_name
+            diagnostics["codex_cli_version"] = decision.codex_cli_version
+            diagnostics["codex_cli_model"] = decision.codex_cli_model
+            diagnostics["codex_cli_reasoning_setting"] = decision.codex_cli_reasoning_setting
+            diagnostics["output_transcript_path"] = decision.output_transcript_path
+            diagnostics["parsed_decision_hash"] = decision.parsed_decision_hash
             cache.set(cache_key, decision_to_cache_payload(decision))
             cache_hit = False
         step = build_scored_step(
@@ -2532,12 +3101,21 @@ def run_four_arm(config: RunConfig) -> dict[str, Any]:
     if not (run_root / "manifest.json").exists():
         write_manifest(run_root, config)
     cache = LocalJsonCache(run_root / "cache.json")
-    client: MockDecisionClient | KimiDecisionClient | GlmSophnetDecisionClient
+    client: MockDecisionClient | KimiDecisionClient | GlmSophnetDecisionClient | CodexCliBackendDecisionClient
     if config.mode == "mock":
         client = MockDecisionClient(
             provider=config.provider,
             provider_model=config.provider_model,
             provider_base_url=config.provider_base_url,
+        )
+    elif config.provider == CODEX_CLI_BACKEND:
+        client = CodexCliBackendDecisionClient(
+            model=config.provider_model,
+            reasoning_setting=config.codex_cli_reasoning_setting,
+            run_root=run_root,
+            provider_max_tokens=config.provider_max_tokens,
+            codex_binary=config.codex_cli_binary,
+            project_root=Path.cwd(),
         )
     elif config.provider == "glm_sophnet":
         client = GlmSophnetDecisionClient(
@@ -2576,6 +3154,16 @@ def run_four_arm(config: RunConfig) -> dict[str, Any]:
     circuit_breaker = CircuitBreakerState()
 
     if provider_preflight_error:
+        preflight_error_type = (
+            "codex_cli_backend_blocked"
+            if provider_preflight_error.startswith("CODEX_CLI_BACKEND_BLOCKED")
+            else "auth_missing"
+        )
+        preflight_transport = (
+            CODEX_CLI_BACKEND
+            if config.provider == CODEX_CLI_BACKEND
+            else "sophnet_chat_completions"
+        )
         for point in points:
             for arm in ARMS:
                 context = try_price_context(point, price_dir=config.price_dir)
@@ -2587,15 +3175,20 @@ def run_four_arm(config: RunConfig) -> dict[str, Any]:
                     provider=config.provider,
                     provider_model=config.provider_model,
                     provider_base_url=config.provider_base_url,
-                    provider_transport="sophnet_chat_completions",
-                    error_type="auth_missing",
+                    provider_transport=preflight_transport,
+                    error_type=preflight_error_type,
                     error_message=provider_preflight_error,
                     scoring_segment=scoring_segment,
                     context=context,
-                    diagnostics=default_request_diagnostics(
-                        timeout_seconds=arm_base_timeout_seconds(config, arm),
-                        timeout_policy=request_timeout_policy(config, arm=arm, prompt_bytes=0),
-                    ),
+                    diagnostics={
+                        **default_request_diagnostics(
+                            timeout_seconds=arm_base_timeout_seconds(config, arm),
+                            timeout_policy=request_timeout_policy(config, arm=arm, prompt_bytes=0),
+                        ),
+                        **provider_max_tokens_metadata(config),
+                        **provider_temperature_metadata(config),
+                        **codex_cli_backend_metadata(config),
+                    },
                 )
                 write_step(run_root, step)
                 append_ledger(run_root, step)
@@ -2633,6 +3226,10 @@ def run_four_arm(config: RunConfig) -> dict[str, Any]:
             if should_increase_concurrency(config=config, wave_steps=wave_steps):
                 concurrency_used = min(config.max_provider_concurrency, concurrency_used + 1)
 
+    deterministic_reference = deterministic_price_only_reference_for_run(
+        config=config,
+        run_root=run_root,
+    )
     summary = summarize_run(
         config=config,
         steps=steps,
@@ -2642,6 +3239,7 @@ def run_four_arm(config: RunConfig) -> dict[str, Any]:
         max_provider_concurrency_used=concurrency_used,
         downgrade_events=downgrade_events,
         circuit_breaker=circuit_breaker,
+        deterministic_reference=deterministic_reference,
     )
     (run_root / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True),
@@ -2655,7 +3253,7 @@ def run_date_wave(
     config: RunConfig,
     run_root: Path,
     cache: LocalJsonCache,
-    client: MockDecisionClient | KimiDecisionClient | GlmSophnetDecisionClient,
+    client: MockDecisionClient | KimiDecisionClient | GlmSophnetDecisionClient | CodexCliBackendDecisionClient,
     points: list[DecisionPoint],
     feedback_by_key: dict[tuple[str, InputLayer], list[dict[str, Any]]],
     concurrency: int,
@@ -2876,6 +3474,12 @@ def try_price_context(point: DecisionPoint, *, price_dir: Path) -> PriceContext 
 def provider_preflight_blocker(config: RunConfig) -> str:
     if config.mode == "mock":
         return ""
+    if config.provider == CODEX_CLI_BACKEND:
+        if not shutil.which(config.codex_cli_binary):
+            return "CODEX_CLI_BACKEND_BLOCKED: codex_cli_executable_missing"
+        if not codex_cli_version(config.codex_cli_binary):
+            return "CODEX_CLI_BACKEND_BLOCKED: codex_cli_version_unavailable"
+        return ""
     if config.provider not in {"glm_sophnet", "kimi"}:
         return f"unsupported provider: {config.provider}"
     if config.provider == "glm_sophnet" and not v2.sophnet_api_key():
@@ -2970,8 +3574,10 @@ def summarize_run(
     max_provider_concurrency_used: int,
     downgrade_events: list[dict[str, Any]],
     circuit_breaker: CircuitBreakerState | None = None,
+    deterministic_reference: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     circuit_breaker = circuit_breaker or CircuitBreakerState()
+    deterministic_reference = deterministic_reference or deterministic_price_only_reference_empty()
     provider_errors = sum(1 for step in steps if step.get("status") == "provider_error")
     schema_pass = sum(1 for step in steps if step.get("status") == "scored")
     timeout_count = count_error_type(steps, "provider_timeout")
@@ -2998,6 +3604,7 @@ def summarize_run(
         if step.get("error_type") == "feedback_source_leak" or step.get("feedback_source_leak")
     )
     auth_missing_count = count_error_type(steps, "auth_missing")
+    codex_cli_backend_blocked_count = count_error_type(steps, "codex_cli_backend_blocked")
     provider_http_error_count = count_error_type(steps, "provider_http_error")
     price_missing_count = count_error_type(steps, "price_missing")
     retryable_provider_error_recovered_count = sum(
@@ -3061,6 +3668,8 @@ def summarize_run(
     elif config.mode == "provider-canary":
         if provider_preflight_error.startswith("PROVIDER_BLOCKED_PRE_HTTP"):
             status = "PROVIDER_BLOCKED_PRE_HTTP"
+        elif provider_preflight_error.startswith("CODEX_CLI_BACKEND_BLOCKED"):
+            status = "CODEX_CLI_BACKEND_BLOCKED"
         else:
             canary_passed = (
                 provider_errors == 0
@@ -3073,7 +3682,11 @@ def summarize_run(
             )
             status = "PROVIDER_CANARY_PASS" if canary_passed else "PROVIDER_CANARY_FAIL"
     else:
-        if circuit_breaker.triggered:
+        if provider_preflight_error.startswith("CODEX_CLI_BACKEND_BLOCKED"):
+            status = "CODEX_CLI_BACKEND_BLOCKED"
+        elif provider_preflight_error.startswith("PROVIDER_BLOCKED_PRE_HTTP"):
+            status = "PROVIDER_BLOCKED_PRE_HTTP"
+        elif circuit_breaker.triggered:
             status = "STOPPED_BY_CIRCUIT_BREAKER"
         else:
             status = (
@@ -3090,6 +3703,7 @@ def summarize_run(
     provider_limits = provider_limit_metadata(config)
     provider_tokens = provider_max_tokens_metadata(config)
     provider_temperature = provider_temperature_metadata(config)
+    codex_backend = codex_cli_backend_metadata(config)
     paired_diff_summary = paired_diffs(steps)
     statistical_test_summary = statistical_tests(steps)
     return {
@@ -3104,13 +3718,15 @@ def summarize_run(
         "target_provider": config.provider,
         "target_provider_model": config.provider_model,
         "provider_model": config.provider_model,
-        "provider_execution_mode": "local_mock" if config.mode == "mock" else "provider_http",
+        "provider_execution_mode": provider_execution_mode(config),
         "provider_base_url": config.provider_base_url,
         "provider_max_tokens": config.provider_max_tokens,
         **provider_tokens,
         **provider_temperature,
+        **codex_backend,
         "provider_call_status": provider_call_status(
             mode=config.mode,
+            provider=config.provider,
             provider_preflight_error=provider_preflight_error,
         ),
         "provider_limits": provider_limits,
@@ -3119,6 +3735,8 @@ def summarize_run(
         "provider_preflight_error": provider_preflight_error,
         "stop_reason": stop_reason,
         "arms": list(ARMS),
+        "arm_interpretation": arm_interpretation_summary(),
+        **deterministic_reference_summary_fields(deterministic_reference),
         "input_layers": list(config.input_layers),
         "warm_up_dates": config.warm_up_dates,
         "repeat_run_index": config.repeat_run_index,
@@ -3163,6 +3781,7 @@ def summarize_run(
         "input_echo_error_count": input_echo_errors,
         "future_data_violation_count": future_violations,
         "auth_missing_count": auth_missing_count,
+        "codex_cli_backend_blocked_count": codex_cli_backend_blocked_count,
         "provider_http_error_count": provider_http_error_count,
         "retryable_provider_error_recovered_count": retryable_provider_error_recovered_count,
         "unrecovered_provider_timeout_count": timeout_count,
@@ -3171,6 +3790,12 @@ def summarize_run(
         "normalization_counts": normalization_counts(steps),
         "raw_content_saved_count": sum(
             1 for step in steps if step.get("provider_raw_content_path")
+        ),
+        "codex_cli_transcript_path_count": sum(
+            1 for step in steps if step.get("output_transcript_path")
+        ),
+        "parsed_decision_hash_count": sum(
+            1 for step in steps if step.get("parsed_decision_hash")
         ),
         "full_gotra_scored_points": full_gotra_scored_count(steps),
         "full_gotra_feedback_available_scored_points": full_gotra_feedback_available_count(steps),
@@ -3209,9 +3834,23 @@ def total_scored_points(config: RunConfig) -> int:
     return len(config.tickers) * scored_dates * len(config.input_layers)
 
 
-def provider_call_status(*, mode: Mode, provider_preflight_error: str) -> str:
+def provider_execution_mode(config: RunConfig) -> str:
+    if config.mode == "mock":
+        return "local_mock"
+    if config.provider == CODEX_CLI_BACKEND:
+        return CODEX_CLI_BACKEND
+    return "provider_http"
+
+
+def provider_call_status(*, mode: Mode, provider: str, provider_preflight_error: str) -> str:
     if mode == "mock" or provider_preflight_error.startswith("PROVIDER_BLOCKED_PRE_HTTP"):
         return "no real provider HTTP call"
+    if provider_preflight_error.startswith("CODEX_CLI_BACKEND_BLOCKED"):
+        return "no Codex CLI backend call"
+    if provider == CODEX_CLI_BACKEND:
+        if mode == "provider-pilot":
+            return "Codex CLI backend pilot attempted"
+        return "Codex CLI backend canary attempted"
     if mode == "provider-pilot":
         return "provider HTTP pilot attempted"
     return "provider HTTP canary attempted"
@@ -3238,6 +3877,18 @@ def evidence_layer_summary() -> dict[str, str]:
         "provider_runtime_health": "not entered unless provider-canary/provider-pilot is run",
         "formal_lite_acceptance": "not entered by this implementation goal",
         "science_public_claim": "not entered",
+    }
+
+
+def arm_interpretation_summary() -> dict[str, str]:
+    return {
+        "direct_llm": (
+            "direct_llm_parametric_memory_control; not a clean historical no-future baseline"
+        ),
+        "ksana_formatting_only": "formatting/scaffold control arm",
+        "ksana_real_research": "time-bounded research packet arm when evidence is available",
+        "full_gotra": "research plus eligible Alaya feedback arm",
+        "clean_historical_reference": "deterministic_price_only_baseline or future-only/forward-live evidence",
     }
 
 
@@ -3364,6 +4015,12 @@ def request_diagnostics_by_arm(steps: list[dict[str, Any]]) -> dict[str, Any]:
             "input_echo_error_count": count_error_type(arm_steps, "input_echo_error"),
             "raw_content_saved_count": sum(
                 1 for step in arm_steps if step.get("provider_raw_content_path")
+            ),
+            "codex_cli_transcript_path_count": sum(
+                1 for step in arm_steps if step.get("output_transcript_path")
+            ),
+            "parsed_decision_hash_count": sum(
+                1 for step in arm_steps if step.get("parsed_decision_hash")
             ),
         }
     return output
@@ -3827,6 +4484,8 @@ def blocked_run_id_exists_summary(*, config: RunConfig, run_root: Path) -> dict[
     provider_limits = provider_limit_metadata(config)
     provider_tokens = provider_max_tokens_metadata(config)
     provider_temperature = provider_temperature_metadata(config)
+    codex_backend = codex_cli_backend_metadata(config)
+    deterministic_reference = deterministic_price_only_reference_empty()
     return {
         "schema": SUMMARY_SCHEMA,
         "definition_version": DEFINITION_VERSION,
@@ -3841,6 +4500,7 @@ def blocked_run_id_exists_summary(*, config: RunConfig, run_root: Path) -> dict[
         "provider_max_tokens": config.provider_max_tokens,
         **provider_tokens,
         **provider_temperature,
+        **codex_backend,
         "provider_call_status": "no new provider HTTP call",
         "provider_limits": provider_limits,
         **provider_limits,
@@ -3850,6 +4510,7 @@ def blocked_run_id_exists_summary(*, config: RunConfig, run_root: Path) -> dict[
         "scheduler_policy": config.scheduler_policy,
         "research_artifacts_path": str(config.research_artifacts_path or ""),
         "feedback_artifacts_path": str(config.feedback_artifacts_path or ""),
+        **deterministic_reference_summary_fields(deterministic_reference),
         "timeout_policy": timeout_policy_manifest(config),
         "circuit_breaker_triggered": False,
         "trigger_reason": "",
@@ -3892,6 +4553,8 @@ def manifest_identity(config: RunConfig) -> dict[str, Any]:
         "provider_base_url": config.provider_base_url,
         "provider_max_tokens": config.provider_max_tokens,
         "provider_temperature": provider_temperature_for(config.provider, config.provider_model),
+        "codex_cli_reasoning_setting": config.codex_cli_reasoning_setting,
+        "codex_cli_binary": config.codex_cli_binary,
         "tickers": list(config.tickers),
         "dates": [item.isoformat() for item in config.dates],
         "input_layers": list(config.input_layers),
@@ -3909,6 +4572,7 @@ def write_manifest(run_root: Path, config: RunConfig) -> None:
     provider_limits = provider_limit_metadata(config)
     provider_tokens = provider_max_tokens_metadata(config)
     provider_temperature = provider_temperature_metadata(config)
+    codex_backend = codex_cli_backend_metadata(config)
     manifest = {
         "schema": MANIFEST_SCHEMA,
         "definition_version": DEFINITION_VERSION,
@@ -3924,10 +4588,12 @@ def write_manifest(run_root: Path, config: RunConfig) -> None:
         "provider_max_tokens": config.provider_max_tokens,
         **provider_tokens,
         **provider_temperature,
+        **codex_backend,
         "provider_call_status": "no real provider HTTP call" if config.mode == "mock" else "pending",
         "provider_limits": provider_limits,
         **provider_limits,
         "arms": list(ARMS),
+        "arm_interpretation": arm_interpretation_summary(),
         "input_layers": list(config.input_layers),
         "warm_up_dates": config.warm_up_dates,
         "repeat_run_index": config.repeat_run_index,
@@ -3944,6 +4610,8 @@ def write_manifest(run_root: Path, config: RunConfig) -> None:
         "timeout_policy": timeout_policy_manifest(config),
         "timeout_retries": config.timeout_retries,
         "timeout_retry_backoff_seconds": config.timeout_retry_backoff_seconds,
+        "codex_cli_reasoning_setting": config.codex_cli_reasoning_setting,
+        "codex_cli_binary": config.codex_cli_binary,
         "secret_values_printed": False,
     }
     (run_root / "manifest.json").write_text(
@@ -3986,10 +4654,12 @@ def append_ledger(run_root: Path, step: dict[str, Any]) -> None:
 
 
 def validate_run_id(run_id: str) -> None:
-    if not run_id.startswith((RUN_ID_PREFIX, RUN_ID_PREFIX_V3_1, RUN_ID_PREFIX_V3_2)):
+    if not run_id.startswith(
+        (RUN_ID_PREFIX, RUN_ID_PREFIX_V3_1, RUN_ID_PREFIX_V3_2, RUN_ID_PREFIX_V3_4)
+    ):
         raise ValueError(
             f"run_id must start with {RUN_ID_PREFIX!r}, {RUN_ID_PREFIX_V3_1!r}, "
-            f"or {RUN_ID_PREFIX_V3_2!r}"
+            f"{RUN_ID_PREFIX_V3_2!r}, or {RUN_ID_PREFIX_V3_4!r}"
         )
     if "/" in run_id or ".." in run_id:
         raise ValueError("run_id must be a single path segment")
@@ -4000,6 +4670,8 @@ def redact_error(message: str) -> str:
 
 
 def default_provider_base_url(provider: str) -> str:
+    if provider == CODEX_CLI_BACKEND:
+        return "local://codex-cli"
     return v2.default_provider_base_url(provider)
 
 
@@ -4083,7 +4755,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Required marker for --mode recompute to make the no-provider boundary explicit.",
     )
     parser.add_argument("--run-id", default="")
-    parser.add_argument("--provider", choices=["glm_sophnet", "kimi"], default=DEFAULT_PROVIDER)
+    parser.add_argument(
+        "--provider",
+        choices=["glm_sophnet", "kimi", CODEX_CLI_BACKEND],
+        default=DEFAULT_PROVIDER,
+    )
     parser.add_argument("--provider-model", default=DEFAULT_GLM_MODEL)
     parser.add_argument("--provider-base-url", default="")
     parser.add_argument("--provider-max-tokens", type=int, default=1200)
@@ -4128,6 +4804,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Local JSON/JSONL feedback artifact fixture; no network retrieval is performed.",
     )
     parser.add_argument("--env-file", default="")
+    parser.add_argument("--codex-cli-reasoning-setting", default=DEFAULT_CODEX_CLI_REASONING)
+    parser.add_argument("--codex-cli-binary", default="codex")
     parser.add_argument("--resume", action="store_true")
     return parser
 
@@ -4138,6 +4816,14 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
     normalize_sophnet_api_key_env()
     mode: Mode = args.mode
     run_id = args.run_id or default_run_id(mode)
+    provider_model = args.provider_model
+    if args.provider == CODEX_CLI_BACKEND and provider_model == DEFAULT_GLM_MODEL:
+        provider_model = (
+            os.getenv("GOTRA_CODEX_CLI_MODEL")
+            or os.getenv("JUDGE_LLM_MODEL")
+            or os.getenv("LLM_MODEL")
+            or DEFAULT_CODEX_CLI_MODEL
+        )
     provider_concurrency = max(1, int(args.provider_concurrency))
     max_provider_concurrency = max(provider_concurrency, int(args.max_provider_concurrency))
     legacy_timeout = float(args.request_timeout_seconds) if args.request_timeout_seconds else None
@@ -4145,7 +4831,7 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
     formatting_timeout = args.ksana_formatting_timeout_seconds
     real_research_timeout = args.ksana_real_research_timeout_seconds
     full_timeout = args.full_gotra_timeout_seconds
-    deepseek_defaults = args.provider_model == DEEPSEEK_FLASH_MODEL
+    deepseek_defaults = provider_model == DEEPSEEK_FLASH_MODEL
     default_direct_timeout = 90.0 if deepseek_defaults else 300.0
     default_formatting_timeout = 120.0 if deepseek_defaults else 420.0
     default_real_research_timeout = 150.0 if deepseek_defaults else 480.0
@@ -4171,7 +4857,7 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         mode=mode,
         run_id=run_id,
         provider=args.provider,
-        provider_model=args.provider_model,
+        provider_model=provider_model,
         provider_base_url=args.provider_base_url or default_provider_base_url(args.provider),
         provider_max_tokens=max(1, int(args.provider_max_tokens)),
         tickers=args.tickers,
@@ -4217,6 +4903,8 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         resume=bool(args.resume),
         research_artifacts_path=args.research_artifacts_path,
         feedback_artifacts_path=args.feedback_artifacts_path,
+        codex_cli_reasoning_setting=str(args.codex_cli_reasoning_setting or DEFAULT_CODEX_CLI_REASONING),
+        codex_cli_binary=str(args.codex_cli_binary or "codex"),
     )
 
 

@@ -240,6 +240,27 @@ class JudgeAgent:
                 "reasoning": "Simplified Chinese, <=300 chars; distinguish methodology disagreement vs potential error",
                 "knowledge_flag": "none|watch|strong_candidate|quarantine_candidate",
                 "audit_actor": AUDIT_ACTOR,
+                "reason_code_examples": [
+                    "calibrated_accept",
+                    "risk_or_future_source_leak",
+                    "duplicate_or_noise",
+                    "insufficient_or_uncertain",
+                    "low_value_or_low_quality",
+                    "strong_conflict",
+                    "methodology_disagreement",
+                    "factual_error",
+                    "needs_human_review",
+                ],
+                "rubric_dimensions": [
+                    "methodology_disagreement_vs_factual_error",
+                    "evidence_provenance_and_traceability",
+                    "future_source_leak_or_decision_date_boundary",
+                    "conflict_with_existing_strong_knowledge",
+                    "duplicate_noise_or_low_incremental_value",
+                    "insufficient_evidence_or_defer_conditions",
+                    "likely_clean_outcome_feedback_substrate",
+                ],
+                "strong_candidate_policy": "report flag only; never auto-promote strong knowledge",
             },
         }
 

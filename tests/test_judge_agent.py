@@ -158,6 +158,12 @@ def test_judge_context_reads_alaya_knowledge_sor_and_local_artifacts(tmp_path: P
     assert seen_context["red_team_findings"][0]["path"].endswith("AUDIT-META.md")
     assert seen_context["historical_accuracy"] == [{"id": "pred_1", "predictionError": 0.04}]
     assert seen_context["quarantine_list"]["items"][0]["source_pr_id"] == "PR-old"
+    assert "risk_or_future_source_leak" in seen_context["output_contract"]["reason_code_examples"]
+    assert (
+        "future_source_leak_or_decision_date_boundary"
+        in seen_context["output_contract"]["rubric_dimensions"]
+    )
+    assert seen_context["output_contract"]["strong_candidate_policy"].startswith("report flag only")
 
 
 def test_judge_reject_routes_to_gate_reject_with_reason_code(tmp_path: Path) -> None:
