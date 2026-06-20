@@ -15,6 +15,7 @@ from gotra.judge_agent.judge_agent import (
     JudgeAgent,
     find_provenance_by_feedback_ref,
     parse_judge_decision,
+    sanitize_error_message,
 )
 
 
@@ -370,6 +371,43 @@ def test_judge_provenance_persists_when_approve_write_fails(tmp_path: Path) -> N
     assert "approve unavailable" in records[0]["alaya_write_error_message"]
 
 
+def test_judge_provenance_error_message_redacts_secret_like_tokens(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    write_local_context(data_dir)
+    client = FakeAlayaClient()
+    log_path = tmp_path / "judge_provenance.jsonl"
+    secret_message = (
+        "Authorization: Bearer sk-providersecret1234567890\n"
+        "api_key=abc123supersecret token=tok_secret_123 access_token=access_secret_456"
+    )
+
+    def fail_approve(gate_id: str, *, rationale: str) -> dict[str, Any]:
+        raise RuntimeError(secret_message)
+
+    client.approve_gate = fail_approve  # type: ignore[method-assign]
+    agent = JudgeAgent(
+        alaya_client=client,
+        decision_provider=lambda context: decision_payload(),
+        data_dir=data_dir,
+        provenance_log_path=log_path,
+    )
+
+    with pytest.raises(RuntimeError, match="Authorization"):
+        agent.judge_gate("gate_meaning")
+
+    record = read_jsonl(log_path)[0]
+    redacted = record["alaya_write_error_message"]
+    assert "\n" not in redacted
+    assert "Authorization: [REDACTED]" in redacted
+    assert "api_key=[REDACTED]" in redacted
+    assert "token=[REDACTED]" in redacted
+    assert "access_token=[REDACTED]" in redacted
+    assert "sk-providersecret1234567890" not in redacted
+    assert "abc123supersecret" not in redacted
+    assert "tok_secret_123" not in redacted
+    assert "access_secret_456" not in redacted
+
+
 def test_judge_provenance_persists_when_reject_write_fails(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     write_local_context(data_dir)
@@ -409,6 +447,14 @@ def test_judge_provenance_persists_when_reject_write_fails(tmp_path: Path) -> No
     assert records[0]["alaya_write_attempted"] is True
     assert records[0]["alaya_write_error_class"] == "RuntimeError"
     assert "reject unavailable" in records[0]["alaya_write_error_message"]
+
+
+def test_sanitize_error_message_redacts_bearer_and_provider_key_like_tokens() -> None:
+    message = sanitize_error_message(
+        RuntimeError("Bearer abc.def.ghi sk-abc123456789XYZ Authorization: key-123")
+    )
+
+    assert message == "Bearer [REDACTED] sk-[REDACTED] Authorization: [REDACTED]"
 
 
 def test_ci_contract_has_no_automation_strong_promotion_paths() -> None:
