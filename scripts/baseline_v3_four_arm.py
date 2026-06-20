@@ -2031,6 +2031,38 @@ def deterministic_price_only_reference_empty() -> dict[str, Any]:
     }
 
 
+def deterministic_reference_summary_fields(reference: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "deterministic_price_only_baseline_status": reference["status"],
+        "deterministic_price_only_baseline_count": reference["count"],
+        "deterministic_price_only_baseline_unique_scored_point_count": reference[
+            "unique_scored_point_count"
+        ],
+        "deterministic_price_only_baseline_raw_mirrored_count": reference[
+            "raw_mirrored_count"
+        ],
+        "deterministic_price_only_baseline_input_layer_count": reference[
+            "input_layer_count"
+        ],
+        "deterministic_price_only_baseline_metrics": reference["metrics"],
+        "deterministic_price_only_baseline_future_data_violations": reference[
+            "future_data_violations"
+        ],
+        "deterministic_price_only_baseline_latest_visible_price_date_max": reference[
+            "latest_visible_price_date_max"
+        ],
+        "deterministic_price_only_baseline_artifact_dir": reference["artifact_dir"],
+        "deterministic_price_only_baseline_error_count": reference["error_count"],
+        "deterministic_price_only_baseline_errors": reference["errors"],
+        "deterministic_price_only_baseline_llm_used": reference["llm_used"],
+        "deterministic_price_only_baseline_provider_or_backend_called": reference[
+            "provider_or_backend_called"
+        ],
+        "clean_historical_reference_status": reference["clean_historical_reference_status"],
+        "deterministic_price_only_baseline": reference,
+    }
+
+
 def scoring_segment_for(config: RunConfig, decision_date: date) -> ScoringSegment:
     ordered_dates = sorted(config.dates)
     warm_up_dates = set(ordered_dates[: max(0, config.warm_up_dates)])
@@ -3704,39 +3736,7 @@ def summarize_run(
         "stop_reason": stop_reason,
         "arms": list(ARMS),
         "arm_interpretation": arm_interpretation_summary(),
-        "deterministic_price_only_baseline_status": deterministic_reference["status"],
-        "deterministic_price_only_baseline_count": deterministic_reference["count"],
-        "deterministic_price_only_baseline_unique_scored_point_count": deterministic_reference[
-            "unique_scored_point_count"
-        ],
-        "deterministic_price_only_baseline_raw_mirrored_count": deterministic_reference[
-            "raw_mirrored_count"
-        ],
-        "deterministic_price_only_baseline_input_layer_count": deterministic_reference[
-            "input_layer_count"
-        ],
-        "deterministic_price_only_baseline_metrics": deterministic_reference["metrics"],
-        "deterministic_price_only_baseline_future_data_violations": deterministic_reference[
-            "future_data_violations"
-        ],
-        "deterministic_price_only_baseline_latest_visible_price_date_max": deterministic_reference[
-            "latest_visible_price_date_max"
-        ],
-        "deterministic_price_only_baseline_artifact_dir": deterministic_reference[
-            "artifact_dir"
-        ],
-        "deterministic_price_only_baseline_error_count": deterministic_reference[
-            "error_count"
-        ],
-        "deterministic_price_only_baseline_errors": deterministic_reference["errors"],
-        "deterministic_price_only_baseline_llm_used": deterministic_reference["llm_used"],
-        "deterministic_price_only_baseline_provider_or_backend_called": deterministic_reference[
-            "provider_or_backend_called"
-        ],
-        "clean_historical_reference_status": deterministic_reference[
-            "clean_historical_reference_status"
-        ],
-        "deterministic_price_only_baseline": deterministic_reference,
+        **deterministic_reference_summary_fields(deterministic_reference),
         "input_layers": list(config.input_layers),
         "warm_up_dates": config.warm_up_dates,
         "repeat_run_index": config.repeat_run_index,
@@ -4485,6 +4485,7 @@ def blocked_run_id_exists_summary(*, config: RunConfig, run_root: Path) -> dict[
     provider_tokens = provider_max_tokens_metadata(config)
     provider_temperature = provider_temperature_metadata(config)
     codex_backend = codex_cli_backend_metadata(config)
+    deterministic_reference = deterministic_price_only_reference_empty()
     return {
         "schema": SUMMARY_SCHEMA,
         "definition_version": DEFINITION_VERSION,
@@ -4509,6 +4510,7 @@ def blocked_run_id_exists_summary(*, config: RunConfig, run_root: Path) -> dict[
         "scheduler_policy": config.scheduler_policy,
         "research_artifacts_path": str(config.research_artifacts_path or ""),
         "feedback_artifacts_path": str(config.feedback_artifacts_path or ""),
+        **deterministic_reference_summary_fields(deterministic_reference),
         "timeout_policy": timeout_policy_manifest(config),
         "circuit_breaker_triggered": False,
         "trigger_reason": "",
