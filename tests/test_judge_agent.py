@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 from pathlib import Path
 from typing import Any
 
@@ -8,7 +9,13 @@ import pytest
 import yaml
 
 from gotra.judge_agent.gate_poller import GatePoller, auto_judge_enabled
-from gotra.judge_agent.judge_agent import AUDIT_ACTOR, JudgeAgent, parse_judge_decision
+from gotra.judge_agent.judge_agent import (
+    AUDIT_ACTOR,
+    PROVENANCE_SCHEMA_VERSION,
+    JudgeAgent,
+    find_provenance_by_feedback_ref,
+    parse_judge_decision,
+)
 
 
 class FakeAlayaClient:
@@ -24,6 +31,9 @@ class FakeAlayaClient:
                     "projectId": "proj_1",
                     "ticker": "META",
                     "run_id": "RUN-1",
+                    "knowledge_id": "kb_candidate_meta",
+                    "prediction_id": "pred_1",
+                    "feedback_ref": "feedback:meta:judge:2026-06-20",
                     "prompt_text": "Should META AI ads evidence enter active knowledge?",
                 },
             },
@@ -37,6 +47,9 @@ class FakeAlayaClient:
                     "projectId": "proj_1",
                     "ticker": "META",
                     "run_id": "RUN-1",
+                    "knowledge_id": "kb_risk_meta",
+                    "prediction_id": "pred_2",
+                    "feedback_ref": "feedback:meta:risk:2026-06-20",
                     "prompt_text": "Is risk too high?",
                 },
             },
@@ -100,6 +113,10 @@ def decision_payload(**overrides: Any) -> dict[str, Any]:
     }
     payload.update(overrides)
     return payload
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 def test_parse_judge_decision_enforces_strict_contract() -> None:
@@ -169,6 +186,72 @@ def test_judge_reject_routes_to_gate_reject_with_reason_code(tmp_path: Path) -> 
     ]
 
 
+def test_judge_provenance_jsonl_records_approve_reject_defer_paths(tmp_path: Path) -> None:
+    log_path = tmp_path / "judge" / "decisions.jsonl"
+    data_dir = tmp_path / "data"
+    write_local_context(data_dir)
+
+    approve_client = FakeAlayaClient()
+    approve = JudgeAgent(
+        alaya_client=approve_client,
+        decision_provider=lambda context: decision_payload(),
+        data_dir=data_dir,
+        provenance_log_path=log_path,
+    ).judge_gate("gate_meaning")
+
+    reject_client = FakeAlayaClient()
+    reject = JudgeAgent(
+        alaya_client=reject_client,
+        decision_provider=lambda context: decision_payload(
+            decision="reject",
+            confidence=0.9,
+            reasoning="潜在错误风险过高，需要拒绝自动通过。",
+            knowledge_flag="quarantine_candidate",
+            reason_code="risk_too_high",
+        ),
+        data_dir=data_dir,
+        provenance_log_path=log_path,
+    ).judge_gate("gate_risk")
+
+    defer_client = FakeAlayaClient()
+    defer = JudgeAgent(
+        alaya_client=defer_client,
+        decision_provider=lambda context: decision_payload(
+            decision="defer",
+            confidence=0.7,
+            reasoning="证据仍不充分，需要等待人工复核。",
+            knowledge_flag="watch",
+        ),
+        data_dir=data_dir,
+        provenance_log_path=log_path,
+    ).judge_gate("gate_meaning")
+
+    assert approve.routed_action == "approve_gate"
+    assert reject.routed_action == "reject_gate"
+    assert defer.routed_action == "none"
+    records = read_jsonl(log_path)
+    assert [record["decision"] for record in records] == ["approve", "reject", "defer"]
+    assert [record["routed_action"] for record in records] == [
+        "approve_gate",
+        "reject_gate",
+        "none",
+    ]
+    assert [record["alaya_write_attempted"] for record in records] == [True, True, False]
+    for record in records:
+        assert record["provenance_schema_version"] == PROVENANCE_SCHEMA_VERSION
+        assert record["run_id"] == "RUN-1"
+        assert record["audit_actor"] == AUDIT_ACTOR
+        assert record["knowledge_id"]
+        assert record["prediction_id"]
+        assert record["feedback_ref"]
+        assert record["apply"] is True
+        assert record["dry_run"] is False
+        assert record["decision_timestamp_utc"].endswith("Z")
+        assert len(record["input_hash"]) == 64
+        assert len(record["decision_hash"]) == 64
+        assert len(record["gate_payload_hash"]) == 64
+
+
 def test_risk_gate_defers_when_quarantine_filter_sync_is_missing(tmp_path: Path) -> None:
     client = FakeAlayaClient()
     provider_called = False
@@ -191,15 +274,70 @@ def test_risk_gate_defers_when_quarantine_filter_sync_is_missing(tmp_path: Path)
 
 def test_strong_candidate_does_not_call_knowledge_approve(tmp_path: Path) -> None:
     client = FakeAlayaClient()
+    log_path = tmp_path / "judge_provenance.jsonl"
 
     result = JudgeAgent(
         alaya_client=client,
         decision_provider=lambda context: decision_payload(knowledge_flag="strong_candidate"),
         data_dir=tmp_path,
+        provenance_log_path=log_path,
     ).judge_gate("gate_meaning")
 
     assert result.routed_action == "approve_gate"
     assert all(call[0] != "approve_knowledge" for call in client.calls)
+    records = read_jsonl(log_path)
+    assert records[0]["knowledge_flag"] == "strong_candidate"
+    assert records[0]["routed_action"] == "approve_gate"
+
+
+def test_gate_poller_dry_run_writes_provenance_without_alaya_writes(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    write_local_context(data_dir)
+    client = FakeAlayaClient()
+    log_path = tmp_path / "judge" / "dry_run.jsonl"
+    judge = JudgeAgent(
+        alaya_client=client,
+        decision_provider=lambda context: decision_payload(),
+        data_dir=data_dir,
+        provenance_log_path=log_path,
+    )
+    poller = GatePoller(
+        judge=judge,
+        alaya_client=client,  # type: ignore[arg-type]
+        dry_run=True,
+    )
+
+    acted = poller.poll_once()
+
+    assert acted == 0
+    assert poller.last_evaluated_count == 2
+    assert client.calls == []
+    records = read_jsonl(log_path)
+    assert len(records) == 2
+    assert all(record["apply"] is False for record in records)
+    assert all(record["dry_run"] is True for record in records)
+    assert all(record["routed_action"] == "none" for record in records)
+    assert all(record["alaya_write_attempted"] is False for record in records)
+
+
+def test_feedback_ref_resolves_to_judge_provenance_record(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    write_local_context(data_dir)
+    client = FakeAlayaClient()
+    log_path = tmp_path / "judge_provenance.jsonl"
+    feedback_ref = "feedback:meta:judge:2026-06-20"
+
+    JudgeAgent(
+        alaya_client=client,
+        decision_provider=lambda context: decision_payload(),
+        data_dir=data_dir,
+        provenance_log_path=log_path,
+    ).judge_gate("gate_meaning")
+
+    record = find_provenance_by_feedback_ref(log_path, feedback_ref)
+    assert record is not None
+    assert record["gate_id"] == "gate_meaning"
+    assert record["feedback_ref"] == feedback_ref
 
 
 def test_ci_contract_has_no_automation_strong_promotion_paths() -> None:
