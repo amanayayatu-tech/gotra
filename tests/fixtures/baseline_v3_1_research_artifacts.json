@@ -1,0 +1,58 @@
+[
+  {
+    "ticker": "AAPL",
+    "source_name": "Fixture 10-Q excerpt",
+    "source_url_or_id": "fixture://sec/aapl-2023-q4",
+    "publish_timestamp": "2023-12-15T00:00:00Z",
+    "availability_date": "2023-12-15",
+    "source_kind": "real",
+    "retrieval_method": "local_fixture",
+    "evidence_ref": "real:aapl:sec_q4",
+    "summary": "Time-bounded filing excerpt available before the decision date."
+  },
+  {
+    "ticker": "AAPL",
+    "source_name": "Fixture analyst note",
+    "source_url_or_id": "fixture://research/aapl-note",
+    "publish_timestamp": "2023-12-20T00:00:00Z",
+    "availability_date": "2023-12-20",
+    "source_kind": "unverified",
+    "retrieval_method": "local_fixture",
+    "evidence_ref": "unverified:aapl:analyst_note",
+    "summary": "Unverified local note available before the decision date."
+  },
+  {
+    "ticker": "AAPL",
+    "source_name": "Fixture synthetic packet",
+    "source_url_or_id": "fixture://synthetic/aapl",
+    "publish_timestamp": "2023-12-22T00:00:00Z",
+    "availability_date": "2023-12-22",
+    "source_kind": "synthetic",
+    "retrieval_method": "local_fixture",
+    "evidence_ref": "synthetic:aapl:packet",
+    "summary": "Synthetic fixture retained to keep legacy packet coverage visible."
+  },
+  {
+    "ticker": "AAPL",
+    "source_name": "Fixture future leak",
+    "source_url_or_id": "fixture://future/aapl",
+    "publish_timestamp": "2024-02-05T00:00:00Z",
+    "availability_date": "2024-02-05",
+    "source_kind": "real",
+    "retrieval_method": "local_fixture",
+    "evidence_ref": "future:aapl:leak",
+    "summary": "This row must be rejected by the future-data gate.",
+    "future_return": 9.99
+  },
+  {
+    "ticker": "*",
+    "source_name": "Fixture broad market context",
+    "source_url_or_id": "fixture://market/context",
+    "publish_timestamp": "2023-12-18T00:00:00Z",
+    "availability_date": "2023-12-18",
+    "source_kind": "unverified",
+    "retrieval_method": "local_fixture",
+    "evidence_ref": "unverified:market:context",
+    "summary": "Broad local market context shared across tickers."
+  }
+]
