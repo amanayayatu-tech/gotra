@@ -32,7 +32,8 @@ This is forward-live capture engineering evidence only. Outcomes are not matured
 
 - Backend family: `codex_cli_llm_backend` for real capture smoke.
 - Model: `gpt-5.5`
-- Reasoning setting: `low`
+- Reasoning setting for the already-recorded smoke: `low`
+- Future v3.5A Codex CLI backend test/capture default after PR hardening: `gpt-5.5` with reasoning `high`, unless a later prereg/goal explicitly locks another setting.
 - Horizon: 30 calendar days
 - Local timezone: `Asia/Shanghai`
 - Capture date: 2026-06-20 Asia/Shanghai
@@ -53,7 +54,12 @@ uv run ruff check --no-cache scripts/baseline_v3_four_arm.py scripts/baseline_v3
 uv run pytest -q tests/test_forward_live_capture.py tests/test_baseline_v3_four_arm.py
 ```
 
-Focused result: `54 passed`.
+Original focused result: `54 passed`.
+
+PR #23 review-hardening validation:
+
+- `uv run pytest -q tests/test_forward_live_capture.py tests/test_baseline_v3_four_arm.py` -> `62 passed`
+- `uv run pytest -q` -> `255 passed`
 
 ## Mock Capture
 
@@ -73,6 +79,7 @@ Focused result: `54 passed`.
 - Codex CLI transcript path count: 0
 - Parsed decision hash count: 0
 - Deterministic reference count: 5
+- Deterministic reference top-level baseline fields: present after PR hardening (`deterministic_price_only_baseline_*`)
 - Deterministic reference latest visible price date max: `2026-06-18`
 - Deterministic reference future-data violations: 0
 - Deterministic reference provider/backend called: false
@@ -89,6 +96,7 @@ Focused result: `54 passed`.
 - Codex CLI version: `codex-cli 0.139.0`
 - Model: `gpt-5.5`
 - Reasoning: `low`
+- Future-run reasoning default after PR hardening: `high`; this does not relabel the recorded smoke metadata.
 - Status: `FORWARD_LIVE_CAPTURE_PASS`
 - Expected capture decisions: 8
 - Actual capture artifacts: 8

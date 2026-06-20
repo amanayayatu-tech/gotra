@@ -10,6 +10,7 @@ v3.5A is stacked on the v3.4 Codex CLI experiment family and deterministic refer
 
 - Base stack: PR #20 -> PR #21 -> PR #22.
 - Backend family, if a real capture is run: `codex_cli_llm_backend`.
+- Future v3.5A Codex CLI backend test/capture default: model `gpt-5.5`, reasoning `high`, unless a later prereg/goal explicitly locks another setting.
 - Old Kimi/GLM/DeepSeek provider API formal-lite and parser repair lines remain frozen historical provider-runtime evidence.
 - Codex CLI backend results must not be treated as equivalent to old provider API results.
 
@@ -33,6 +34,7 @@ The first v3.5A capture grid is intentionally small and auditable:
 - Input layers: `price_only_packet`, `richer_research_packet`
 - Expected backend decision captures: 5 tickers x 1 capture timestamp x 2 input layers x 4 arms = 40
 - Deterministic reference: one `deterministic_price_only_baseline` capture per unique `(ticker, capture_decision_date, horizon)`, expected count = 5
+- Horizon is locked to 30 days in v3.5A because the underlying v3 decision contract is currently wired to that horizon.
 
 ## Required Capture Fields
 
