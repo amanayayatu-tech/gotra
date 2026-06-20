@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from math import erf, sqrt
+import random
 from statistics import mean
 from typing import Any
 
@@ -131,6 +132,126 @@ def hac_mean_test(values: list[float], *, max_lag: int | None = None) -> dict[st
     }
 
 
+def paired_loss_differences_v3(
+    steps: list[dict[str, Any]],
+    left: str,
+    right: str,
+    *,
+    input_layer: str | None = None,
+    segment: str = "scored",
+    cluster_by_input_layer: bool = False,
+) -> dict[str, list[float]]:
+    """Return v3 paired MSE loss differences grouped by ticker or ticker/layer.
+
+    The sign convention is ``left_mse - right_mse``. Positive values therefore
+    mean the right arm has lower MSE on that paired point.
+    """
+
+    by_key: dict[tuple[str, str, str], dict[str, float]] = defaultdict(dict)
+    for step in steps:
+        if step.get("status") != "scored":
+            continue
+        if str(step.get("scoring_segment", "scored")) != segment:
+            continue
+        step_layer = str(step.get("input_layer") or "")
+        if input_layer is not None and step_layer != input_layer:
+            continue
+        ticker = str(step.get("ticker"))
+        decision_date = str(step.get("decision_date"))
+        by_key[(ticker, decision_date, step_layer)][str(step.get("arm"))] = float(step["mse"])
+
+    by_cluster: dict[str, list[float]] = defaultdict(list)
+    for (ticker, _decision_date, step_layer), values in sorted(by_key.items()):
+        if left in values and right in values:
+            cluster = f"{ticker}|{step_layer}" if cluster_by_input_layer else ticker
+            by_cluster[cluster].append(round(values[left] - values[right], 12))
+    return {cluster: values for cluster, values in sorted(by_cluster.items()) if values}
+
+
+def cluster_bootstrap_ci(
+    loss_diffs_by_ticker: dict[str, list[float]],
+    *,
+    iters: int = 10000,
+    seed: int,
+    alpha: float = 0.05,
+    left_arm: str = "",
+    right_arm: str = "",
+) -> dict[str, Any]:
+    """Cluster bootstrap CI over ticker-level paired loss differences."""
+
+    clusters = [(ticker, list(values)) for ticker, values in sorted(loss_diffs_by_ticker.items()) if values]
+    flat = [value for _ticker, values in clusters for value in values]
+    if len(clusters) < 2 or not flat:
+        return {
+            "statistical_test_completed": False,
+            "right_arm_better_significant": False,
+            "passed": False,
+            "passed_field_semantics": "deprecated_alias_for_right_arm_better_significant",
+            "reason": "not_enough_paired_steps",
+            "insufficient_reason": "not_enough_paired_steps",
+            "left_arm": left_arm,
+            "right_arm": right_arm,
+            "winner_arm": "",
+            "effect_direction": "undetermined",
+            "mean_loss_diff": round(mean(flat), 6) if flat else None,
+            "ci_low": None,
+            "ci_high": None,
+            "p_value": None,
+            "n_clusters": len(clusters),
+            "n": len(flat),
+            "iters": int(iters),
+            "alpha": alpha,
+        }
+
+    rng = random.Random(seed)
+    bootstrap_means: list[float] = []
+    cluster_count = len(clusters)
+    for _iteration in range(max(1, int(iters))):
+        sampled: list[float] = []
+        for _cluster_index in range(cluster_count):
+            _ticker, values = clusters[rng.randrange(cluster_count)]
+            sampled.extend(values)
+        bootstrap_means.append(mean(sampled))
+
+    bootstrap_means.sort()
+    lower = _quantile_sorted(bootstrap_means, alpha / 2)
+    upper = _quantile_sorted(bootstrap_means, 1 - alpha / 2)
+    point = mean(flat)
+    less_equal_zero = sum(1 for value in bootstrap_means if value <= 0) / len(bootstrap_means)
+    greater_equal_zero = sum(1 for value in bootstrap_means if value >= 0) / len(bootstrap_means)
+    p_value = min(1.0, 2 * min(less_equal_zero, greater_equal_zero))
+    right_arm_better_significant = point > 0 and lower > 0
+    if point > 0:
+        effect_direction = "right_arm_better"
+        winner_arm = right_arm
+    elif point < 0:
+        effect_direction = "left_arm_better"
+        winner_arm = left_arm
+    else:
+        effect_direction = "neutral"
+        winner_arm = ""
+    return {
+        "statistical_test_completed": True,
+        "right_arm_better_significant": right_arm_better_significant,
+        "passed": right_arm_better_significant,
+        "passed_field_semantics": "deprecated_alias_for_right_arm_better_significant",
+        "reason": "",
+        "insufficient_reason": "",
+        "left_arm": left_arm,
+        "right_arm": right_arm,
+        "winner_arm": winner_arm,
+        "effect_direction": effect_direction,
+        "mean_loss_diff": round(point, 6),
+        "ci_low": round(lower, 6),
+        "ci_high": round(upper, 6),
+        "p_value": round(p_value, 8),
+        "n_clusters": cluster_count,
+        "n": len(flat),
+        "iters": int(iters),
+        "alpha": alpha,
+    }
+
+
 def cumulative_mse_series(steps: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     by_arm: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for step in sorted(steps, key=lambda item: (parse_date(item["decision_date"]), str(item["ticker"]))):
@@ -155,3 +276,18 @@ def cumulative_mse_series(steps: list[dict[str, Any]]) -> dict[str, list[dict[st
 
 def _normal_cdf(value: float) -> float:
     return (1.0 + erf(value / sqrt(2.0))) / 2.0
+
+
+def _quantile_sorted(values: list[float], quantile: float) -> float:
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return values[0]
+    position = (len(values) - 1) * min(1.0, max(0.0, quantile))
+    lower = int(position)
+    upper = min(len(values) - 1, lower + 1)
+    if lower == upper:
+        return values[lower]
+    lower_value = values[lower]
+    upper_value = values[upper]
+    return lower_value + (upper_value - lower_value) * (position - lower)
