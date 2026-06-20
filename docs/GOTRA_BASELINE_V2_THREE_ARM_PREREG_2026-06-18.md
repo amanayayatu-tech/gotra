@@ -14,6 +14,14 @@ Existing gotra BT code uses `baseline` and `alaya` arms. In that code path, `bas
 
 This task is a preregistered pilot harness and engineering health check. It is not full formal acceptance, not OOS pass, not paper/live trading, and not a science/public claim.
 
+2026-06-20 interpretation caveat: historical `direct_llm` metrics from this
+pilot must be read as `direct_llm_parametric_memory_control`, not as a clean
+no-future historical baseline. Modern LLM parameter memory may contain later
+market narratives even when prompts and artifacts are time-bounded. Direct LLM
+metrics are diagnostic only and must not be used to prove or refute GOTRA,
+ksana, or alaya success; see
+`docs/GOTRA_DIRECT_LLM_INTERPRETATION_BOUNDARY_2026-06-20.md`.
+
 ## 2. Fairness Constraints
 
 All three arms must share:
@@ -256,4 +264,8 @@ paired_coverage = 1.0
 
 `PROVIDER_PILOT_PASS` means the fixed Baseline v2 pilot grid completed on the Kimi provider path with paired coverage 1.0 and no provider/schema/future-data errors. It does not mean formal-lite pass, OOS pass, Stage9 pass, paper trading readiness, or a science/public claim.
 
-In this pilot, `direct_llm` had better direction hit rate, MSE, MAE, and Policy A return than `ksana_only` and `full_gotra`. The pilot therefore does not support the claim that `ksana_only` or `full_gotra` outperformed `direct_llm` on this grid.
+In this pilot, `direct_llm_parametric_memory_control` had better direction hit
+rate, MSE, MAE, and Policy A return than `ksana_only` and `full_gotra`. The
+pilot therefore does not support the claim that `ksana_only` or `full_gotra`
+outperformed `direct_llm_parametric_memory_control` on this grid. This remains a
+diagnostic pilot result only.

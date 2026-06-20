@@ -45,6 +45,17 @@ future_data_violation_count = 0
 raw_content_saved_count = 0
 ```
 
+## Direct LLM Interpretation Boundary
+
+Historical `direct_llm` metrics in this document must be read as
+`direct_llm_parametric_memory_control`; see
+`docs/GOTRA_DIRECT_LLM_INTERPRETATION_BOUNDARY_2026-06-20.md`.
+
+This is not a clean no-future historical baseline. Modern LLM parameter memory
+may contain later market narratives even when prompts and artifacts are
+time-bounded. These metrics are diagnostic only and must not be used to prove or
+refute GOTRA, ksana, or alaya success.
+
 ## Pilot Metrics
 
 ```text
@@ -56,8 +67,10 @@ full_gotra: scored=60, direction_hit_rate=0.3, mse=225.483452, mae=11.117102, po
 ## Interpretation
 
 ```text
-direct_llm is best on direction_hit_rate, MSE, MAE, and Policy A return in this pilot.
-This pilot does not support ksana_only or full_gotra outperforming direct_llm.
+direct_llm_parametric_memory_control ranks best on direction_hit_rate, MSE, MAE,
+and Policy A return in this pilot.
+This pilot does not support ksana_only or full_gotra outperforming
+direct_llm_parametric_memory_control.
 ```
 
 This is a negative/neutral pilot signal for measurable ksana/alaya lift under the current price-derived packet and fixed pilot grid. It is not a final verdict on gotra, ksana research, alaya memory, or product value.

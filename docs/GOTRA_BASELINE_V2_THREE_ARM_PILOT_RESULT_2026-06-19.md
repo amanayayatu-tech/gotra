@@ -39,6 +39,17 @@ pilot paired_coverage = 1.0
 pilot provider_error/input_echo/json/schema/429/timeout/future-data = 0
 ```
 
+## Direct LLM Interpretation Boundary
+
+Historical `direct_llm` metrics in this document must be read as
+`direct_llm_parametric_memory_control`; see
+`docs/GOTRA_DIRECT_LLM_INTERPRETATION_BOUNDARY_2026-06-20.md`.
+
+This is not a clean no-future historical baseline. Modern LLM parameter memory
+may contain later market narratives even when prompts and artifacts are
+time-bounded. These metrics are diagnostic only and must not be used to prove or
+refute GOTRA, ksana, or alaya success.
+
 ## Frozen Interpretation
 
 ```text
@@ -61,7 +72,10 @@ full_gotra:
   policy_a_cumulative_return_pct = 6.577583
 ```
 
-The direct conclusion is that this pilot does not show `ksana_only` or `full_gotra` outperforming `direct_llm`. This is a pilot-layer negative/neutral signal for the current Baseline v2 input and artifact design.
+The direct conclusion is that this pilot does not show `ksana_only` or
+`full_gotra` outperforming `direct_llm_parametric_memory_control`. This is a
+pilot-layer diagnostic signal for the current Baseline v2 input and artifact
+design, not a verdict on GOTRA, ksana, or alaya.
 
 ## Local Validation
 

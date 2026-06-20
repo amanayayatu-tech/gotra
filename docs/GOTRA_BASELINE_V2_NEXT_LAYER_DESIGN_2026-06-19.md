@@ -2,9 +2,22 @@
 
 ## Purpose
 
-This document explains why `ksana_only` and `full_gotra` did not show an advantage over `direct_llm` in the frozen Baseline v2 Kimi-K2.6 provider pilot, and defines the next validation layer.
+This document explains why `ksana_only` and `full_gotra` did not show an
+advantage over `direct_llm_parametric_memory_control` in the frozen Baseline v2
+Kimi-K2.6 provider pilot, and defines the next validation layer.
 
 The goal is not to tune the setup until `full_gotra` wins. The goal is to learn whether gotra's advantage requires richer inputs, real ksana research, matured alaya feedback, and metrics that separate prediction quality from content-product value.
+
+## Direct LLM Interpretation Boundary
+
+Historical `direct_llm` metrics in this design note must be read as
+`direct_llm_parametric_memory_control`; see
+`docs/GOTRA_DIRECT_LLM_INTERPRETATION_BOUNDARY_2026-06-20.md`.
+
+This is not a clean no-future historical baseline. Modern LLM parameter memory
+may contain later market narratives even when prompts and artifacts are
+time-bounded. These metrics are diagnostic only and must not be used to prove or
+refute GOTRA, ksana, or alaya success.
 
 ## Frozen Pilot Signal
 
@@ -26,7 +39,8 @@ Frozen pilot metrics:
 Direct conclusion:
 
 ```text
-This pilot does not show ksana_only or full_gotra outperforming direct_llm.
+This pilot does not show ksana_only or full_gotra outperforming
+direct_llm_parametric_memory_control.
 ```
 
 ## 1. Input May Be Too Weak

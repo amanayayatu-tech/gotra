@@ -52,6 +52,17 @@ paper trading/trading advice: not entered
 
 It does not mean formal-lite pass, OOS pass, Stage9 pass, paper trading readiness, or a science/public claim.
 
+## Direct LLM Interpretation Boundary
+
+Historical `direct_llm` metrics in this document must be read as
+`direct_llm_parametric_memory_control`; see
+`docs/GOTRA_DIRECT_LLM_INTERPRETATION_BOUNDARY_2026-06-20.md`.
+
+This is not a clean no-future historical baseline. Modern LLM parameter memory
+may contain later market narratives even when prompts and artifacts are
+time-bounded. The `direct_llm` metrics below are diagnostic only and must not be
+used to prove or refute GOTRA, ksana, or alaya success.
+
 ## Pilot Metrics
 
 | arm | scored_steps | direction_hit_rate | MSE | MAE | Policy A cumulative return pct |
@@ -70,9 +81,15 @@ It does not mean formal-lite pass, OOS pass, Stage9 pass, paper trading readines
 
 ## Interpretation
 
-In this pilot, `direct_llm` had the best direction hit rate, MSE, MAE, and Policy A cumulative return. The paired diffs are directionally unfavorable to `ksana_only` and `full_gotra` under this pilot metric stack.
+In this pilot, `direct_llm_parametric_memory_control` had the best direction hit
+rate, MSE, MAE, and Policy A cumulative return. The paired diffs are
+directionally unfavorable to `ksana_only` and `full_gotra` under this pilot
+metric stack.
 
-This pilot does not support the claim that `ksana_only` or `full_gotra` outperformed `direct_llm` on the fixed Baseline v2 pilot grid.
+This pilot does not support the claim that `ksana_only` or `full_gotra`
+outperformed `direct_llm_parametric_memory_control` on the fixed Baseline v2
+pilot grid. This diagnostic comparison must not be promoted to an OOS,
+science/public, or trading conclusion.
 
 This is not a gotra project failure. It means the current Baseline v2 input packet, ksana artifact construction, alaya feedback maturity, or metric design did not surface an advantage for the more complex arms.
 
@@ -118,7 +135,8 @@ future_data_violation_count = 0
 Frozen interpretation:
 
 ```text
-direct_llm outperformed ksana_only and full_gotra on this pilot grid.
+direct_llm_parametric_memory_control ranked ahead of ksana_only and full_gotra
+on this pilot grid.
 The result is pilot evidence only.
 No formal-lite, OOS, Stage9, paper trading, science, or public claim is made.
 ```
