@@ -41,9 +41,14 @@ Review hardening added for PR #34:
 
 - successful v3.5E scorer-summary prerequisite:
   `SCORED_OUTCOMES_AVAILABLE`, sufficient scored count, zero future-data
-  blockers, and zero provenance failures
+  blockers, zero provenance failures, and clean boundary flags
+  (`provider_or_backend_called=false`, `codex_cli_called=false`,
+  `formal_lite_entered=false`, and
+  `direct_llm_interpretation=direct_llm_parametric_memory_control`)
 - unscorable source decision blocker: source predicted direction must be
   `long`, `avoid`, or `neutral`
+- duplicate deterministic reference keys block readiness instead of silently
+  choosing one price-only artifact
 - duplicate `full_gotra` pairing keys block readiness instead of silently
   choosing one artifact
 - scheduler provenance consistency: outcome `scheduler_run_id` must match
@@ -65,9 +70,9 @@ Local validation used synthetic `/tmp` fixtures to exercise a clean sufficient
 readiness path. No provider, Codex CLI backend, formal-lite, transcript, or raw
 LLM artifact was used.
 
-- Run id: `baseline_v3_6_forward_live_verdict_readiness_local_20260620T193030Z`
-- Summary path: `/tmp/gotra_v3_6_readiness_validation_20260620T193030Z/runs/baseline_v3_6_forward_live_verdict_readiness_local_20260620T193030Z/summary.json`
-- Summary sha256: `b80e3f8c648bf420b65aa9755b68496e93441ae6d9cf1e761babb08e4940653d`
+- Run id: `baseline_v3_6_forward_live_verdict_readiness_local_20260620T194549Z`
+- Summary path: `/tmp/gotra_v3_6_readiness_validation_20260620T194549Z/runs/baseline_v3_6_forward_live_verdict_readiness_local_20260620T194549Z/summary.json`
+- Summary sha256: `bd2f5859449588a7e2d512947acd45bada65e4e3d9218c1a40d43e8c0b9f2372`
 - Status: `READY_FOR_FORWARD_LIVE_VERDICT`
 - Matured outcome count: `4`
 - Scored outcome count: `4`
@@ -81,6 +86,7 @@ LLM artifact was used.
 - Provenance link count: `4`
 - Scorer summary count: `1`
 - Successful scorer summary count: `1`
+- Deterministic reference pairing failure count: `0`
 - Bootstrap eligible: `true`
 - HAC eligible: `true`
 - Provider/backend called: `false`
@@ -100,16 +106,16 @@ uv run ruff check --no-cache scripts/baseline_v3_6_forward_live_verdict_readines
 uv run pytest -q tests/test_forward_live_verdict_readiness_gate.py
 uv run pytest -q tests/test_forward_live_outcome_resolver.py tests/test_forward_live_outcome_scheduler.py tests/test_forward_live_operating_loop.py tests/test_forward_live_matured_outcome_scorer.py
 uv run pytest -q
-uv run python scripts/baseline_v3_6_forward_live_verdict_readiness_gate.py --input-root /tmp/gotra_v3_6_readiness_validation_20260620T193030Z/input --readiness-run-id baseline_v3_6_forward_live_verdict_readiness_local_20260620T193030Z --output-dir /tmp/gotra_v3_6_readiness_validation_20260620T193030Z/runs
+uv run python scripts/baseline_v3_6_forward_live_verdict_readiness_gate.py --input-root /tmp/gotra_v3_6_readiness_validation_20260620T194549Z/input --readiness-run-id baseline_v3_6_forward_live_verdict_readiness_local_20260620T194549Z --output-dir /tmp/gotra_v3_6_readiness_validation_20260620T194549Z/runs
 ```
 
 Results:
 
 - py_compile: pass
 - Ruff: pass
-- v3.6 focused tests: `15 passed`
+- v3.6 focused tests: `17 passed`
 - v3.5B/v3.5C/v3.5D/v3.5E regression tests: `46 passed`
-- full pytest: `352 passed`
+- full pytest: `354 passed`
 - local readiness validation: `READY_FOR_FORWARD_LIVE_VERDICT`
 
 ## Artifact Boundary

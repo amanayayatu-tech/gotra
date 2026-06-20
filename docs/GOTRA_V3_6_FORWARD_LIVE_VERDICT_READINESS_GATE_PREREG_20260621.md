@@ -51,9 +51,12 @@ The gate must check and report:
 
 The v3.5E scorer prerequisite is satisfied only by a successful
 `SCORED_OUTCOMES_AVAILABLE` summary with enough scored outcomes for the v3.6
-minimum, zero future-data blockers, and zero provenance failures. A stale,
-blocked, `DATA_NOT_MATURED`, or `DATA_INSUFFICIENT` scorer summary cannot make
-the readiness gate ready.
+minimum, zero future-data blockers, zero provenance failures, and clean execution
+boundary fields: `provider_or_backend_called=false`, `codex_cli_called=false`,
+`formal_lite_entered=false`, and
+`direct_llm_interpretation=direct_llm_parametric_memory_control`. A stale,
+blocked, `DATA_NOT_MATURED`, `DATA_INSUFFICIENT`, or boundary-contaminated
+scorer summary cannot make the readiness gate ready.
 
 Deterministic references must be local price-only artifacts with:
 
@@ -69,8 +72,9 @@ with the v3.5B future-data guard. The source prediction direction must be one of
 the v3/v3.5 scoreable buckets: `long`, `avoid`, or `neutral`.
 
 Readiness must block ambiguous provenance. Duplicate `full_gotra` pairing keys
-for the same `(ticker, decision_date, horizon)` are not silently deduplicated.
-The outcome-level `scheduler_run_id` must match the nested
+and duplicate deterministic reference keys for the same
+`(ticker, decision_date, horizon)` are not silently deduplicated. The
+outcome-level `scheduler_run_id` must match the nested
 `provenance.scheduler_run_id`.
 
 ## Status Semantics
@@ -105,7 +109,8 @@ Local acceptance requires:
 - focused tests cover not-matured, insufficient samples, insufficient clusters,
   missing deterministic reference, missing `full_gotra`, future-data blocker,
   missing provenance, successful scorer-summary prerequisite, unscorable source
-  decisions, duplicate `full_gotra` keys, scheduler provenance mismatch,
+  decisions, duplicate deterministic reference keys, duplicate `full_gotra`
+  keys, scheduler provenance mismatch, scorer summary boundary flags,
   clean-ready fixture, direct_llm caveat, and run-id collision
 - v3.5B/v3.5C/v3.5D/v3.5E regression tests pass
 - full pytest passes if runtime remains reasonable

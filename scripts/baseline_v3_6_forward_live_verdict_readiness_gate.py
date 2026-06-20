@@ -210,6 +210,14 @@ def scorer_summary_success(summary: dict[str, Any], *, min_matured_outcomes: int
         return False
     if int(summary.get("provenance_failure_count") or 0):
         return False
+    if summary.get("provider_or_backend_called") is not False:
+        return False
+    if summary.get("codex_cli_called") is not False:
+        return False
+    if summary.get("formal_lite_entered") is not False:
+        return False
+    if summary.get("direct_llm_interpretation") != "direct_llm_parametric_memory_control":
+        return False
     return True
 
 
@@ -231,6 +239,14 @@ def scorer_summary_failure_reasons(
             failures["future_data_violation_count_nonzero"] += 1
         if int(summary.get("provenance_failure_count") or 0):
             failures["provenance_failure_count_nonzero"] += 1
+        if summary.get("provider_or_backend_called") is not False:
+            failures["provider_or_backend_called_not_false"] += 1
+        if summary.get("codex_cli_called") is not False:
+            failures["codex_cli_called_not_false"] += 1
+        if summary.get("formal_lite_entered") is not False:
+            failures["formal_lite_entered_not_false"] += 1
+        if summary.get("direct_llm_interpretation") != "direct_llm_parametric_memory_control":
+            failures["direct_llm_interpretation_missing_or_invalid"] += 1
     return failures
 
 
@@ -610,6 +626,10 @@ def run_readiness_gate(config: ReadinessConfig) -> dict[str, Any]:
         "deterministic_reference_future_data_violation",
         0,
     )
+    deterministic_pairing_failure_count = deterministic_failures.get(
+        "duplicate_deterministic_reference_key",
+        0,
+    )
     future_data_violation_count = (
         len(future_failures)
         + deterministic_future_failures
@@ -620,6 +640,7 @@ def run_readiness_gate(config: ReadinessConfig) -> dict[str, Any]:
         len(provenance_failures)
         + scorer_summary_provenance_failures
         + scorer_prerequisite_failure_count
+        + deterministic_pairing_failure_count
     )
     scored_outcome_count = len(full_outcomes)
     status = readiness_status(
@@ -683,6 +704,7 @@ def run_readiness_gate(config: ReadinessConfig) -> dict[str, Any]:
             "future_data_violation_count": future_data_violation_count,
             "future_data_failures": future_failures[:20],
             "deterministic_reference_future_data_violation_count": deterministic_future_failures,
+            "deterministic_reference_pairing_failure_count": deterministic_pairing_failure_count,
             "input_summary_future_data_violation_count": input_summary_future,
             "scorer_summary_future_data_violation_count": scorer_summary_future,
             "provenance_link_count": len(paired_clean_records),

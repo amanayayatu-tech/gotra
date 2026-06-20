@@ -174,6 +174,39 @@ def test_readiness_requires_successful_scorer_summary(tmp_path: Path) -> None:
     assert "scorer_summary:status:DATA_INSUFFICIENT" in summary["blocking_reasons"]
 
 
+def test_readiness_requires_boundary_clean_scorer_summary(tmp_path: Path) -> None:
+    cases: list[tuple[str, dict[str, object], str | None, str]] = [
+        ("provider", {"provider_or_backend_called": True}, None, "provider_or_backend_called_not_false"),
+        ("codex", {"codex_cli_called": True}, None, "codex_cli_called_not_false"),
+        ("formal", {"formal_lite_entered": True}, None, "formal_lite_entered_not_false"),
+        ("missing_direct", {}, None, "direct_llm_interpretation_missing_or_invalid"),
+        (
+            "wrong_direct",
+            {},
+            "direct_llm",
+            "direct_llm_interpretation_missing_or_invalid",
+        ),
+    ]
+    for suffix, updates, direct_llm_interpretation, reason in cases:
+        root = tmp_path / suffix
+        _write_scorer_summary(
+            root,
+            updates=updates,
+            direct_llm_interpretation=direct_llm_interpretation,
+        )
+        _write_clean_pair(root, "AAPL", "2026-06-20")
+        _write_clean_pair(root, "AAPL", "2026-06-21")
+        _write_clean_pair(root, "MSFT", "2026-06-20")
+        _write_clean_pair(root, "MSFT", "2026-06-21")
+
+        summary = readiness.run_readiness_gate(_config(tmp_path, root, suffix))
+
+        assert summary["status"] == readiness.STATUS_BLOCKED_PROVENANCE
+        assert summary["scorer_summary_success_count"] == 0
+        assert summary["scorer_summary_failure_counts"][reason] == 1
+        assert f"scorer_summary:{reason}" in summary["blocking_reasons"]
+
+
 def test_readiness_rejects_unscorable_source_decisions(tmp_path: Path) -> None:
     root = tmp_path / "fixture"
     _write_scorer_summary(root)
@@ -205,6 +238,28 @@ def test_readiness_blocks_duplicate_full_gotra_pairing_keys(tmp_path: Path) -> N
     assert summary["status"] == readiness.STATUS_BLOCKED_PROVENANCE
     assert summary["outcome_failure_counts"]["duplicate_full_gotra_key"] == 1
     assert "outcome:duplicate_full_gotra_key" in summary["blocking_reasons"]
+
+
+def test_readiness_blocks_duplicate_deterministic_reference_keys(tmp_path: Path) -> None:
+    root = tmp_path / "fixture"
+    _write_scorer_summary(root)
+    _write_clean_pair(root, "AAPL", "2026-06-20")
+    _write_reference(root, "AAPL", "2026-06-20", output_suffix="_duplicate")
+    _write_clean_pair(root, "AAPL", "2026-06-21")
+    _write_clean_pair(root, "MSFT", "2026-06-20")
+    _write_clean_pair(root, "MSFT", "2026-06-21")
+
+    summary = readiness.run_readiness_gate(_config(tmp_path, root, "duplicate_det"))
+
+    assert summary["status"] == readiness.STATUS_BLOCKED_PROVENANCE
+    assert summary["deterministic_reference_failure_counts"][
+        "duplicate_deterministic_reference_key"
+    ] == 1
+    assert summary["deterministic_reference_pairing_failure_count"] == 1
+    assert (
+        "deterministic_reference:duplicate_deterministic_reference_key"
+        in summary["blocking_reasons"]
+    )
 
 
 def test_readiness_blocks_scheduler_provenance_mismatch(tmp_path: Path) -> None:
@@ -280,6 +335,8 @@ def _write_scorer_summary(
     *,
     status: str = scorer_v35e.STATUS_SCORED,
     scored_outcome_count: int = 4,
+    updates: dict[str, object] | None = None,
+    direct_llm_interpretation: str | None = "direct_llm_parametric_memory_control",
 ) -> None:
     payload = {
         "schema": scorer_v35e.SUMMARY_SCHEMA,
@@ -293,12 +350,22 @@ def _write_scorer_summary(
         "codex_cli_called": False,
         "formal_lite_entered": False,
     }
+    if direct_llm_interpretation is not None:
+        payload["direct_llm_interpretation"] = direct_llm_interpretation
+    if updates:
+        payload.update(updates)
     path = root / "scorer" / "summary.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def _write_reference(root: Path, ticker: str, decision_date: str) -> Path:
+def _write_reference(
+    root: Path,
+    ticker: str,
+    decision_date: str,
+    *,
+    output_suffix: str = "",
+) -> Path:
     payload = {
         "schema": capture_v35a.DETERMINISTIC_CAPTURE_SCHEMA,
         "run_id": "baseline_v3_5a_forward_live_readiness_fixture",
@@ -312,7 +379,11 @@ def _write_reference(root: Path, ticker: str, decision_date: str) -> Path:
         "llm_used": False,
         "provider_or_backend_called": False,
     }
-    path = root / "deterministic_price_only_baseline" / f"reference_{decision_date}_{ticker}.json"
+    path = (
+        root
+        / "deterministic_price_only_baseline"
+        / f"reference_{decision_date}_{ticker}{output_suffix}.json"
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     return path
