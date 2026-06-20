@@ -49,6 +49,12 @@ The gate must check and report:
   v3.5E scorer summary
 - bootstrap/HAC eligibility flags only; no bootstrap/HAC verdict is computed
 
+The v3.5E scorer prerequisite is satisfied only by a successful
+`SCORED_OUTCOMES_AVAILABLE` summary with enough scored outcomes for the v3.6
+minimum, zero future-data blockers, and zero provenance failures. A stale,
+blocked, `DATA_NOT_MATURED`, or `DATA_INSUFFICIENT` scorer summary cannot make
+the readiness gate ready.
+
 Deterministic references must be local price-only artifacts with:
 
 - `schema=gotra.baseline_v3_5a.deterministic_price_only_capture_reference.v1`
@@ -59,7 +65,13 @@ Deterministic references must be local price-only artifacts with:
 
 Clean `full_gotra` outcomes must be `RESOLVED`, use the primary input layer, and
 reverse-link to a valid source capture. The loaded source capture is rechecked
-with the v3.5B future-data guard.
+with the v3.5B future-data guard. The source prediction direction must be one of
+the v3/v3.5 scoreable buckets: `long`, `avoid`, or `neutral`.
+
+Readiness must block ambiguous provenance. Duplicate `full_gotra` pairing keys
+for the same `(ticker, decision_date, horizon)` are not silently deduplicated.
+The outcome-level `scheduler_run_id` must match the nested
+`provenance.scheduler_run_id`.
 
 ## Status Semantics
 
@@ -92,7 +104,9 @@ Local acceptance requires:
 - py_compile and Ruff pass for the v3.6 script and tests
 - focused tests cover not-matured, insufficient samples, insufficient clusters,
   missing deterministic reference, missing `full_gotra`, future-data blocker,
-  missing provenance, clean-ready fixture, direct_llm caveat, and run-id collision
+  missing provenance, successful scorer-summary prerequisite, unscorable source
+  decisions, duplicate `full_gotra` keys, scheduler provenance mismatch,
+  clean-ready fixture, direct_llm caveat, and run-id collision
 - v3.5B/v3.5C/v3.5D/v3.5E regression tests pass
 - full pytest passes if runtime remains reasonable
 - a local readiness validation run writes output only to `/tmp` or ignored paths

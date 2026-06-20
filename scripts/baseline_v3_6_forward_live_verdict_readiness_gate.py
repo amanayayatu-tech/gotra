@@ -199,6 +199,41 @@ def scorer_summaries(candidates: list[Path]) -> list[tuple[Path, dict[str, Any]]
     return summaries
 
 
+def scorer_summary_success(summary: dict[str, Any], *, min_matured_outcomes: int) -> bool:
+    if summary.get("status") != scorer_v35e.STATUS_SCORED:
+        return False
+    if int(summary.get("scored_outcome_count") or 0) < min_matured_outcomes:
+        return False
+    if int(summary.get("future_data_blocker_count") or 0):
+        return False
+    if int(summary.get("future_data_violation_count") or 0):
+        return False
+    if int(summary.get("provenance_failure_count") or 0):
+        return False
+    return True
+
+
+def scorer_summary_failure_reasons(
+    summaries: list[tuple[Path, dict[str, Any]]],
+    *,
+    min_matured_outcomes: int,
+) -> Counter[str]:
+    failures: Counter[str] = Counter()
+    for _path, summary in summaries:
+        status = str(summary.get("status") or "")
+        if status != scorer_v35e.STATUS_SCORED:
+            failures[f"status:{status or 'missing'}"] += 1
+        if int(summary.get("scored_outcome_count") or 0) < min_matured_outcomes:
+            failures["scored_outcome_count_below_readiness_minimum"] += 1
+        if int(summary.get("future_data_blocker_count") or 0):
+            failures["future_data_blocker_count_nonzero"] += 1
+        if int(summary.get("future_data_violation_count") or 0):
+            failures["future_data_violation_count_nonzero"] += 1
+        if int(summary.get("provenance_failure_count") or 0):
+            failures["provenance_failure_count_nonzero"] += 1
+    return failures
+
+
 def input_summary_future_data_count(candidates: list[Path]) -> int:
     count = 0
     for path in candidates:
@@ -226,6 +261,9 @@ def clean_source_payload_for_outcome(
     reasons = scorer_v35e.source_future_data_reasons_from_capture(source_payload)
     if reasons:
         return None, "source_capture_future_data_violation:" + ",".join(reasons)
+    predicted_direction = scorer_v35e.predicted_direction_from_source(source_payload)
+    if predicted_direction not in scorer_v35e.VALID_DIRECTIONS:
+        return None, "unknown_predicted_direction"
     return source_payload, ""
 
 
@@ -255,6 +293,10 @@ def clean_full_gotra_outcome_reason(
         "scheduler_run_id"
     ):
         return "missing_scheduler_provenance"
+    if str(record.get("scheduler_run_id")) != str(
+        (record.get("provenance") or {}).get("scheduler_run_id")
+    ):
+        return "scheduler_run_id_mismatch"
     if not record.get("resolver_run_id") or not (record.get("provenance") or {}).get(
         "resolver_run_id"
     ):
@@ -349,6 +391,13 @@ def collect_clean_full_gotra_outcomes(
         key = outcome_key(record)
         if key in clean:
             failures["duplicate_full_gotra_key"] += 1
+            provenance_failures.append(
+                {
+                    "outcome_artifact": str(path),
+                    "source_decision_id": str(record.get("source_decision_id") or ""),
+                    "reason": "duplicate_full_gotra_key",
+                }
+            )
             continue
         clean[key] = CleanFullGotraOutcome(
             key=key,
@@ -372,6 +421,8 @@ def blocking_reasons_for(
     future_data_violation_count: int,
     provenance_failure_count: int,
     scorer_summary_count: int,
+    scorer_summary_success_count: int,
+    scorer_summary_failures: Counter[str],
     deterministic_failures: Counter[str],
     outcome_failures: Counter[str],
     min_matured_outcomes: int,
@@ -386,6 +437,8 @@ def blocking_reasons_for(
         reasons.append("provenance_failure_detected")
     if scorer_summary_count == 0:
         reasons.append("missing_matured_outcome_scorer_summary")
+    elif scorer_summary_success_count == 0:
+        reasons.append("missing_successful_matured_outcome_scorer_summary")
     if matured_outcome_count == 0:
         reasons.append("no_resolved_mature_outcomes")
     if scored_outcome_count < min_matured_outcomes:
@@ -405,6 +458,9 @@ def blocking_reasons_for(
     for reason, count in sorted(deterministic_failures.items()):
         if count:
             reasons.append(f"deterministic_reference:{reason}")
+    for reason, count in sorted(scorer_summary_failures.items()):
+        if count:
+            reasons.append(f"scorer_summary:{reason}")
     for reason, count in sorted(outcome_failures.items()):
         if count and reason not in {"outcome_not_resolved", "not_full_gotra", "full_gotra_input_layer_mismatch"}:
             reasons.append(f"outcome:{reason}")
@@ -424,7 +480,7 @@ def readiness_status(
     date_count: int,
     future_data_violation_count: int,
     provenance_failure_count: int,
-    scorer_summary_count: int,
+    scorer_summary_success_count: int,
     min_matured_outcomes: int,
     min_paired_points: int,
     min_clusters: int,
@@ -432,7 +488,7 @@ def readiness_status(
 ) -> str:
     if future_data_violation_count:
         return STATUS_BLOCKED_FUTURE_DATA
-    if provenance_failure_count or scorer_summary_count == 0:
+    if provenance_failure_count or scorer_summary_success_count == 0:
         return STATUS_BLOCKED_PROVENANCE
     if matured_outcome_count == 0:
         return STATUS_DATA_NOT_MATURED
@@ -523,6 +579,18 @@ def run_readiness_gate(config: ReadinessConfig) -> dict[str, Any]:
         primary_input_layer=config.primary_input_layer,
     )
     summaries = scorer_summaries(candidates)
+    successful_scorer_summaries = [
+        (path, summary)
+        for path, summary in summaries
+        if scorer_summary_success(
+            summary,
+            min_matured_outcomes=config.min_matured_outcomes,
+        )
+    ]
+    scorer_summary_failures = scorer_summary_failure_reasons(
+        summaries,
+        min_matured_outcomes=config.min_matured_outcomes,
+    )
     scorer_summary_future = sum(
         int(summary.get("future_data_blocker_count") or summary.get("future_data_violation_count") or 0)
         for _path, summary in summaries
@@ -530,6 +598,7 @@ def run_readiness_gate(config: ReadinessConfig) -> dict[str, Any]:
     scorer_summary_provenance_failures = sum(
         int(summary.get("provenance_failure_count") or 0) for _path, summary in summaries
     )
+    scorer_prerequisite_failure_count = 0 if successful_scorer_summaries else 1
     input_summary_future = input_summary_future_data_count(candidates)
     paired_keys = sorted(set(references) & set(full_outcomes))
     paired_candidate_count = min(len(references), len(full_outcomes))
@@ -550,7 +619,7 @@ def run_readiness_gate(config: ReadinessConfig) -> dict[str, Any]:
     provenance_failure_count = (
         len(provenance_failures)
         + scorer_summary_provenance_failures
-        + (0 if summaries else 1)
+        + scorer_prerequisite_failure_count
     )
     scored_outcome_count = len(full_outcomes)
     status = readiness_status(
@@ -563,7 +632,7 @@ def run_readiness_gate(config: ReadinessConfig) -> dict[str, Any]:
         date_count=len(dates),
         future_data_violation_count=future_data_violation_count,
         provenance_failure_count=provenance_failure_count,
-        scorer_summary_count=len(summaries),
+        scorer_summary_success_count=len(successful_scorer_summaries),
         min_matured_outcomes=config.min_matured_outcomes,
         min_paired_points=config.min_paired_points,
         min_clusters=config.min_clusters,
@@ -583,6 +652,8 @@ def run_readiness_gate(config: ReadinessConfig) -> dict[str, Any]:
         future_data_violation_count=future_data_violation_count,
         provenance_failure_count=provenance_failure_count,
         scorer_summary_count=len(summaries),
+        scorer_summary_success_count=len(successful_scorer_summaries),
+        scorer_summary_failures=scorer_summary_failures,
         deterministic_failures=deterministic_failures,
         outcome_failures=outcome_failures,
         min_matured_outcomes=config.min_matured_outcomes,
@@ -618,7 +689,12 @@ def run_readiness_gate(config: ReadinessConfig) -> dict[str, Any]:
             "provenance_failure_count": provenance_failure_count,
             "provenance_failures": provenance_failures[:20],
             "scorer_summary_count": len(summaries),
+            "scorer_summary_success_count": len(successful_scorer_summaries),
+            "scorer_summary_failure_counts": dict(sorted(scorer_summary_failures.items())),
             "scorer_summary_paths": [str(path) for path, _summary in summaries],
+            "successful_scorer_summary_paths": [
+                str(path) for path, _summary in successful_scorer_summaries
+            ],
             "deterministic_reference_failure_counts": dict(sorted(deterministic_failures.items())),
             "outcome_failure_counts": dict(sorted(outcome_failures.items())),
             "bootstrap_eligible": bootstrap_eligible,

@@ -154,6 +154,75 @@ def test_readiness_ready_for_clean_sufficient_fixture(tmp_path: Path) -> None:
     assert summary["formal_lite_entered"] is False
 
 
+def test_readiness_requires_successful_scorer_summary(tmp_path: Path) -> None:
+    root = tmp_path / "fixture"
+    _write_scorer_summary(
+        root,
+        status=scorer_v35e.STATUS_DATA_INSUFFICIENT,
+        scored_outcome_count=2,
+    )
+    _write_clean_pair(root, "AAPL", "2026-06-20")
+    _write_clean_pair(root, "AAPL", "2026-06-21")
+    _write_clean_pair(root, "MSFT", "2026-06-20")
+    _write_clean_pair(root, "MSFT", "2026-06-21")
+
+    summary = readiness.run_readiness_gate(_config(tmp_path, root, "failed_scorer"))
+
+    assert summary["status"] == readiness.STATUS_BLOCKED_PROVENANCE
+    assert summary["scorer_summary_success_count"] == 0
+    assert "missing_successful_matured_outcome_scorer_summary" in summary["blocking_reasons"]
+    assert "scorer_summary:status:DATA_INSUFFICIENT" in summary["blocking_reasons"]
+
+
+def test_readiness_rejects_unscorable_source_decisions(tmp_path: Path) -> None:
+    root = tmp_path / "fixture"
+    _write_scorer_summary(root)
+    invalid_direction = {"decision": {"direction": "up", "expected_change_pct": 3.0}}
+    for ticker in ("AAPL", "MSFT"):
+        for decision_date in ("2026-06-20", "2026-06-21"):
+            _write_reference(root, ticker, decision_date)
+            _write_outcome(root, ticker, decision_date, source_updates=invalid_direction)
+
+    summary = readiness.run_readiness_gate(_config(tmp_path, root, "bad_direction"))
+
+    assert summary["status"] == readiness.STATUS_BLOCKED_PROVENANCE
+    assert summary["full_gotra_available_count"] == 0
+    assert summary["outcome_failure_counts"]["unknown_predicted_direction"] == 4
+    assert "outcome:unknown_predicted_direction" in summary["blocking_reasons"]
+
+
+def test_readiness_blocks_duplicate_full_gotra_pairing_keys(tmp_path: Path) -> None:
+    root = tmp_path / "fixture"
+    _write_scorer_summary(root)
+    _write_clean_pair(root, "AAPL", "2026-06-20")
+    _write_outcome(root, "AAPL", "2026-06-20", output_suffix="_duplicate")
+    _write_clean_pair(root, "AAPL", "2026-06-21")
+    _write_clean_pair(root, "MSFT", "2026-06-20")
+    _write_clean_pair(root, "MSFT", "2026-06-21")
+
+    summary = readiness.run_readiness_gate(_config(tmp_path, root, "duplicate_full"))
+
+    assert summary["status"] == readiness.STATUS_BLOCKED_PROVENANCE
+    assert summary["outcome_failure_counts"]["duplicate_full_gotra_key"] == 1
+    assert "outcome:duplicate_full_gotra_key" in summary["blocking_reasons"]
+
+
+def test_readiness_blocks_scheduler_provenance_mismatch(tmp_path: Path) -> None:
+    root = tmp_path / "fixture"
+    _write_scorer_summary(root)
+    _write_reference(root, "AAPL", "2026-06-20")
+    outcome = _write_outcome(root, "AAPL", "2026-06-20")
+    payload = json.loads(outcome.read_text(encoding="utf-8"))
+    payload["provenance"]["scheduler_run_id"] = "baseline_v3_5c_outcome_scheduler_stale"
+    outcome.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    summary = readiness.run_readiness_gate(_config(tmp_path, root, "scheduler_mismatch"))
+
+    assert summary["status"] == readiness.STATUS_BLOCKED_PROVENANCE
+    assert summary["outcome_failure_counts"]["scheduler_run_id_mismatch"] == 1
+    assert "outcome:scheduler_run_id_mismatch" in summary["blocking_reasons"]
+
+
 def test_direct_llm_is_not_clean_full_gotra_pair(tmp_path: Path) -> None:
     root = tmp_path / "fixture"
     _write_scorer_summary(root)
@@ -206,11 +275,17 @@ def _write_clean_pair(root: Path, ticker: str, decision_date: str) -> None:
     _write_outcome(root, ticker, decision_date)
 
 
-def _write_scorer_summary(root: Path) -> None:
+def _write_scorer_summary(
+    root: Path,
+    *,
+    status: str = scorer_v35e.STATUS_SCORED,
+    scored_outcome_count: int = 4,
+) -> None:
     payload = {
         "schema": scorer_v35e.SUMMARY_SCHEMA,
         "scorer_run_id": "baseline_v3_5e_matured_outcome_scorer_fixture",
-        "status": scorer_v35e.STATUS_SCORED,
+        "status": status,
+        "scored_outcome_count": scored_outcome_count,
         "future_data_violation_count": 0,
         "future_data_blocker_count": 0,
         "provenance_failure_count": 0,
@@ -296,6 +371,7 @@ def _write_outcome(
     arm: str = "full_gotra",
     input_layer: str = readiness.DEFAULT_PRIMARY_INPUT_LAYER,
     source_updates: dict[str, object] | None = None,
+    output_suffix: str = "",
 ) -> Path:
     source = _write_source_capture(
         root,
@@ -349,7 +425,7 @@ def _write_outcome(
         / "baseline_v3_5b_outcome_resolver_readiness_fixture"
         / "outcomes"
         / status.lower()
-        / f"outcome_{decision_date}_{ticker.lower()}_{arm}_{input_layer}.json"
+        / f"outcome_{decision_date}_{ticker.lower()}_{arm}_{input_layer}{output_suffix}.json"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
