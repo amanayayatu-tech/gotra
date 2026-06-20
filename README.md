@@ -1,193 +1,201 @@
-# gotra
+# GOTRA
 
-> **गोत्र**（梵语「世系 / 谱系」）—— 让每一次投研判断都有可追溯的血脉：从信号到预测，从预测到观察，从误差归因到知识沉淀。
+> **GOTRA / gotra** 记录一次投研判断的血脉：signal、prediction、evidence、outcome、
+> error attribution、feedback、provenance，以及可审计、可复盘的知识状态。
 
-**gotra 是一个自主、可审计、人类闸门兜底的投研数据飞轮。**
+GOTRA 是一个 AI 原生、可审计、可复盘的投研研究工作流与内容/研究基础设施。它的目标是让研究判断、证据、预测、结果和反馈可以被追踪和复核，而不是提供荐股、自动交易或收益承诺。
 
-给它一份固定的股票池，它每天自动完成研究、判断、预测、误差归因与知识沉淀，早晚各产出一份详细报告。整个过程零人工干预——唯一保留的人类动作，是为「知识晋级为长期信念（strong）」这一最危险的一步做一次一键确认。系统的目标不是预测得更准，而是**越跑越准**：把每一次判断的对错沉淀成可复用、可审计、可隔离的知识，形成认知复利。
+当前项目状态：内部工程与研究证据阶段。当前 `main` 已包含 Stage4-8、Baseline v2/v3/v3.1/v3.2/v3.3/v3.4/v3.5A 文档与代码路径，包括本地 harness、provider/backend 实验、deterministic reference 和 forward-live capture plumbing。除非某个后续文档明确升级证据层级，否则这些内容默认不构成 OOS/public/science proof，也不构成交易或投资建议。
 
----
+## 项目定位
 
-## 为什么是 gotra
+GOTRA 用来：
 
-市面上的 AI 投研工具大多是「一次性」的：每次提问都从零开始，既不记得上次错在哪，也无法证明自己在变好。gotra 反其道而行：
+- 记录带审计元数据的研究判断和预测；
+- 把研究证据、价格上下文、反馈和 provenance 绑定到判断链路；
+- 通过 Judge Agent 和可人工复核的闸门处理高风险知识决策；
+- 在明确 no-future-data 约束下回放历史实验；
+- 在结果成熟前捕获 future-live 决策；
+- 把工程/runtime 健康、内部研究结果、science/public claim 和 trading claim 分开。
 
-- **有记忆的判断** —— 每个决策都进预测账本，到期后用真实价格计算误差并归因，反馈进知识库的置信度模型（Beta 自适应）。错误的认知会被自动隔离，正确的认知被反复印证后才晋级。
-- **可审计的血脉** —— 从信号、预测、观察、误差到知识，每一步写操作都留痕，能回答「这条结论是谁、哪一轮、依据什么证据产生的」。
-- **守得住的边界** —— 不下单、不接券商、不输出买卖指令；最危险的认知晋级必须经人类确认，机器永远不能自封「真理」。
-- **真正自主** —— 一份股票池之外，研究、闸门判断、报告全自动；人只在每天的晚报里花一分钟，批准值得长期相信的少数结论。
+GOTRA 不是：
 
----
+- 个性化财务建议；
+- 自动交易机器人；
+- 接券商下单的执行系统；
+- 收益保证或利润承诺系统；
+- “GOTRA、ksana、alaya 或某个 LLM 可以预测市场”的证明。
 
-## 核心理念：六条不可违反的底线
+## 当前架构
 
-这是 gotra 之所以是 gotra 的定义性约束，全程冻结：
+当前仓库主要由以下层组成：
 
-1. **数学心脏保持纯净** —— 误差计算、误差归因、置信度更新、状态迁移四个核心函数无副作用、时间靠参数注入，保证整个飞轮可复现、可单测、可审计。
-2. **strong 晋级必过人类闸** —— 知识晋级为长期信念必须人类批准，**禁止任何「为了跑得快」的自动批准开关**。机器自封 strong = 自我强化的幻觉闭环。
-3. **审计不可旁路** —— 一切写操作经会记录操作者（actor）的审计路径，禁止绕过审计的裸写。
-4. **脏知识不进高风险证据** —— 过期、隔离、冲突状态的知识不得进入高风险决策的证据集，过滤条件只增不减。
-5. **灰区不简化** —— 模糊反馈弱累加、连续模糊触发人类判断，不黑白二分。
-6. **模型留在接口后** —— 全系统的模型调用只经统一接口，保证可复现的回归基准与零改动的真实推理注入。
-
-> **认知熵减的本质**：让脏数据失去影响力（降级、隔离、排除出证据集），而不是让它消失。前者可逆、可审计、可申诉；后者一旦做错就是不可逆的认知损失。
-
----
-
-## 工程铁律（CI 与审阅口径）
-
-以下约束来自 [`docs/AUTONOMY_RUNBOOK.md`](docs/AUTONOMY_RUNBOOK.md)，违反即判 FAIL：
-
-1. **宪法优先** —— 任何加速开关都不能破坏 ksana 纯函数、Alaya 审计路径或 `active→strong` human-only 底线。
-2. **LLM 唯一通道** —— gotra 业务代码不得直连 OpenAI / Anthropic SDK；模型调用必须留在 provider 接口之后，经 Codex CLI 路径执行。
-3. **审计不可旁路** —— 跨系统写入必须走会记录 `actor` 的事件路径，禁止裸写绕过审计。
-4. **分支隔离与单独提交** —— 每个 Phase / runner 修复使用独立分支和清晰 commit，不把工装、科学结论和产物混在一起。
-5. **仓库卫生** —— bundle、validation logs、回测缓存、报告、patch、密钥不进 git；可复现实验定义和源码必须进 git。
-6. **零未来函数** —— 回测中任一 `T` 的决策只允许读取 `availability_date <= T` 的输入。
-7. **不得伪装通过** —— N/A 标 N/A，失败标 FAIL，禁止为了指标变绿而改阈值、改口径或 p-hack。
-
-GitHub CI 执行 `ruff`、全量 `pytest`、直连 LLM import grep、ksana orchestration guard。详见 [CI workflow](.github/workflows/ci.yml)。
-
-CI green 只代表工程 plumbing、并行 runner、analyzer、ledger 和本地确定性测试通过；它不等于 Stage 3 科学验收通过。正式 BT 验收仍必须另外给出完整 run id、baseline replay compare artifact，并满足预注册 A 类 gate。
-
-面向 AI coding agent 的本地操作规约见 [`SPEC.md`](SPEC.md)；若与 CI workflow 或 runbook 冲突，采用更严格的安全/审计规则。
-
----
-
-## 自主闭环（Definition of Done）
-
-```text
-唯一人工输入：股票池（固定持仓 + 研究公司）
-  → 调度器每日早 / 晚两次自动触发完整流水线
-  → 自动深度研究：把研究问题派发给 Perplexity Deep Research，结果自动回填
-  → F/W/G 委员会 + Chairman 产出研究简报与决策案例
-  → Judge Agent 自动判决闸门：研究闸 / 风险闸全自动放行或驳回
-  → 决策案例进入预测账本（1/7/30/90 天 claims，禁用未来数据）
-  → 窗口到期 → 观察快照 → 误差计算与归因
-  → 误差反馈进知识库（置信度自适应）；误差超阈的知识自动隔离（只隔离不删）
-  → strong 知识候选进【晚报待批清单】，由人一键批准（唯一保留的人工动作）
-  → 每日早报 / 晚报 自动推送
-  → 同一标的再研究时引用既有可信知识，被隔离的知识不进引擎
-```
-
-**全系统模型推理统一为 `gpt-5.5`、reasoning effort = `xhigh`，经 Codex CLI 调用。** 每一步可审计；任一子系统停机不阻塞其余部分。
-
----
-
-## 系统架构
-
-gotra 由四个协作子系统组成，通过事件契约与文件 / HTTP 通道松耦合，各自独立运行、互不阻塞：
-
-| 子系统 | 职责 |
-| --- | --- |
-| **治理内核**（TypeScript） | 事件账本、人类闸门、预测 / 观察 / 误差归因内核、知识状态机（draft→active→strong / stale / quarantined / conflict） |
-| **领域引擎**（Python） | 股票池扫描、F/W/G 委员会、Chairman 决策、红队审计、outcome 快照、自然日窗口取数（零未来函数） |
-| **自主层** | 自动 Perplexity 执行器、Judge Agent 分级自动闸门、auto-quarantine、daemon 早晚双窗口调度、每日报告与通知 |
-| **回测层** | 10 股 × 10 年 Walk-Forward 零未来函数回测，验证「认知复利」真实有效 |
-
-```text
-gotra/
-  governance/                  # 治理内核：账本 / 闸门 / 预测 / 归因 / 知识状态机
-  engine/                      # 领域引擎：股票池 / 委员会 / Chairman / 红队 / outcome
-  autonomy/
-    perplexity_executor/       # 自动深度研究执行器
-    judge_agent/               # Judge Agent 分级自动闸门 + auto_quarantine
-    daemon/                    # 早晚双窗口自主调度
-    reporting/                 # 每日报告 + Telegram / SMTP 通知
-  backtest/                    # Walk-Forward 回测 harness + 价格缓存
-  contracts/
-    investment_event.schema.json   # 跨子系统事件契约（JSON Schema）
-  data/
-    stock_pool/master_pool.yaml     # 唯一人工输入：固定持仓 + 研究公司
-  docs/
-    ROADMAP.md                 # 分阶段执行路线图
-    AUTONOMY_RUNBOOK.md        # 自主化 + 回测 可执行任务书（Codex 逐 Phase 执行）
-```
-
-### Judge Agent · 分级自主
-
-闸门判断按风险分级，既做到日常零人工，又守住宪法底线：
-
-- **研究闸（meaning）/ 风险闸（risk）** → 全自动放行 / 驳回，由 `gpt-5.5 xhigh` 给出结构化判决，理由区分「方法论分歧」与「潜在错误」，全程留痕。
-- **strong 晋级** → **绝不自动**。候选写入晚报待批清单，由人一键批准。这是被反复引用的长期资产，必须守住人类这道物理隔断（底线 2）。
-
----
-
-## 效力验收：10 股 × 10 年 Walk-Forward 回测
-
-系统是否真的具备「认知复利」，用一个**零未来函数（No Lookahead Bias）**的滚动回测来证明：
-
-- **数据**：10 只代表性港股 / 美股（腾讯、美团、众安、NVIDIA、小米、阿里、比亚迪、苹果、台积电、微软）2016–2026 日频数据。
-- **滚动窗口**：1 年初始化窗口，滚动预测下 1 个月，逐月前进。任一 T 时刻决策**只用可得时间 ≤ T 的数据**——三层防泄漏：价格按 `date≤T` 切片、基本面按财报发布日门控、回测期禁实时联网研究。
-- **消融对比**：认知复利臂（带知识库 + 置信度自适应）vs Baseline 臂（无状态单步）。**两臂共用同一 `gpt-5.5 xhigh` 模型与 prompt 骨架，唯一变量 = 是否带认知复利。**
-- **指标**：MSE 演化。预期复利臂随时间收敛，Baseline 臂在市场风格切换时灾难性漂移；以差分（Diebold-Mariano + Newey-West HAC）度量机制净增量效应。
-- **诚实声明**：现成大模型跑历史回测存在不可消除的预训练泄漏，故**绝对 MSE 不可信**，结论仅就「机制差分效应」成立；指标开跑前预注册 + 时间戳锁定，杜绝 p-hacking。
-
-「全绿」分两类：**Correctness 闸**（零未来函数审计、无崩溃、可复现、纯函数单测、全程审计留痕）必须 100% 通过以证明实验有效；**Hypothesis 闸**（MSE 收敛 / 抗漂移 / 差分显著）是真实科学结论，达成则验证「认知复利有效」，未达成如实报负结果。
-
----
-
-## 路线图
-
-| 阶段 | 内容 | 关键退出标准 |
+| 层 | 职责 | 主要入口 |
 | --- | --- | --- |
-| Phase 0 | 工作区初始化、事件契约、目录骨架 | 子系统可加载、契约校验通过 |
-| Phase A | 模型调用统一走 Codex CLI（gpt-5.5 xhigh）+ provider 物理只读硬化 | provider 隔离生效、无行为漂移 |
-| Phase B0 | 治理内核 automation-actor 合同（**strong 仍 human-only**） | 自动化可放行闸门 / 隔离知识，**永不能晋级 strong** |
-| Phase P | 自动 Perplexity 执行器 | 研究问题自动回填，引擎纯度守护测试仍全绿 |
-| Phase B | Judge Agent 分级自动闸门 + auto-quarantine | 闸门决策自动留痕、无自动 strong |
-| Phase C | daemon 自主调度 + 每日早晚报告 + 通知 | 两窗口完整运行、strong 待批可一键批 |
-| Phase BT | 10×10×10年 Walk-Forward 回测（效力验收） | Correctness 闸 100% 全绿 |
+| Research / signal generation | 构造价格包、研究包和受控实验 prompt。 | `scripts/baseline_v3_four_arm.py`, `gotra/perplexity_executor/`, `integrations/alaya/` |
+| Judge gate / decision routing | 判断 gate candidate，持久化 decision provenance，支持 dry-run polling，保持 strong promotion human-only。 | `gotra/judge_agent/`, `scripts/gate_poller.py`, `gotra/judge_agent/prompts/` |
+| Alaya knowledge / feedback layer | 表达 active/strong knowledge 上下文，同步 gates，生成 outcome-derived feedback artifacts，并保持 feedback eligibility 可审计。 | `integrations/alaya/`, `gotra/judge_agent/outcome_feedback.py` |
+| Backtest / formal-lite harness | 运行 local/mock/provider/backend grid，计算诊断指标，并执行 no-future-data 与 artifact 边界。 | `gotra/backtest/`, `scripts/baseline_v3_four_arm.py`, `gotra/backtest/statistics.py` |
+| Deterministic reference | 提供不调用 LLM/backend/provider 的 cleaner price-only 历史参考。 | v3.4b/v3.4c summary 中的 `deterministic_price_only_baseline` 字段 |
+| Forward-live capture | 在 outcome 成熟前捕获 future-only 决策，记录 prompt hash、decision hash 和可选 Codex CLI transcript path。 | `scripts/baseline_v3_5_forward_live_capture.py` |
+| Outcome maturity / scoring | 计划中的下一层，只在 horizon 成熟后评分 captured decisions。 | v3.5B planned；v3.5A capture 不做 outcome scoring |
+| Evidence / provenance artifacts | 用文档和本地 runtime artifacts 保持每次实验可检查，同时不提交 raw provider output。 | `docs/`, `data/backtest/*.md`, ignored `data/backtest/runs/*` |
 
-详见 [`docs/AUTONOMY_RUNBOOK.md`](docs/AUTONOMY_RUNBOOK.md) 与 [`docs/ROADMAP.md`](docs/ROADMAP.md)。本仓库按可被 **Codex `goal` / `codex exec`** 逐 Phase 自主执行的任务书组织；每个 Phase 在独立分支实现、自验通过全绿套件后再合并冻结。
+旧的 Kimi/GLM/DeepSeek provider API formal-lite/parser 线、新的 `codex_cli_llm_backend` experiment family、deterministic references、forward-live capture path 是不同证据族，不能合并解释成同一个结果。
 
----
+## 证据梯度
+
+阅读本仓库时请按以下证据层级解释：
+
+| 层级 | 能说明什么 | 不能说明什么 |
+| --- | --- | --- |
+| local checks | 代码可导入、确定性测试、lint、fixture 行为、artifact hygiene。 | provider 可靠性、市场 edge、OOS 有效性。 |
+| provider/runtime health | 某个 provider/backend 在特定 grid 下能返回 schema-valid decisions。 | replay 有效、科学验收、投资有效。 |
+| mock/canary/tiny smoke | 小范围路径在扩容前可跑通。 | formal acceptance 或 public proof。 |
+| formal-lite internal research | 预注册内部 grid 完成或失败，并留下诊断记录。 | OOS/science/public proof 或 trading claim。 |
+| forward-live capture | 未来结果发生前，决策已被捕获。 | outcome matured pass；必须等 horizon 成熟后评分。 |
+| OOS/science/public proof | 需要单独记录的成熟、验收协议。 | 默认不由本 repo 当前状态声称。 |
+| trading/investment claim | 需要完全不同的合规与证据层。 | 本项目不声称。 |
+
+当前仓库证据默认是 internal engineering/research evidence。除非未来某个命名 artifact 明确升级证据层级，否则不要把局部 smoke、provider health、formal-lite internal run 或 forward-live capture 说成更强结论。
+
+## Direct LLM Caveat
+
+历史 `direct_llm` 必须解释为 `direct_llm_parametric_memory_control`。
+
+它不是干净的 no-future historical baseline。即使 prompts、input packets 和 artifact filters 都限制到 `decision_date`，现代 LLM 的参数记忆也可能包含后来的市场叙事。prompt 和 artifact gate 可以降低显式 future-data 泄漏，但不能抹掉 parametric memory。
+
+因此：
+
+- `direct_llm` metrics 只能作为诊断；
+- C1/C3/C5、return、MSE、MAE、direction-hit 等包含 `direct_llm` 的指标，不得用来证明或反驳 GOTRA、ksana、alaya 的成功或失败；
+- 更适合历史 alaya-style 解释的比较是 `ksana_real_research` vs `full_gotra`，并且仍然受 internal-evidence 边界约束；
+- 更干净的 baseline 是 deterministic price-only 或 simple statistical reference；
+- 最可信的未来导向路径是 forward-live/future-only capture，并在 outcome 成熟后再评分。
+
+详见 [`docs/GOTRA_DIRECT_LLM_INTERPRETATION_BOUNDARY_2026-06-20.md`](docs/GOTRA_DIRECT_LLM_INTERPRETATION_BOUNDARY_2026-06-20.md)。
+
+## Baseline 演进摘要
+
+以下是当前主线的审慎时间线，不是市场优越性声明：
+
+- **Stage4-8**：reproducibility、replay gate、provider routing 和 baseline-only signal/PNL screening。它们改进了审计 harness 并明确失败边界，但没有建立 public market-edge proof。
+- **Baseline v2 / v3**：四臂实验族，比较 `direct_llm`、`ksana_formatting_only`、`ksana_real_research`、`full_gotra`，并区分 `price_only_packet` 与 `richer_research_packet`。Baseline v3 formal-lite 属于内部研究证据，强结论仍为 inconclusive。
+- **v3.1 / v3.2**：real-evidence 和 true-independent feedback substrate。v3.1 保持 H2 data-insufficient；v3.2 引入更严格的 feedback eligibility，并在 formal-lite attempt 中暴露 provider contract blocker。
+- **v3.3a-d**：Judge decision provenance、dry-run gate polling、outcome-derived feedback artifact production、temporal replay/calibration、prompt/spec hardening。这些是 local engineering 和 replay/calibration evidence。
+- **v3.4 / v3.4b / v3.4c**：新的 `codex_cli_llm_backend` experiment family、transcript/hash metadata、deterministic price-only reference integration 和 scaled internal run。这些是 internal backend/reference diagnostics，不是 OOS 或 public-science result。
+- **v3.5A**：forward-live/future-only decision capture path。它可以在 outcome 发生前捕获决策；outcome scoring 必须等 horizon 成熟。
+
+## 当前不声称
+
+本仓库当前不声称：
+
+- 默认已经具备 OOS/public/science proof；
+- 任何交易或投资推荐；
+- provider health、Codex CLI backend health 或 CI success 等于 market edge；
+- forward-live capture 等于 matured outcome pass；
+- `direct_llm` 是干净的 no-future baseline；
+- product metrics 本身可以证明预测质量或投资价值。
+
+如果某个 run 写着 `PROVIDER_PILOT_PASS`、`FORMAL_LITE_MIN_INTERNAL_PASS`、`SCALED_INTERNAL_PROVIDER_PILOT_PASS` 或 `FORWARD_LIVE_CAPTURE_PASS`，请只在对应文档声明的证据层内解释。
 
 ## 快速开始
 
-> 当前代码已包含 gotra Python 包、`engine/ksana` 子模块、事件契约、Judge / Perplexity / daemon / reporting / backtest 模块和测试。真实 LLM / Perplexity / Alaya 写入仍需显式环境配置；默认测试不连接真实 provider。
+前置要求：
 
-前置：本机已安装并登录 Codex CLI（系统所有模型调用经此）。
+- Python `>=3.11`，CI 使用 Python `3.12`；
+- [`uv`](https://docs.astral.sh/uv/)；
+- 运行触达 `engine/ksana` 的检查前，需要初始化 git submodules。
 
 ```bash
 git clone https://github.com/amanayayatu-tech/gotra.git
 cd gotra
 git submodule update --init --recursive
-
-# 安装依赖
-uv venv && source .venv/bin/activate
-uv sync
-
-# 配置环境（全系统模型调用走 Codex CLI · gpt-5.5 · xhigh）
-cp .env.example .env
-#   LLM_PROVIDER=codex_cli
-#   LLM_MODEL=gpt-5.5
-#   CODEX_PROVIDER_REASONING_EFFORT=xhigh
-#   AUTO_JUDGE=true
-#   PERPLEXITY_API_KEY=...      # 仅实盘自主用；回测期置空
-
-# 校验事件契约
-python -c "import json,jsonschema; jsonschema.Draft202012Validator.check_schema(json.load(open('contracts/investment_event.schema.json')))"
-
-# daemon 干跑（验证编排串联与失败隔离，不实跑模型）
-uv run python -m gotra.daemon_orchestration.run --once --type morning --dry-run
+uv sync --frozen
 ```
 
-### 本地验证
+可选环境配置见 [`.env.example`](.env.example)。不要把真实 secrets 加入 git。Provider/backend runs 属于高成本且证据敏感动作，必须有明确 goal 和预注册边界后再运行。
+
+## 本地检查
+
+常规本地验证：
 
 ```bash
 uv run ruff check . --force-exclude
 uv run pytest -q
-uv run pytest -q tests/test_backtest_analyze.py tests/test_backtest_ledger.py tests/test_backtest_parallel.py tests/test_backtest_walk_forward.py
-uv run pytest -q engine/ksana/tests/orchestrator/test_decision_checks.py
 git diff --check
 ```
 
----
+README/docs-only 变更通常只需要 `git diff --check`，除非 README 引用了被改动的命令或代码路径。当前 v3 surfaces 的有用 focused checks：
 
-## 状态
+```bash
+uv run python -m py_compile \
+  scripts/baseline_v3_four_arm.py \
+  scripts/baseline_v3_5_forward_live_capture.py \
+  gotra/backtest/statistics.py
 
-🚧 早期建设中。当前代码线已包含基础自主层、回测 harness、Codex CLI provider 隔离、baseline replay compare、provider health artifacts、BT analyzer、SQLite ledger、baseline 并行和 Alaya ticker-chain 并行。正式 BT Stage 3 已冻结为预注册 A 类 gate FAIL 和负/混合科学结论：canonical concurrency-4 baseline replay 为 `846/1006 = 84.10%`，低于 `95%` gate；H1 FAIL，H2 mixed，H3 FAIL。因此不能宣称认知增强已被验证。当前 `codex_cli` provider 不具备可靠 `temperature/top_p/seed` 控制；正式科学运行前应先用 `--require-stage3-provider` 阻断不合格 provider。最终 verdict 见 [`docs/STAGE3_FINAL_VERDICT_20260615.md`](docs/STAGE3_FINAL_VERDICT_20260615.md)，证据 manifest 见 [`docs/STAGE3_EVIDENCE_MANIFEST_20260615.md`](docs/STAGE3_EVIDENCE_MANIFEST_20260615.md)。
+uv run pytest -q tests/test_baseline_v3_four_arm.py tests/test_forward_live_capture.py
+```
+
+CI 还会运行 Ruff、全量 pytest、BT repair tests、heuristic BT canaries、direct-vendor LLM import guards、repository hygiene guard 和 ksana orchestration guard。详见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
+
+## Artifact Hygiene
+
+不要提交生成产物或敏感产物：
+
+- `data/backtest/runs/*`
+- `data/backtest/prices/*`
+- Codex CLI transcripts
+- raw provider/API outputs
+- `.env*`，但 `.env.example` 除外
+- API keys、tokens、auth JSON 或本地 secrets
+- SQLite/DB files
+- bundle/tar/zip archives
+- paper-trading data
+- validation logs、review bundles、patch files、generated reports
+- Stage8/Stage9 local artifacts，除非某个 docs-only artifact 被明确接受
+
+仓库 `.gitignore` 和 CI hygiene guard 会强制执行这些规则中的稳定子集。
+
+## 文档地图
+
+核心项目契约：
+
+- [`SPEC.md`](SPEC.md)：agent-facing 操作规约、边界和验证命令。
+- [`docs/AUTONOMY_RUNBOOK.md`](docs/AUTONOMY_RUNBOOK.md)：自主化/runbook 约束。
+- [`docs/ROADMAP.md`](docs/ROADMAP.md)：阶段路线图。
+- [`data/backtest/PREREGISTERED.md`](data/backtest/PREREGISTERED.md)：原始 BT protocol。
+
+证据与边界文档：
+
+- [`docs/GOTRA_DIRECT_LLM_INTERPRETATION_BOUNDARY_2026-06-20.md`](docs/GOTRA_DIRECT_LLM_INTERPRETATION_BOUNDARY_2026-06-20.md)
+- [`data/backtest/STAGE6_PREREGISTERED.md`](data/backtest/STAGE6_PREREGISTERED.md)
+- [`docs/STAGE6_EVIDENCE_MANIFEST_20260617.md`](docs/STAGE6_EVIDENCE_MANIFEST_20260617.md)
+- [`docs/STAGE6_FINAL_VERDICT_2026-06-17.md`](docs/STAGE6_FINAL_VERDICT_2026-06-17.md)
+- [`docs/GOTRA_V3_3A_CHAIN_AUDIT_AND_PROVENANCE_20260620.md`](docs/GOTRA_V3_3A_CHAIN_AUDIT_AND_PROVENANCE_20260620.md)
+- [`docs/GOTRA_V3_3B_OUTCOME_FEEDBACK_PRODUCTION_20260620.md`](docs/GOTRA_V3_3B_OUTCOME_FEEDBACK_PRODUCTION_20260620.md)
+- [`docs/GOTRA_V3_3C_JUDGE_TEMPORAL_REPLAY_20260620.md`](docs/GOTRA_V3_3C_JUDGE_TEMPORAL_REPLAY_20260620.md)
+- [`docs/GOTRA_V3_3D_JUDGE_PROMPT_HARDENING_20260620.md`](docs/GOTRA_V3_3D_JUDGE_PROMPT_HARDENING_20260620.md)
+- [`docs/GOTRA_V3_4_CODEX_CLI_FORMAL_LITE_RESULT_20260620.md`](docs/GOTRA_V3_4_CODEX_CLI_FORMAL_LITE_RESULT_20260620.md)
+- [`docs/GOTRA_V3_4B_DETERMINISTIC_REFERENCE_RESULT_20260620.md`](docs/GOTRA_V3_4B_DETERMINISTIC_REFERENCE_RESULT_20260620.md)
+- [`docs/GOTRA_V3_4C_CODEX_CLI_SCALED_REFERENCE_RESULT_20260620.md`](docs/GOTRA_V3_4C_CODEX_CLI_SCALED_REFERENCE_RESULT_20260620.md)
+- [`docs/GOTRA_V3_5A_FORWARD_LIVE_CAPTURE_RESULT_20260620.md`](docs/GOTRA_V3_5A_FORWARD_LIVE_CAPTURE_RESULT_20260620.md)
+
+相关代码和测试入口：
+
+- [`scripts/baseline_v3_four_arm.py`](scripts/baseline_v3_four_arm.py)
+- [`scripts/baseline_v3_5_forward_live_capture.py`](scripts/baseline_v3_5_forward_live_capture.py)
+- [`gotra/judge_agent/outcome_feedback.py`](gotra/judge_agent/outcome_feedback.py)
+- [`gotra/judge_agent/temporal_replay.py`](gotra/judge_agent/temporal_replay.py)
+- [`tests/test_baseline_v3_four_arm.py`](tests/test_baseline_v3_four_arm.py)
+- [`tests/test_forward_live_capture.py`](tests/test_forward_live_capture.py)
+- [`tests/test_judge_agent.py`](tests/test_judge_agent.py)
+- [`tests/test_outcome_feedback.py`](tests/test_outcome_feedback.py)
+- [`tests/test_judge_temporal_replay.py`](tests/test_judge_temporal_replay.py)
+
+## 合规与使用警示
+
+GOTRA 仅用于研究和信息整理。它不提供投资建议、组合管理、交易执行，也不构成对任何证券的买入、卖出或持有建议。用户对自己的决策负责。任何结果都可能错误、不完整、结论不足、过时，或受数据、provider、模型和实验设计限制影响。
 
 ## License
 
