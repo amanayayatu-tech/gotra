@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ import time
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from statistics import mean, median
 from typing import Any, Literal, Protocol
 
 import pandas as pd
@@ -40,7 +42,7 @@ from gotra.backtest.statistics import summarize_steps
 
 
 Arm = Literal["baseline", "alaya"]
-ProviderName = Literal["heuristic", "codex_cli"]
+ProviderName = Literal["heuristic", "codex_cli", "codex_responses", "kimi"]
 RunMode = Literal["sampled", "full"]
 LedgerBackend = Literal["json", "sqlite"]
 ParallelMode = Literal["off", "baseline", "ticker-chains", "both"]
@@ -55,9 +57,9 @@ prompt, or live market data. Treat the prompt as a compact F/W/G + Chairman work
 - G partner: identify governance and risk implications from the provided price history only.
 - Chairman: reconcile F/W/G into one 30-day expected price-change decision.
 
-Both experimental arms share this exact skeleton. The only stateful signal is the feedback array:
-empty feedback means no cognitive-compounding state; non-empty feedback means only matured prior
-outcomes whose availability date is not after the decision date.
+Both experimental arms share this exact skeleton. The only stateful signal is the
+cognitive_compounding_state object: empty cards mean no state; non-empty cards and confidence
+adaptation mean only matured prior outcomes whose availability date is not after the decision date.
 
 Return strict JSON only, with exactly these keys:
 {"direction": "long|short|watch|avoid", "expected_change_pct": number, "confidence": number,
@@ -91,6 +93,8 @@ class BacktestConfig:
     provider_concurrency: int = 1
     parallel_mode: ParallelMode = "off"
     resume: bool = False
+    codex_responses_samples: int | None = None
+    codex_responses_sample_concurrency: int | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +107,19 @@ class Decision:
     estimated_tokens: int
     token_usage_source: str
     cache_hit: bool
+    denoising: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class ProviderSample:
+    sample_index: int
+    direction: str
+    expected_change_pct: float
+    confidence: float
+    reasoning: str
+    billed_tokens: int
+    token_usage_source: str
+    attempts: int
 
 
 class CompletionClient(Protocol):
@@ -265,7 +282,7 @@ class HeuristicDecisionProvider:
 
 
 class CodexDecisionProvider:
-    """gpt-5.5/xhigh provider through the hardened Codex CLI client."""
+    """Shared JSON decision provider wrapper for completion clients."""
 
     network_enabled = False
 
@@ -274,9 +291,44 @@ class CodexDecisionProvider:
         *,
         client: CompletionClient | None = None,
         max_retries: int = 2,
+        provider_name: ProviderName = "codex_cli",
+        sample_count: int | None = None,
+        sample_concurrency: int | None = None,
     ) -> None:
         self.client = client
         self.max_retries = max_retries
+        self.provider_name = provider_name
+        self.sample_count = (
+            _resolve_codex_responses_sample_count(sample_count)
+            if _uses_median_denoising(provider_name)
+            else 1
+        )
+        self.sample_concurrency = _resolve_codex_responses_sample_concurrency(
+            sample_count=self.sample_count,
+            explicit=sample_concurrency,
+            provider_concurrency=self.sample_count,
+            parallel_steps_enabled=False,
+        )
+
+    def configure_denoising(
+        self,
+        *,
+        sample_count: int | None,
+        sample_concurrency: int | None,
+        provider_concurrency: int,
+        parallel_steps_enabled: bool,
+    ) -> None:
+        if not _uses_median_denoising(self.provider_name):
+            self.sample_count = 1
+            self.sample_concurrency = 1
+            return
+        self.sample_count = _resolve_codex_responses_sample_count(sample_count)
+        self.sample_concurrency = _resolve_codex_responses_sample_concurrency(
+            sample_count=self.sample_count,
+            explicit=sample_concurrency,
+            provider_concurrency=provider_concurrency,
+            parallel_steps_enabled=parallel_steps_enabled,
+        )
 
     def preflight(self) -> None:
         """Verify the Codex provider path before the expensive walk-forward loop."""
@@ -291,7 +343,7 @@ class CodexDecisionProvider:
         text, _provider_tokens = _completion_text_and_usage(completion)
         payload = json.loads(text)
         if payload != {"ok": True}:
-            raise ProviderError(f"codex_cli preflight returned unexpected payload: {text}")
+            raise ProviderError(f"{self.provider_name} preflight returned unexpected payload: {text}")
 
     def decide(
         self,
@@ -313,8 +365,8 @@ class CodexDecisionProvider:
         prompt = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True, indent=2)
         prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         cache_key = (
-            f"{ticker}:{decision_date.isoformat()}:{arm}:codex_cli:"
-            f"{FULL_PROMPT_VERSION}:{prompt_hash}"
+            f"{ticker}:{decision_date.isoformat()}:{arm}:{self.provider_name}:"
+            f"{_codex_cache_prompt_version(self.provider_name, self.sample_count)}:{prompt_hash}"
         )
         cached = cache.get(cache_key)
         token_estimate = estimate_tokens(BT_CODEX_SYSTEM_PROMPT + "\n" + prompt)
@@ -329,64 +381,197 @@ class CodexDecisionProvider:
                 estimated_tokens=int(cached.get("estimated_tokens", token_estimate)),
                 token_usage_source=str(cached.get("token_usage_source", "estimated")),
                 cache_hit=True,
+                denoising=_cached_denoising(cached),
             )
 
-        budget.preflight(estimated_tokens=token_estimate)
+        budget.preflight(estimated_tokens=token_estimate * self.sample_count)
         last_error = ""
-        for _attempt in range(self.max_retries + 1):
-            try:
-                completion = self._client().complete(
-                    system_prompt=BT_CODEX_SYSTEM_PROMPT,
-                    user_prompt=prompt,
-                    max_tokens=700,
-                    timeout_seconds=240,
-                    temperature=0.0,
+        try:
+            if self.sample_count == 1:
+                decision_payload, billed_tokens, token_usage_source, denoising = (
+                    self._complete_single_decision(
+                        prompt=prompt,
+                        token_estimate=token_estimate,
+                    )
                 )
-                text, provider_tokens = _completion_text_and_usage(completion)
-                decision_payload = _parse_decision_json(text)
-                billed_tokens = provider_tokens if provider_tokens is not None else token_estimate
-                token_usage_source = "provider_usage" if provider_tokens is not None else "estimated"
-                budget.charge(
-                    cache_key=cache_key,
-                    estimated_tokens=billed_tokens,
-                    cache_hit=False,
-                    allow_overage=True,
+            else:
+                decision_payload, billed_tokens, token_usage_source, denoising = (
+                    self._complete_median_denoised_decision(
+                        prompt=prompt,
+                        token_estimate=token_estimate,
+                    )
                 )
-                cache.set(
-                    cache_key,
-                    {
-                        "direction": decision_payload["direction"],
-                        "expected_change_pct": decision_payload["expected_change_pct"],
-                        "confidence": decision_payload["confidence"],
-                        "reasoning": decision_payload["reasoning"],
-                        "estimated_tokens": billed_tokens,
-                        "token_usage_source": token_usage_source,
-                    },
-                )
-                return Decision(
-                    direction=str(decision_payload["direction"]),
-                    expected_change_pct=float(decision_payload["expected_change_pct"]),
-                    confidence=float(decision_payload["confidence"]),
-                    reasoning=str(decision_payload["reasoning"]),
-                    prompt_hash=prompt_hash,
-                    estimated_tokens=billed_tokens,
-                    token_usage_source=token_usage_source,
-                    cache_hit=False,
-                )
-            except BudgetExceeded:
-                raise
-            except Exception as exc:  # noqa: BLE001 - provider output is untrusted by design.
-                last_error = str(exc)
+            budget.charge(
+                cache_key=cache_key,
+                estimated_tokens=billed_tokens,
+                cache_hit=False,
+                allow_overage=True,
+            )
+            cache.set(
+                cache_key,
+                {
+                    "direction": decision_payload["direction"],
+                    "expected_change_pct": decision_payload["expected_change_pct"],
+                    "confidence": decision_payload["confidence"],
+                    "reasoning": decision_payload["reasoning"],
+                    "estimated_tokens": billed_tokens,
+                    "token_usage_source": token_usage_source,
+                    "denoising": denoising,
+                },
+            )
+            return Decision(
+                direction=str(decision_payload["direction"]),
+                expected_change_pct=float(decision_payload["expected_change_pct"]),
+                confidence=float(decision_payload["confidence"]),
+                reasoning=str(decision_payload["reasoning"]),
+                prompt_hash=prompt_hash,
+                estimated_tokens=billed_tokens,
+                token_usage_source=token_usage_source,
+                cache_hit=False,
+                denoising=denoising,
+            )
+        except BudgetExceeded:
+            raise
+        except Exception as exc:  # noqa: BLE001 - provider output is untrusted by design.
+            last_error = str(exc)
         raise ProviderError(
-            f"codex_cli provider failed after {self.max_retries + 1} attempts: {last_error}",
+            f"{self.provider_name} provider failed after {self.max_retries + 1} attempts: {last_error}",
             prompt_hash=prompt_hash,
-            estimated_tokens=token_estimate,
+            estimated_tokens=token_estimate * self.sample_count,
         )
 
     def _client(self) -> CompletionClient:
         if self.client is None:
             self.client = _build_default_codex_client()
         return self.client
+
+    def _complete_single_decision(
+        self,
+        *,
+        prompt: str,
+        token_estimate: int,
+    ) -> tuple[dict[str, Any], int, str, dict[str, Any] | None]:
+        last_error = ""
+        for _attempt in range(self.max_retries + 1):
+            try:
+                sample = self._complete_one_sample(
+                    prompt=prompt,
+                    token_estimate=token_estimate,
+                    sample_index=1,
+                    attempts=1,
+                )
+                return (
+                    {
+                        "direction": sample.direction,
+                        "expected_change_pct": sample.expected_change_pct,
+                        "confidence": sample.confidence,
+                        "reasoning": sample.reasoning,
+                    },
+                    sample.billed_tokens,
+                    sample.token_usage_source,
+                    None,
+                )
+            except Exception as exc:  # noqa: BLE001 - provider output is untrusted by design.
+                last_error = str(exc)
+        raise RuntimeError(last_error)
+
+    def _complete_median_denoised_decision(
+        self,
+        *,
+        prompt: str,
+        token_estimate: int,
+    ) -> tuple[dict[str, Any], int, str, dict[str, Any]]:
+        samples = self._complete_denoising_samples(
+            prompt=prompt,
+            token_estimate=token_estimate,
+        )
+        return _aggregate_denoising_samples(
+            samples=samples,
+            sample_count=self.sample_count,
+            sample_concurrency=self.sample_concurrency,
+            provider_name=self.provider_name,
+        )
+
+    def _complete_denoising_samples(
+        self,
+        *,
+        prompt: str,
+        token_estimate: int,
+    ) -> list[ProviderSample]:
+        sample_indexes = list(range(1, self.sample_count + 1))
+        if self.sample_concurrency <= 1:
+            return [
+                self._complete_one_sample_with_retry(
+                    prompt=prompt,
+                    token_estimate=token_estimate,
+                    sample_index=sample_index,
+                )
+                for sample_index in sample_indexes
+            ]
+
+        samples: list[ProviderSample] = []
+        with ThreadPoolExecutor(max_workers=self.sample_concurrency) as executor:
+            futures = {
+                executor.submit(
+                    self._complete_one_sample_with_retry,
+                    prompt=prompt,
+                    token_estimate=token_estimate,
+                    sample_index=sample_index,
+                ): sample_index
+                for sample_index in sample_indexes
+            }
+            for future in as_completed(futures):
+                samples.append(future.result())
+        return sorted(samples, key=lambda sample: sample.sample_index)
+
+    def _complete_one_sample_with_retry(
+        self,
+        *,
+        prompt: str,
+        token_estimate: int,
+        sample_index: int,
+    ) -> ProviderSample:
+        last_error = ""
+        for attempt in range(1, 3):
+            try:
+                return self._complete_one_sample(
+                    prompt=prompt,
+                    token_estimate=token_estimate,
+                    sample_index=sample_index,
+                    attempts=attempt,
+                )
+            except Exception as exc:  # noqa: BLE001 - provider output is untrusted by design.
+                last_error = str(exc)
+        raise RuntimeError(f"sample {sample_index} failed after retry: {last_error}")
+
+    def _complete_one_sample(
+        self,
+        *,
+        prompt: str,
+        token_estimate: int,
+        sample_index: int,
+        attempts: int,
+    ) -> ProviderSample:
+        completion = self._client().complete(
+            system_prompt=BT_CODEX_SYSTEM_PROMPT,
+            user_prompt=prompt,
+            max_tokens=700,
+            timeout_seconds=240,
+            temperature=0.0,
+        )
+        text, provider_tokens = _completion_text_and_usage(completion)
+        decision_payload = _parse_decision_json(text)
+        billed_tokens = provider_tokens if provider_tokens is not None else token_estimate
+        return ProviderSample(
+            sample_index=sample_index,
+            direction=str(decision_payload["direction"]),
+            expected_change_pct=float(decision_payload["expected_change_pct"]),
+            confidence=float(decision_payload["confidence"]),
+            reasoning=str(decision_payload["reasoning"]),
+            billed_tokens=billed_tokens,
+            token_usage_source="provider_usage" if provider_tokens is not None else "estimated",
+            attempts=attempts,
+        )
 
 
 class CodexCliUsageClient:
@@ -573,7 +758,7 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
         "run_id": run_id,
         "mode": config.mode,
         "provider": config.provider,
-        "provider_metadata": _provider_metadata(config.provider),
+        "provider_metadata": _provider_metadata(config.provider, config=config),
         "provider_determinism": provider_determinism,
         "provider_determinism_error": provider_determinism_error,
         "require_stage3_provider": config.require_stage3_provider,
@@ -667,9 +852,20 @@ def _provider_for_run(
     ledger: SQLiteLedger | None,
 ) -> DecisionProvider:
     provider = _build_provider(config.provider)
+    _configure_provider_for_run(provider=provider, config=config)
     if ledger is None:
         return provider
     return _LedgerProvider(provider=provider, ledger=ledger)
+
+
+def _configure_provider_for_run(*, provider: DecisionProvider, config: BacktestConfig) -> None:
+    if isinstance(provider, CodexDecisionProvider):
+        provider.configure_denoising(
+            sample_count=config.codex_responses_samples,
+            sample_concurrency=config.codex_responses_sample_concurrency,
+            provider_concurrency=config.provider_concurrency,
+            parallel_steps_enabled=_parallel_enabled(config),
+        )
 
 
 class _LedgerProvider:
@@ -934,8 +1130,16 @@ def _resume_ticker_steps(
                     "decision_date": step["decision_date"],
                     "outcome_availability_date": step["outcome_as_of"],
                     "error": step["error"],
+                    "mse": step["mse"],
                     "actual_change_pct": step["actual_change_pct"],
                     "expected_change_pct": step["expected_change_pct"],
+                    "decision_direction": step["decision_direction"],
+                    "actual_direction": _direction_from_change(float(step["actual_change_pct"])),
+                    "direction_hit": step["decision_direction"]
+                    == _direction_from_change(float(step["actual_change_pct"])),
+                    "style_window": step.get("style_window"),
+                    "vote_consistency": _step_vote_consistency(step),
+                    "denoising_sample_count": _step_denoising_sample_count(step),
                 }
             )
     return steps
@@ -980,7 +1184,21 @@ def _build_provider(name: ProviderName) -> DecisionProvider:
     if name == "heuristic":
         return HeuristicDecisionProvider()
     if name == "codex_cli":
-        return CodexDecisionProvider()
+        return CodexDecisionProvider(provider_name="codex_cli")
+    if name == "codex_responses":
+        from gotra.backtest.codex_responses_client import CodexResponsesCompletionClient
+
+        return CodexDecisionProvider(
+            client=CodexResponsesCompletionClient(),
+            provider_name="codex_responses",
+        )
+    if name == "kimi":
+        from gotra.backtest.kimi_client import KimiCompletionClient
+
+        return CodexDecisionProvider(
+            client=KimiCompletionClient(),
+            provider_name="kimi",
+        )
     raise ValueError(f"unsupported BT provider: {name}")
 
 
@@ -1045,7 +1263,7 @@ def _provider_health_initial_state(
 ) -> dict[str, Any]:
     enough_budget_for_preflight = budget.max_tokens is None or budget.max_tokens >= 50_000
     preflight_enabled = (
-        config.provider == "codex_cli"
+        config.provider in {"codex_cli", "codex_responses", "kimi"}
         and config.provider_preflight
         and enough_budget_for_preflight
         and hasattr(provider, "preflight")
@@ -1067,7 +1285,7 @@ def _provider_abort_reason(
     steps: list[dict[str, Any]],
     consecutive_provider_errors: int,
 ) -> str:
-    if config.provider != "codex_cli":
+    if config.provider not in {"codex_cli", "codex_responses", "kimi"}:
         return ""
     if (
         config.provider_error_abort_consecutive > 0
@@ -1129,11 +1347,10 @@ def _run_ticker_step(
         return []
 
     steps: list[dict[str, Any]] = []
-    matured_feedback = [
-        item
-        for item in feedback_by_ticker.get(ticker.symbol, [])
-        if parse_date(item["outcome_availability_date"]) <= decision_date
-    ]
+    matured_feedback = _matured_feedback_for_decision(
+        feedback_by_ticker.get(ticker.symbol, []),
+        decision_date=decision_date,
+    )
     for arm in config.arms:
         actual_change = _change_pct(float(start_row["adj_close"]), float(end_row["adj_close"]))
         try:
@@ -1220,8 +1437,15 @@ def _run_ticker_step(
                     "decision_date": decision_date.isoformat(),
                     "outcome_availability_date": step["outcome_as_of"],
                     "error": error,
+                    "mse": mse,
                     "actual_change_pct": actual_change,
                     "expected_change_pct": decision.expected_change_pct,
+                    "decision_direction": decision.direction,
+                    "actual_direction": _direction_from_change(actual_change),
+                    "direction_hit": decision.direction == _direction_from_change(actual_change),
+                    "style_window": style_window_for(decision_date),
+                    "vote_consistency": _decision_vote_consistency(decision),
+                    "denoising_sample_count": _decision_denoising_sample_count(decision),
                 }
             )
         if budget.over_budget_error:
@@ -1273,8 +1497,9 @@ def _build_step(
         "cache_hit": decision.cache_hit,
         "cache_namespace": config.cache_namespace,
         "provider": config.provider,
-        "provider_metadata": _provider_metadata(config.provider),
+        "provider_metadata": _provider_metadata(config.provider, config=config),
         "provider_network_enabled": provider.network_enabled,
+        "denoising": decision.denoising,
         "style_window": style_window_for(decision_date),
         "decision_inputs": _decision_inputs(decision_slice, feedback),
         "outcome_inputs": _outcome_inputs(end_row),
@@ -1329,8 +1554,9 @@ def _build_provider_error_step(
         "cache_hit": False,
         "cache_namespace": config.cache_namespace,
         "provider": config.provider,
-        "provider_metadata": _provider_metadata(config.provider),
+        "provider_metadata": _provider_metadata(config.provider, config=config),
         "provider_network_enabled": provider.network_enabled,
+        "denoising": None,
         "provider_error": error_message,
         "style_window": style_window_for(decision_date),
         "decision_inputs": _decision_inputs(decision_slice, feedback),
@@ -1354,6 +1580,17 @@ def _decision_inputs(
             "rows": int(len(decision_slice)),
         }
     ]
+    if feedback:
+        latest_card_availability = max(str(item["outcome_availability_date"]) for item in feedback)
+        decision_inputs.append(
+            {
+                "name": "cognitive_compounding_knowledge_card",
+                "kind": "alaya_knowledge_card",
+                "source": "matured_prior_step_outcomes",
+                "availability_date": latest_card_availability,
+                "matured_samples": len(feedback),
+            }
+        )
     for index, item in enumerate(feedback):
         decision_inputs.append(
             {
@@ -1377,9 +1614,63 @@ def _outcome_inputs(end_row: pd.Series) -> list[dict[str, Any]]:
     ]
 
 
-def _provider_metadata(provider: ProviderName) -> dict[str, Any]:
-    if provider != "codex_cli":
+def _provider_metadata(provider: ProviderName, *, config: BacktestConfig | None = None) -> dict[str, Any]:
+    if provider == "heuristic":
         return {}
+    if provider == "codex_responses":
+        from gotra.backtest.codex_responses_client import DEFAULT_CODEX_RESPONSES_BASE_URL
+
+        sample_count = _resolve_codex_responses_sample_count(
+            config.codex_responses_samples if config is not None else None
+        )
+        sample_concurrency = _resolve_codex_responses_sample_concurrency(
+            sample_count=sample_count,
+            explicit=config.codex_responses_sample_concurrency if config is not None else None,
+            provider_concurrency=config.provider_concurrency if config is not None else sample_count,
+            parallel_steps_enabled=_parallel_enabled(config) if config is not None else False,
+        )
+        return {
+            "model": os.getenv("JUDGE_LLM_MODEL") or os.getenv("LLM_MODEL") or "gpt-5.5",
+            "reasoning_effort": os.getenv("CODEX_PROVIDER_REASONING_EFFORT")
+            or os.getenv("JUDGE_CODEX_REASONING_EFFORT")
+            or "xhigh",
+            "transport": "codex_responses",
+            "base_url": os.getenv("CODEX_RESPONSES_BASE_URL") or DEFAULT_CODEX_RESPONSES_BASE_URL,
+            "auth_source": os.getenv("CODEX_AUTH_JSON") or "~/.codex/auth.json",
+            "denoising": {
+                "method": "median_expected_change_pct",
+                "sample_count": sample_count,
+                "sample_concurrency": sample_concurrency,
+                "single_sample_retry": 1,
+                "vote_consistency": "modal_direction_fraction",
+            },
+        }
+    if provider == "kimi":
+        from gotra.backtest.kimi_client import DEFAULT_KIMI_MODEL, DEFAULT_SOPHNET_BASE_URL
+
+        sample_count = _resolve_codex_responses_sample_count(
+            config.codex_responses_samples if config is not None else None
+        )
+        sample_concurrency = _resolve_codex_responses_sample_concurrency(
+            sample_count=sample_count,
+            explicit=config.codex_responses_sample_concurrency if config is not None else None,
+            provider_concurrency=config.provider_concurrency if config is not None else sample_count,
+            parallel_steps_enabled=_parallel_enabled(config) if config is not None else False,
+        )
+        return {
+            "model": DEFAULT_KIMI_MODEL,
+            "transport": "sophnet_chat_completions",
+            "base_url": DEFAULT_SOPHNET_BASE_URL,
+            "auth_source": "SOPHNET_API_KEY",
+            "temperature": 0.0,
+            "denoising": {
+                "method": "median_expected_change_pct",
+                "sample_count": sample_count,
+                "sample_concurrency": sample_concurrency,
+                "single_sample_retry": 1,
+                "vote_consistency": "modal_direction_fraction",
+            },
+        }
     return {
         "model": os.getenv("JUDGE_LLM_MODEL") or os.getenv("LLM_MODEL") or "gpt-5.5",
         "reasoning_effort": os.getenv("CODEX_PROVIDER_REASONING_EFFORT")
@@ -1421,6 +1712,55 @@ def _provider_determinism_metadata(
                 "or seed controls for preregistered baseline replay acceptance"
             ),
         }
+    if provider == "codex_responses":
+        measured_repro_ok = _env_flag("CODEX_RESPONSES_MEASURED_REPRO_OK")
+        blocking_reason = (
+            ""
+            if measured_repro_ok
+            else (
+                "codex_responses (ChatGPT OAuth) does not accept temperature; "
+                "sampling is uncontrolled. Stage 3 eligibility depends on an "
+                "empirically measured direction-agreement rate >=95%, not on "
+                "temperature control."
+            )
+        )
+        return {
+            "provider": provider,
+            "required_for_stage3": require_stage3_provider,
+            "stage3_acceptance_eligible": measured_repro_ok,
+            "temperature_control": "unsupported",
+            "top_p_control": False,
+            "seed_control": False,
+            "acceptance_metric": "direction_agreement>=0.95",
+            "acceptance_basis": "empirically_measured_direction_agreement",
+            "measured_repro_flag": "CODEX_RESPONSES_MEASURED_REPRO_OK",
+            "bit_level_reproducible": False,
+            "blocking_reason": blocking_reason,
+        }
+    if provider == "kimi":
+        measured_repro_ok = _env_flag("KIMI_MEASURED_REPRO_OK")
+        blocking_reason = (
+            ""
+            if measured_repro_ok
+            else (
+                "kimi exposes temperature=0 through SophNet, but Stage 3 eligibility still "
+                "depends on an empirically measured direction-agreement rate >=95% under a "
+                "preregistered replay. Stage 7 smoke evidence is provider/plumbing only."
+            )
+        )
+        return {
+            "provider": provider,
+            "required_for_stage3": require_stage3_provider,
+            "stage3_acceptance_eligible": measured_repro_ok,
+            "temperature_control": "supported_zero",
+            "top_p_control": False,
+            "seed_control": False,
+            "acceptance_metric": "direction_agreement>=0.95",
+            "acceptance_basis": "empirically_measured_direction_agreement",
+            "measured_repro_flag": "KIMI_MEASURED_REPRO_OK",
+            "bit_level_reproducible": False,
+            "blocking_reason": blocking_reason,
+        }
     raise ValueError(f"unsupported BT provider: {provider}")
 
 
@@ -1430,6 +1770,95 @@ def _provider_determinism_error(provider_determinism: dict[str, Any]) -> str:
     if provider_determinism.get("stage3_acceptance_eligible") is True:
         return ""
     return str(provider_determinism.get("blocking_reason") or "provider is not Stage 3 eligible")
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_codex_responses_sample_count(explicit: int | None = None) -> int:
+    if explicit is not None:
+        return _positive_int(explicit, name="codex_responses_samples")
+    value = os.getenv("BT_CODEX_RESPONSES_SAMPLES") or os.getenv("CODEX_RESPONSES_SAMPLES")
+    if value:
+        return _positive_int(value, name="CODEX_RESPONSES_SAMPLES")
+    return 5
+
+
+def _resolve_codex_responses_sample_concurrency(
+    *,
+    sample_count: int,
+    explicit: int | None,
+    provider_concurrency: int,
+    parallel_steps_enabled: bool,
+) -> int:
+    if sample_count <= 1:
+        return 1
+    if explicit is not None:
+        return min(sample_count, _positive_int(explicit, name="codex_responses_sample_concurrency"))
+    value = os.getenv("BT_CODEX_RESPONSES_SAMPLE_CONCURRENCY") or os.getenv(
+        "CODEX_RESPONSES_SAMPLE_CONCURRENCY"
+    )
+    if value:
+        return min(sample_count, _positive_int(value, name="CODEX_RESPONSES_SAMPLE_CONCURRENCY"))
+    if parallel_steps_enabled:
+        return 1
+    return min(sample_count, max(1, int(provider_concurrency)))
+
+
+def _positive_int(value: int | str, *, name: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if parsed < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return parsed
+
+
+def _uses_median_denoising(provider_name: ProviderName) -> bool:
+    return provider_name in {"codex_responses", "kimi"}
+
+
+def _codex_cache_prompt_version(provider_name: ProviderName, sample_count: int) -> str:
+    if not _uses_median_denoising(provider_name):
+        return FULL_PROMPT_VERSION
+    return f"{FULL_PROMPT_VERSION}:median-n{sample_count}"
+
+
+def _cached_denoising(cached: dict[str, Any]) -> dict[str, Any] | None:
+    denoising = cached.get("denoising")
+    return dict(denoising) if isinstance(denoising, dict) else None
+
+
+def _decision_vote_consistency(decision: Decision) -> float | None:
+    if not decision.denoising:
+        return None
+    value = decision.denoising.get("vote_consistency")
+    return float(value) if value is not None else None
+
+
+def _decision_denoising_sample_count(decision: Decision) -> int | None:
+    if not decision.denoising:
+        return None
+    value = decision.denoising.get("sample_count")
+    return int(value) if value is not None else None
+
+
+def _step_vote_consistency(step: dict[str, Any]) -> float | None:
+    denoising = step.get("denoising")
+    if not isinstance(denoising, dict):
+        return None
+    value = denoising.get("vote_consistency")
+    return float(value) if value is not None else None
+
+
+def _step_denoising_sample_count(step: dict[str, Any]) -> int | None:
+    denoising = step.get("denoising")
+    if not isinstance(denoising, dict):
+        return None
+    value = denoising.get("sample_count")
+    return int(value) if value is not None else None
 
 
 def _write_step(run_root: Path, step: dict[str, Any]) -> None:
@@ -1480,6 +1909,11 @@ def _build_codex_prompt_payload(
     feedback: list[dict[str, Any]],
 ) -> dict[str, Any]:
     latest_row = price_rows.iloc[-1]
+    cognitive_state = _build_cognitive_compounding_state(
+        ticker=ticker,
+        decision_date=decision_date,
+        feedback=feedback,
+    )
     return {
         "schema": "gotra.bt.decision_prompt.v1",
         "version": FULL_PROMPT_VERSION,
@@ -1505,7 +1939,7 @@ def _build_codex_prompt_payload(
             "features": _price_features(price_rows),
             "recent_adjusted_close": _compact_price_rows(price_rows),
         },
-        "feedback": feedback,
+        "cognitive_compounding_state": cognitive_state,
         "output_contract": {
             "direction": "long|short|watch|avoid",
             "expected_change_pct": "number",
@@ -1524,6 +1958,303 @@ def _compact_price_rows(rows: pd.DataFrame, *, max_rows: int = 64) -> list[dict[
         }
         for row in compact.to_dict("records")
     ]
+
+
+def _build_cognitive_compounding_state(
+    *,
+    ticker: str,
+    decision_date: date,
+    feedback: list[dict[str, Any]],
+) -> dict[str, Any]:
+    matured_feedback = _matured_feedback_for_decision(feedback, decision_date=decision_date)
+    cards = _build_knowledge_cards(
+        ticker=ticker,
+        decision_date=decision_date,
+        feedback=matured_feedback,
+    )
+    state = {
+        "knowledge_cards": cards,
+        "confidence_adaptation": _build_confidence_adaptation(cards),
+    }
+    denoising_context = _build_denoising_confidence_context(matured_feedback)
+    if denoising_context is not None:
+        state["denoising_confidence_context"] = denoising_context
+    return state
+
+
+def _matured_feedback_for_decision(
+    feedback: list[dict[str, Any]],
+    *,
+    decision_date: date,
+) -> list[dict[str, Any]]:
+    matured: list[dict[str, Any]] = []
+    for item in feedback:
+        availability = item.get("outcome_availability_date")
+        if not availability:
+            continue
+        if parse_date(str(availability)) <= decision_date:
+            matured.append(dict(item))
+    return sorted(
+        matured,
+        key=lambda item: (
+            str(item.get("decision_date") or ""),
+            str(item.get("outcome_availability_date") or ""),
+        ),
+    )
+
+
+def _build_knowledge_cards(
+    *,
+    ticker: str,
+    decision_date: date,
+    feedback: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    matured_feedback = _matured_feedback_for_decision(feedback, decision_date=decision_date)
+    if not matured_feedback:
+        return []
+
+    abs_errors = [
+        abs(float(item["error"]))
+        for item in matured_feedback
+        if item.get("error") is not None
+    ]
+    errors = [
+        float(item["error"])
+        for item in matured_feedback
+        if item.get("error") is not None
+    ]
+    direction_hits = [
+        hit
+        for item in matured_feedback
+        if (hit := _direction_hit(item)) is not None
+    ]
+    recent_feedback = matured_feedback[-6:]
+    recent_hits = [
+        hit
+        for item in recent_feedback
+        if (hit := _direction_hit(item)) is not None
+    ]
+    latest_availability = max(str(item["outcome_availability_date"]) for item in matured_feedback)
+    return [
+        {
+            "kind": "ticker_cognitive_compounding_card",
+            "ticker": ticker,
+            "as_of_decision_date": decision_date.isoformat(),
+            "latest_outcome_availability_date": latest_availability,
+            "matured_samples": len(matured_feedback),
+            "recent_window_samples": len(recent_feedback),
+            "direction_hit_rate": _rate(direction_hits),
+            "recent_direction_hit_rate": _rate(recent_hits),
+            "typical_abs_error_pct": _rounded(median(abs_errors)) if abs_errors else None,
+            "mean_error_bias_pct": _rounded(mean(errors)) if errors else None,
+            "style_window_performance": _style_window_performance(matured_feedback),
+        }
+    ]
+
+
+def _build_confidence_adaptation(cards: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not cards:
+        return None
+    card = cards[0]
+    recent_hit_rate = card.get("recent_direction_hit_rate")
+    hit_rate = recent_hit_rate if recent_hit_rate is not None else card.get("direction_hit_rate")
+    typical_abs_error = card.get("typical_abs_error_pct")
+    if hit_rate is None:
+        mode = "neutral"
+        expected_change_guidance = "No direction-hit history is available; keep confidence conservative."
+    elif float(hit_rate) < 0.45 or (typical_abs_error is not None and float(typical_abs_error) >= 8.0):
+        mode = "shrink_expected_change"
+        expected_change_guidance = (
+            "Prior direction hit rate or error profile is weak; shrink absolute expected_change_pct "
+            "toward zero unless current price evidence is unusually strong."
+        )
+    elif float(hit_rate) >= 0.65 and (typical_abs_error is None or float(typical_abs_error) <= 5.0):
+        mode = "allow_historical_confidence"
+        expected_change_guidance = (
+            "Prior direction hit rate and error profile are acceptable; use normal confidence, "
+            "still bounded by current price evidence."
+        )
+    else:
+        mode = "neutral"
+        expected_change_guidance = (
+            "Prior evidence is mixed; avoid increasing absolute expected_change_pct from history alone."
+        )
+    return {
+        "policy": "historical_accuracy_calibration",
+        "mode": mode,
+        "basis": {
+            "recent_direction_hit_rate": recent_hit_rate,
+            "direction_hit_rate": card.get("direction_hit_rate"),
+            "typical_abs_error_pct": typical_abs_error,
+            "matured_samples": card.get("matured_samples"),
+        },
+        "expected_change_guidance": expected_change_guidance,
+    }
+
+
+def _build_denoising_confidence_context(
+    feedback: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    vote_values = [
+        float(item["vote_consistency"])
+        for item in feedback
+        if item.get("vote_consistency") is not None
+    ]
+    sample_counts = [
+        int(item["denoising_sample_count"])
+        for item in feedback
+        if item.get("denoising_sample_count") is not None
+    ]
+    if not vote_values:
+        return None
+    recent_values = vote_values[-6:]
+    return {
+        "policy": "median_denoising_vote_consistency",
+        "matured_samples": len(vote_values),
+        "recent_window_samples": len(recent_values),
+        "recent_mean_vote_consistency": _rounded(mean(recent_values)),
+        "min_vote_consistency": _rounded(min(vote_values)),
+        "max_vote_consistency": _rounded(max(vote_values)),
+        "sample_count": max(sample_counts) if sample_counts else None,
+        "guidance": (
+            "Use lower vote consistency as uncertainty context for confidence calibration only; "
+            "do not alter the shared median aggregation rule."
+        ),
+    }
+
+
+def _style_window_performance(feedback: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in feedback:
+        window = str(item.get("style_window") or "unclassified")
+        grouped.setdefault(window, []).append(item)
+
+    performance: list[dict[str, Any]] = []
+    for window, items in sorted(grouped.items()):
+        abs_errors = [
+            abs(float(item["error"]))
+            for item in items
+            if item.get("error") is not None
+        ]
+        mses = [
+            float(item["mse"])
+            for item in items
+            if item.get("mse") is not None
+        ]
+        hits = [
+            hit
+            for item in items
+            if (hit := _direction_hit(item)) is not None
+        ]
+        performance.append(
+            {
+                "style_window": window,
+                "samples": len(items),
+                "direction_hit_rate": _rate(hits),
+                "mean_abs_error_pct": _rounded(mean(abs_errors)) if abs_errors else None,
+                "mean_mse": _rounded(mean(mses)) if mses else None,
+            }
+        )
+    return performance
+
+
+def _aggregate_denoising_samples(
+    *,
+    samples: list[ProviderSample],
+    sample_count: int,
+    sample_concurrency: int,
+    provider_name: ProviderName,
+) -> tuple[dict[str, Any], int, str, dict[str, Any]]:
+    if len(samples) != sample_count:
+        raise ValueError(f"expected {sample_count} samples, got {len(samples)}")
+    expected_values = [sample.expected_change_pct for sample in samples]
+    median_expected = float(median(expected_values))
+    sample_directions = [_direction_from_expected_change(value) for value in expected_values]
+    vote_consistency = _vote_consistency(sample_directions)
+    representative = min(
+        samples,
+        key=lambda sample: (abs(sample.expected_change_pct - median_expected), sample.sample_index),
+    )
+    billed_tokens = sum(sample.billed_tokens for sample in samples)
+    token_usage_source = (
+        "provider_usage"
+        if all(sample.token_usage_source == "provider_usage" for sample in samples)
+        else "estimated"
+    )
+    denoising = {
+        "method": "median_expected_change_pct",
+        "sample_count": sample_count,
+        "successful_samples": len(samples),
+        "sample_concurrency": sample_concurrency,
+        "median_expected_change_pct": _rounded(median_expected),
+        "sample_expected_change_pcts": [_rounded(value) for value in expected_values],
+        "sample_directions": sample_directions,
+        "vote_consistency": vote_consistency,
+        "sample_attempts": [sample.attempts for sample in samples],
+        "representative_sample_index": representative.sample_index,
+    }
+    return (
+        {
+            "direction": _direction_from_expected_change(median_expected),
+            "expected_change_pct": _rounded(median_expected),
+            "confidence": _rounded(median([sample.confidence for sample in samples])),
+            "reasoning": (
+                f"median denoised {sample_count} {provider_name} samples; representative sample: "
+                f"{representative.reasoning}"
+            ),
+        },
+        billed_tokens,
+        token_usage_source,
+        denoising,
+    )
+
+
+def _direction_from_expected_change(expected_change_pct: float) -> str:
+    if expected_change_pct > 0:
+        return "long"
+    if expected_change_pct < 0:
+        return "avoid"
+    return "watch"
+
+
+def _vote_consistency(directions: list[str]) -> float:
+    if not directions:
+        raise ValueError("vote consistency requires at least one direction")
+    counts: dict[str, int] = {}
+    for direction in directions:
+        counts[direction] = counts.get(direction, 0) + 1
+    return _rounded(max(counts.values()) / len(directions))
+
+
+def _direction_hit(item: dict[str, Any]) -> bool | None:
+    actual_change = item.get("actual_change_pct")
+    if actual_change is None:
+        return None
+    actual_direction = _direction_from_change(float(actual_change))
+    predicted_direction = str(
+        item.get("decision_direction") or _direction_from_change(float(item.get("expected_change_pct") or 0.0))
+    )
+    if predicted_direction == "short":
+        predicted_direction = "avoid"
+    return predicted_direction == actual_direction
+
+
+def _direction_from_change(change_pct: float) -> str:
+    if change_pct >= 2.0:
+        return "long"
+    if change_pct <= -2.0:
+        return "avoid"
+    return "watch"
+
+
+def _rate(values: list[bool]) -> float | None:
+    if not values:
+        return None
+    return _rounded(sum(1 for value in values if value) / len(values))
+
+
+def _rounded(value: float) -> float:
+    return round(float(value), 6)
 
 
 def _completion_text_and_usage(completion: Any) -> tuple[str, int | None]:
@@ -1708,7 +2439,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--data-dir", default="data/backtest")
     parser.add_argument("--run-id", default="")
     parser.add_argument("--mode", choices=["sampled", "full"], default="sampled")
-    parser.add_argument("--provider", choices=["heuristic", "codex_cli"], default="heuristic")
+    parser.add_argument(
+        "--provider",
+        choices=["heuristic", "codex_cli", "codex_responses", "kimi"],
+        default="heuristic",
+    )
     parser.add_argument("--start", default=DEFAULT_START.isoformat())
     parser.add_argument("--end", default=DEFAULT_END.isoformat())
     parser.add_argument("--step-months", type=int, default=SAMPLED_STEP_MONTHS)
@@ -1733,6 +2468,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--parallel-mode",
         choices=["off", "baseline", "ticker-chains", "both"],
         default="off",
+    )
+    parser.add_argument(
+        "--codex-responses-samples",
+        type=int,
+        help="Number of independent codex_responses samples per decision. Defaults to 5.",
+    )
+    parser.add_argument(
+        "--codex-responses-sample-concurrency",
+        type=int,
+        help=(
+            "Maximum parallel samples inside one codex_responses decision. Defaults to provider "
+            "concurrency for serial runs and 1 for parallel step runs."
+        ),
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--no-provider-preflight", action="store_true")
@@ -1772,6 +2520,8 @@ def main(argv: list[str] | None = None) -> int:
             provider_concurrency=args.provider_concurrency,
             parallel_mode=args.parallel_mode,
             resume=args.resume,
+            codex_responses_samples=args.codex_responses_samples,
+            codex_responses_sample_concurrency=args.codex_responses_sample_concurrency,
         )
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))

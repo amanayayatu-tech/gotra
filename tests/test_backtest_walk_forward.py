@@ -6,6 +6,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from gotra.backtest.audit import audit_step
 from gotra.backtest.budget import TokenBudget
@@ -21,6 +22,7 @@ from gotra.backtest.walk_forward import (
     _last_agent_message_from_codex_jsonl,
     run_backtest,
 )
+from gotra.backtest.kimi_client import KimiCompletionClient
 import gotra.backtest.walk_forward as walk_forward
 
 
@@ -213,6 +215,185 @@ def test_codex_provider_records_actual_usage_overage_after_paid_call(tmp_path: P
     assert budget.snapshot()["over_budget"] is True
     assert "token budget exceeded" in str(budget.snapshot()["over_budget_error"]).lower()
     assert json.loads((tmp_path / "cache.json").read_text(encoding="utf-8"))
+
+
+def test_codex_responses_provider_median_denoises_odd_samples(tmp_path: Path) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.values = [10.0, -2.0, 4.0, 100.0, 6.0]
+            self.calls = 0
+
+        def complete(self, **_kwargs):
+            self.calls += 1
+            value = self.values.pop(0)
+            return {
+                "content": _decision_json(expected_change_pct=value),
+                "usage": {"total_tokens": 100 + self.calls},
+            }
+
+    client = FakeClient()
+    decision = CodexDecisionProvider(
+        client=client,
+        provider_name="codex_responses",
+        sample_count=5,
+        sample_concurrency=1,
+    ).decide(
+        ticker="AAPL",
+        arm="baseline",
+        decision_date=date(2020, 1, 1),
+        price_rows=_price_rows(start="2019-01-01", days=370),
+        feedback=[],
+        cache=DecisionCache(tmp_path / "cache.json"),
+        budget=TokenBudget(max_tokens=100_000),
+    )
+
+    assert client.calls == 5
+    assert decision.expected_change_pct == 6.0
+    assert decision.direction == "long"
+    assert decision.confidence == 0.5
+    assert decision.estimated_tokens == 515
+    assert decision.token_usage_source == "provider_usage"
+    assert decision.denoising is not None
+    assert decision.denoising["sample_count"] == 5
+    assert decision.denoising["sample_expected_change_pcts"] == [10.0, -2.0, 4.0, 100.0, 6.0]
+    assert decision.denoising["sample_directions"] == ["long", "avoid", "long", "long", "long"]
+    assert decision.denoising["vote_consistency"] == 0.8
+
+
+def test_codex_responses_provider_median_denoises_even_samples_and_extremes(
+    tmp_path: Path,
+) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.values = [-100.0, -1.0, 3.0, 100.0]
+
+        def complete(self, **_kwargs):
+            return _decision_json(expected_change_pct=self.values.pop(0), confidence=0.7)
+
+    decision = CodexDecisionProvider(
+        client=FakeClient(),
+        provider_name="codex_responses",
+        sample_count=4,
+        sample_concurrency=1,
+    ).decide(
+        ticker="MSFT",
+        arm="baseline",
+        decision_date=date(2020, 1, 1),
+        price_rows=_price_rows(start="2019-01-01", days=370),
+        feedback=[],
+        cache=DecisionCache(tmp_path / "cache.json"),
+        budget=TokenBudget(max_tokens=100_000),
+    )
+
+    assert decision.expected_change_pct == 1.0
+    assert decision.direction == "long"
+    assert decision.confidence == 0.7
+    assert decision.token_usage_source == "estimated"
+    assert decision.denoising is not None
+    assert decision.denoising["sample_directions"] == ["avoid", "avoid", "long", "long"]
+    assert decision.denoising["vote_consistency"] == 0.5
+
+
+def test_codex_responses_provider_retries_failed_single_sample(tmp_path: Path) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.values = [-4.0, 8.0, 10.0]
+
+        def complete(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("transient SSE failure")
+            return _decision_json(expected_change_pct=self.values.pop(0))
+
+    client = FakeClient()
+    decision = CodexDecisionProvider(
+        client=client,
+        provider_name="codex_responses",
+        sample_count=3,
+        sample_concurrency=1,
+    ).decide(
+        ticker="NVDA",
+        arm="baseline",
+        decision_date=date(2020, 1, 1),
+        price_rows=_price_rows(start="2019-01-01", days=370),
+        feedback=[],
+        cache=DecisionCache(tmp_path / "cache.json"),
+        budget=TokenBudget(max_tokens=100_000),
+    )
+
+    assert client.calls == 4
+    assert decision.expected_change_pct == 8.0
+    assert decision.direction == "long"
+    assert decision.denoising is not None
+    assert decision.denoising["sample_attempts"] == [2, 1, 1]
+
+
+def test_codex_responses_n1_degenerates_to_single_sample_behavior(tmp_path: Path) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(self, **_kwargs):
+            self.calls += 1
+            return _decision_json(direction="hold", expected_change_pct=-5.0, confidence=55)
+
+    client = FakeClient()
+    decision = CodexDecisionProvider(
+        client=client,
+        provider_name="codex_responses",
+        sample_count=1,
+    ).decide(
+        ticker="AAPL",
+        arm="baseline",
+        decision_date=date(2020, 1, 1),
+        price_rows=_price_rows(start="2019-01-01", days=370),
+        feedback=[],
+        cache=DecisionCache(tmp_path / "cache.json"),
+        budget=TokenBudget(max_tokens=100_000),
+    )
+
+    assert client.calls == 1
+    assert decision.direction == "watch"
+    assert decision.expected_change_pct == -5.0
+    assert decision.confidence == 0.55
+    assert decision.denoising is None
+
+
+def test_kimi_provider_median_denoising_reuses_existing_sampling_config(tmp_path: Path) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.values = [1.0, 5.0, -1.0]
+            self.calls = 0
+
+        def complete(self, **_kwargs):
+            self.calls += 1
+            return {
+                "content": _decision_json(expected_change_pct=self.values.pop(0)),
+                "usage": {"total_tokens": 10},
+            }
+
+    client = FakeClient()
+    decision = CodexDecisionProvider(
+        client=client,
+        provider_name="kimi",
+        sample_count=3,
+        sample_concurrency=1,
+    ).decide(
+        ticker="AAPL",
+        arm="baseline",
+        decision_date=date(2020, 1, 1),
+        price_rows=_price_rows(start="2019-01-01", days=370),
+        feedback=[],
+        cache=DecisionCache(tmp_path / "cache.json"),
+        budget=TokenBudget(max_tokens=100_000),
+    )
+
+    assert client.calls == 3
+    assert decision.expected_change_pct == 1.0
+    assert decision.denoising is not None
+    assert decision.denoising["sample_count"] == 3
+    assert decision.reasoning.startswith("median denoised 3 kimi samples")
 
 
 def test_codex_provider_retries_invalid_json(tmp_path: Path) -> None:
@@ -594,6 +775,7 @@ def test_alaya_ticker_chain_parallel_preserves_feedback_order(tmp_path: Path) ->
     assert summary["steps_written"] == 12
     assert summary["metrics"]["paired_steps"] == 6
     assert any(item["kind"] == "alaya_feedback" for item in later_aapl["decision_inputs"])
+    assert any(item["kind"] == "alaya_knowledge_card" for item in later_aapl["decision_inputs"])
 
 
 def test_direction_agreement_compares_baseline_replay_runs(tmp_path: Path) -> None:
@@ -622,7 +804,89 @@ def test_direction_agreement_compares_baseline_replay_runs(tmp_path: Path) -> No
     ]
 
 
-def test_codex_provider_prompt_skeleton_differs_only_by_feedback(tmp_path: Path) -> None:
+def test_knowledge_cards_use_only_matured_feedback() -> None:
+    feedback = [
+        {
+            "decision_date": "2019-10-01",
+            "outcome_availability_date": "2019-11-01",
+            "error": -1.2,
+            "mse": 1.44,
+            "actual_change_pct": 3.0,
+            "expected_change_pct": 4.2,
+            "decision_direction": "long",
+            "style_window": "US-China trade war",
+        },
+        {
+            "decision_date": "2020-01-01",
+            "outcome_availability_date": "2020-03-01",
+            "error": 8.0,
+            "mse": 64.0,
+            "actual_change_pct": -6.0,
+            "expected_change_pct": 2.0,
+            "decision_direction": "long",
+            "style_window": "COVID shock",
+        },
+    ]
+
+    cards = walk_forward._build_knowledge_cards(  # noqa: SLF001
+        ticker="AAPL",
+        decision_date=date(2020, 2, 1),
+        feedback=feedback,
+    )
+
+    assert len(cards) == 1
+    card = cards[0]
+    assert card["matured_samples"] == 1
+    assert card["latest_outcome_availability_date"] == "2019-11-01"
+    assert card["recent_direction_hit_rate"] == 1.0
+    assert card["style_window_performance"] == [
+        {
+            "style_window": "US-China trade war",
+            "samples": 1,
+            "direction_hit_rate": 1.0,
+            "mean_abs_error_pct": 1.2,
+            "mean_mse": 1.44,
+        }
+    ]
+
+
+def test_confidence_adaptation_shrinks_when_history_is_weak() -> None:
+    cards = walk_forward._build_knowledge_cards(  # noqa: SLF001
+        ticker="MSFT",
+        decision_date=date(2020, 6, 1),
+        feedback=[
+            {
+                "decision_date": "2020-01-01",
+                "outcome_availability_date": "2020-02-03",
+                "error": -10.0,
+                "mse": 100.0,
+                "actual_change_pct": -8.0,
+                "expected_change_pct": 2.0,
+                "decision_direction": "long",
+                "style_window": "COVID shock",
+            },
+            {
+                "decision_date": "2020-03-01",
+                "outcome_availability_date": "2020-04-01",
+                "error": 9.0,
+                "mse": 81.0,
+                "actual_change_pct": 7.0,
+                "expected_change_pct": -2.0,
+                "decision_direction": "avoid",
+                "style_window": "COVID shock",
+            },
+        ],
+    )
+
+    adaptation = walk_forward._build_confidence_adaptation(cards)  # noqa: SLF001
+
+    assert adaptation is not None
+    assert adaptation["policy"] == "historical_accuracy_calibration"
+    assert adaptation["mode"] == "shrink_expected_change"
+    assert "shrink absolute expected_change_pct" in adaptation["expected_change_guidance"]
+
+
+def test_codex_provider_prompt_skeleton_differs_only_by_cognitive_state(tmp_path: Path) -> None:
     class FakeClient:
         def __init__(self) -> None:
             self.user_prompts: list[str] = []
@@ -649,6 +913,11 @@ def test_codex_provider_prompt_skeleton_differs_only_by_feedback(tmp_path: Path)
             "decision_date": "2019-10-01",
             "outcome_availability_date": "2019-11-01",
             "error": -1.2,
+            "mse": 1.44,
+            "actual_change_pct": 3.0,
+            "expected_change_pct": 4.2,
+            "decision_direction": "long",
+            "style_window": "US-China trade war",
         }
     ]
 
@@ -674,9 +943,81 @@ def test_codex_provider_prompt_skeleton_differs_only_by_feedback(tmp_path: Path)
     assert client.system_prompts[0] == client.system_prompts[1]
     baseline_payload = json.loads(client.user_prompts[0])
     alaya_payload = json.loads(client.user_prompts[1])
-    assert baseline_payload.pop("feedback") == []
-    assert alaya_payload.pop("feedback") == feedback
+    baseline_state = baseline_payload.pop("cognitive_compounding_state")
+    alaya_state = alaya_payload.pop("cognitive_compounding_state")
+    assert baseline_state == {"knowledge_cards": [], "confidence_adaptation": None}
+    assert len(alaya_state["knowledge_cards"]) == 1
+    assert alaya_state["knowledge_cards"][0]["kind"] == "ticker_cognitive_compounding_card"
+    assert alaya_state["knowledge_cards"][0]["matured_samples"] == 1
+    assert alaya_state["confidence_adaptation"]["policy"] == "historical_accuracy_calibration"
     assert baseline_payload == alaya_payload
+
+
+def test_alaya_prompt_gets_denoising_confidence_context_but_baseline_does_not(
+    tmp_path: Path,
+) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.user_prompts: list[str] = []
+
+        def complete(self, **kwargs):
+            self.user_prompts.append(kwargs["user_prompt"])
+            return _decision_json(expected_change_pct=1.0)
+
+    client = FakeClient()
+    provider = CodexDecisionProvider(client=client)
+    price_rows = _price_rows(start="2019-01-01", days=370)
+    cache = DecisionCache(tmp_path / "cache.json")
+    feedback = [
+        {
+            "decision_date": "2019-10-01",
+            "outcome_availability_date": "2019-11-01",
+            "error": -1.2,
+            "mse": 1.44,
+            "actual_change_pct": 3.0,
+            "expected_change_pct": 4.2,
+            "decision_direction": "long",
+            "style_window": "US-China trade war",
+            "vote_consistency": 0.8,
+            "denoising_sample_count": 5,
+        }
+    ]
+
+    provider.decide(
+        ticker="AAPL",
+        arm="baseline",
+        decision_date=date(2020, 1, 1),
+        price_rows=price_rows,
+        feedback=feedback,
+        cache=cache,
+        budget=TokenBudget(max_tokens=100_000),
+    )
+    provider.decide(
+        ticker="AAPL",
+        arm="alaya",
+        decision_date=date(2020, 1, 1),
+        price_rows=price_rows,
+        feedback=feedback,
+        cache=cache,
+        budget=TokenBudget(max_tokens=100_000),
+    )
+
+    baseline_state = json.loads(client.user_prompts[0])["cognitive_compounding_state"]
+    alaya_state = json.loads(client.user_prompts[1])["cognitive_compounding_state"]
+    assert "denoising_confidence_context" not in baseline_state
+    assert alaya_state["denoising_confidence_context"] == {
+        "policy": "median_denoising_vote_consistency",
+        "matured_samples": 1,
+        "recent_window_samples": 1,
+        "recent_mean_vote_consistency": 0.8,
+        "min_vote_consistency": 0.8,
+        "max_vote_consistency": 0.8,
+        "sample_count": 5,
+        "guidance": (
+            "Use lower vote consistency as uncertainty context for confidence calibration only; "
+            "do not alter the shared median aggregation rule."
+        ),
+    }
 
 
 def test_codex_cli_provider_is_not_stage3_deterministic() -> None:
@@ -692,10 +1033,158 @@ def test_codex_cli_provider_is_not_stage3_deterministic() -> None:
     assert "temperature" in metadata["blocking_reason"]
 
 
-def test_require_stage3_provider_blocks_before_codex_preflight(
+def test_codex_responses_provider_requires_empirical_repro_flag(monkeypatch) -> None:
+    monkeypatch.delenv("CODEX_RESPONSES_MEASURED_REPRO_OK", raising=False)
+    metadata = walk_forward._provider_determinism_metadata(  # noqa: SLF001
+        "codex_responses",
+        require_stage3_provider=True,
+    )
+
+    assert metadata["stage3_acceptance_eligible"] is False
+    assert metadata["temperature_control"] == "unsupported"
+    assert metadata["top_p_control"] is False
+    assert metadata["seed_control"] is False
+    assert metadata["acceptance_basis"] == "empirically_measured_direction_agreement"
+    assert metadata["measured_repro_flag"] == "CODEX_RESPONSES_MEASURED_REPRO_OK"
+    assert "does not accept temperature" in metadata["blocking_reason"]
+    assert "direction-agreement rate >=95%" in metadata["blocking_reason"]
+    assert "temperature" in walk_forward._provider_determinism_error(metadata)  # noqa: SLF001
+
+
+def test_codex_responses_provider_is_stage3_eligible_when_empirically_flagged(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("CODEX_RESPONSES_MEASURED_REPRO_OK", "1")
+    metadata = walk_forward._provider_determinism_metadata(  # noqa: SLF001
+        "codex_responses",
+        require_stage3_provider=True,
+    )
+
+    assert metadata["stage3_acceptance_eligible"] is True
+    assert metadata["temperature_control"] == "unsupported"
+    assert metadata["top_p_control"] is False
+    assert metadata["seed_control"] is False
+    assert metadata["blocking_reason"] == ""
+    assert walk_forward._provider_determinism_error(metadata) == ""  # noqa: SLF001
+
+
+def test_build_provider_returns_kimi_decision_provider() -> None:
+    provider = walk_forward._build_provider("kimi")  # noqa: SLF001
+
+    assert isinstance(provider, CodexDecisionProvider)
+    assert provider.provider_name == "kimi"
+    assert isinstance(provider.client, KimiCompletionClient)
+
+
+def test_kimi_provider_preflight_requires_sophnet_key(monkeypatch) -> None:
+    monkeypatch.delenv("SOPHNET_API_KEY", raising=False)
+    provider = walk_forward._build_provider("kimi")  # noqa: SLF001
+
+    with pytest.raises(RuntimeError, match="SOPHNET_API_KEY"):
+        provider.preflight()
+
+
+def test_kimi_provider_determinism_does_not_upgrade_smoke_to_stage3() -> None:
+    metadata = walk_forward._provider_determinism_metadata(  # noqa: SLF001
+        "kimi",
+        require_stage3_provider=True,
+    )
+
+    assert metadata["stage3_acceptance_eligible"] is False
+    assert metadata["temperature_control"] == "supported_zero"
+    assert metadata["acceptance_basis"] == "empirically_measured_direction_agreement"
+    assert "Stage 7 smoke evidence is provider/plumbing only" in metadata["blocking_reason"]
+
+
+def test_parse_args_accepts_codex_responses_provider() -> None:
+    args = walk_forward.parse_args(["--provider", "codex_responses"])
+
+    assert args.provider == "codex_responses"
+
+
+def test_parse_args_accepts_kimi_provider() -> None:
+    args = walk_forward.parse_args(["--provider", "kimi"])
+
+    assert args.provider == "kimi"
+
+
+def test_parse_args_accepts_codex_responses_denoising_config() -> None:
+    args = walk_forward.parse_args(
+        [
+            "--provider",
+            "codex_responses",
+            "--codex-responses-samples",
+            "7",
+            "--codex-responses-sample-concurrency",
+            "3",
+        ]
+    )
+
+    assert args.codex_responses_samples == 7
+    assert args.codex_responses_sample_concurrency == 3
+
+
+def test_require_stage3_provider_allows_codex_responses(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    monkeypatch.setenv("CODEX_RESPONSES_MEASURED_REPRO_OK", "true")
+    _write_prices(tmp_path / "prices", "AAPL", start="2016-01-01", days=470)
+
+    class Stage3EligibleProvider:
+        network_enabled = False
+
+        def __init__(self) -> None:
+            self.preflight_called = False
+
+        def preflight(self) -> None:
+            self.preflight_called = True
+
+        def decide(self, **_kwargs):
+            return walk_forward.Decision(
+                direction="long",
+                expected_change_pct=1.0,
+                confidence=0.5,
+                reasoning="fixture",
+                prompt_hash="abc123",
+                estimated_tokens=10,
+                token_usage_source="provider_usage",
+                cache_hit=False,
+            )
+
+    provider = Stage3EligibleProvider()
+    monkeypatch.setattr(walk_forward, "_build_provider", lambda _name: provider)
+
+    summary = run_backtest(
+        BacktestConfig(
+            data_dir=tmp_path,
+            run_id="stage3_codex_responses_allowed_test",
+            mode="sampled",
+            provider="codex_responses",
+            start=date(2016, 1, 1),
+            end=date(2017, 1, 1),
+            step_months=3,
+            tickers=(TickerSpec("AAPL", "Apple", date(1980, 12, 12)),),
+            arms=("baseline",),
+            require_stage3_provider=True,
+            token_budget=50_000,
+        )
+    )
+
+    assert provider.preflight_called is True
+    assert summary["steps_written"] == 1
+    assert summary["provider_errors"] == 0
+    assert summary["provider_determinism_error"] == ""
+    assert summary["provider_determinism"]["stage3_acceptance_eligible"] is True
+    assert summary["system_health"]["status"] == "ok"
+
+
+def test_require_stage3_provider_blocks_codex_responses_before_preflight_without_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("CODEX_RESPONSES_MEASURED_REPRO_OK", raising=False)
+
     class ProviderThatMustNotRun:
         network_enabled = False
 
@@ -710,9 +1199,9 @@ def test_require_stage3_provider_blocks_before_codex_preflight(
     summary = run_backtest(
         BacktestConfig(
             data_dir=tmp_path,
-            run_id="stage3_provider_block_test",
+            run_id="stage3_codex_responses_block_test",
             mode="full",
-            provider="codex_cli",
+            provider="codex_responses",
             start=date(2016, 1, 1),
             end=date(2017, 1, 1),
             step_months=1,
@@ -728,12 +1217,14 @@ def test_require_stage3_provider_blocks_before_codex_preflight(
     assert summary["provider_health"]["preflight_enabled"] is False
     assert summary["provider_determinism"]["required_for_stage3"] is True
     assert summary["provider_determinism"]["stage3_acceptance_eligible"] is False
+    assert summary["provider_determinism"]["temperature_control"] == "unsupported"
     assert "temperature" in summary["provider_determinism_error"]
+    assert "direction-agreement rate >=95%" in summary["provider_determinism_error"]
     assert summary["system_health"]["status"] == "blocked_provider_determinism"
     assert summary["system_health"]["provider_determinism_error"] == summary[
         "provider_determinism_error"
     ]
-    assert (tmp_path / "runs" / "stage3_provider_block_test" / "summary.json").exists()
+    assert (tmp_path / "runs" / "stage3_codex_responses_block_test" / "summary.json").exists()
 
 
 def test_provider_error_steps_are_written_and_counted(tmp_path: Path, monkeypatch) -> None:
@@ -886,6 +1377,22 @@ def _price_rows(*, start: str, days: int) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def _decision_json(
+    *,
+    direction: str = "long",
+    expected_change_pct: float,
+    confidence: float = 0.5,
+) -> str:
+    return json.dumps(
+        {
+            "direction": direction,
+            "expected_change_pct": expected_change_pct,
+            "confidence": confidence,
+            "reasoning": "Valid JSON.",
+        }
+    )
 
 
 def _write_step_json(path: Path, ticker: str, decision_date: str, direction: str) -> None:

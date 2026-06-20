@@ -37,7 +37,7 @@ class CompletionClient(Protocol):
         max_tokens: int,
         timeout_seconds: int,
         temperature: float,
-    ) -> str:
+    ) -> str | dict[str, Any]:
         """Return model text."""
 
 

@@ -271,6 +271,10 @@ class DaemonRunConfig:
   BT run directory、generated report、patch、tarball、pyc 文件。
 - 绝不在 gotra business code 中直接 import OpenAI/Anthropic SDK，或调用 direct vendor
   endpoint。
+- 受控例外：`gotra.backtest.kimi_client` / `gotra.backtest.kimi_probe` 可在诊断性
+  Kimi-K2.6 复现性探针中调用 `https://api.sophnet.com/v1/chat/completions`。该例外
+  仅限 `SOPHNET_API_KEY` 环境变量、`temperature=0`、真实 BT prompt 的探针用途；不得
+  推广为 Stage 6/Stage 7 正式 provider，除非另行预注册。
 - 绝不在外部依赖/子模块代码中加入外部研究 API 调用。
 - 绝不在设置了 `PERPLEXITY_API_KEY` 或 `PPLX_API_KEY` 的情况下运行 Phase BT。
 - 绝不绕过审计 API/service path 做 raw write。
