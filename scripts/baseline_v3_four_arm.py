@@ -30,6 +30,7 @@ from gotra.backtest.statistics import (
     hac_mean_test,
     paired_loss_differences_v3,
 )
+from gotra.ksana_public_adapter import adapt_ksana_public_research_artifacts
 from scripts import baseline_v2_three_arm_pilot as v2
 
 
@@ -1117,6 +1118,7 @@ def research_artifact_filter_result(
             load_research_artifact_fixture(research_artifacts_path),
             decision_date=decision_date,
             ticker=ticker,
+            source_artifact_path=research_artifacts_path,
         )
     latest = price_rows.iloc[-1]
     source_date = str(latest["date"])
@@ -1240,30 +1242,17 @@ def filter_external_research_artifacts(
     *,
     decision_date: date,
     ticker: str,
+    source_artifact_path: Path | None = None,
 ) -> dict[str, Any]:
-    accepted: list[dict[str, Any]] = []
-    rejected_future = 0
-    rejected_schema = 0
-    for artifact in artifacts:
-        artifact_ticker = str(artifact.get("ticker") or "")
-        if artifact_ticker not in {ticker, "*"}:
-            continue
-        missing = REQUIRED_RESEARCH_ARTIFACT_FIELDS - set(artifact)
-        source_kind = str(artifact.get("source_kind") or "")
-        forbidden = sorted(FORBIDDEN_RESEARCH_ARTIFACT_FIELDS & set(artifact))
-        if missing or source_kind not in {"real", "unverified", "synthetic"}:
-            rejected_schema += 1
-            continue
-        if forbidden or parse_date(str(artifact["availability_date"])) > decision_date:
-            rejected_future += 1
-            continue
-        accepted.append(normalize_research_artifact(artifact))
-    return {
-        "accepted_artifacts": accepted,
-        "rejected_research_artifact_count": rejected_future + rejected_schema,
-        "rejected_research_future_data_count": rejected_future,
-        "rejected_research_schema_count": rejected_schema,
-    }
+    return adapt_ksana_public_research_artifacts(
+        artifacts,
+        decision_date=decision_date,
+        ticker=ticker,
+        horizon_days=WINDOW_DAYS,
+        input_layer="richer_research_packet",
+        source_artifact_path=source_artifact_path,
+        fixture_id=source_artifact_path.name if source_artifact_path else "",
+    )
 
 
 def research_filter_diagnostics(result: dict[str, Any]) -> dict[str, int]:
@@ -1273,6 +1262,15 @@ def research_filter_diagnostics(result: dict[str, Any]) -> dict[str, int]:
             result.get("rejected_research_future_data_count") or 0
         ),
         "rejected_research_schema_count": int(result.get("rejected_research_schema_count") or 0),
+        "rejected_research_identity_count": int(
+            result.get("rejected_research_identity_count") or 0
+        ),
+        "legacy_unverified_research_artifact_count": int(
+            result.get("legacy_unverified_research_artifact_count") or 0
+        ),
+        "ksana_public_adapter_issue_count": int(
+            result.get("ksana_public_adapter_issue_count") or 0
+        ),
     }
 
 
