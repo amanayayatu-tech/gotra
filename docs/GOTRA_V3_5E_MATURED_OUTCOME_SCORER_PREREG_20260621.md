@@ -46,6 +46,30 @@ The scorer must block the report when:
 
 Provenance requires at least source capture run id, source decision id, source
 artifact path/ref, resolver run id, and an existing source capture artifact.
+The scorer must also revalidate artifact identity after loading the source:
+
+- `record.resolver_run_id` and `record.provenance.resolver_run_id` must both be
+  present and consistent.
+- `source_artifact_path` must point to an artifact matching
+  `source_artifact_ref`; stale refs or paths to another capture are provenance
+  failures.
+- `source_decision_id` must be recomputed from the loaded source capture and
+  `source_artifact_ref` using the v3.5B resolver contract, then matched against
+  the outcome record.
+- ticker, decision date, horizon, arm, and input layer must match between the
+  source capture and outcome record.
+
+After reverse lookup, the scorer must re-run the v3.5B source future-data guard
+on the loaded capture artifact. A source capture with `future_data_violation=true`
+or `latest_visible_price_date` after the capture-visible date is blocked as
+`BLOCKED_FUTURE_DATA` even if the resolved outcome artifact itself is stale and
+claims `source_future_data_violation=false`.
+
+Future-data violation counts are based on unique contaminated outcome/source
+artifact keys. Input-summary-level future-data counts are reported separately as
+`input_summary_future_data_violation_count` and combined only in
+`future_data_blocker_count` for status gating; they must not be double-counted in
+`future_data_violation_count`.
 
 ## Scoring Metrics
 

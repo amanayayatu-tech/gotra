@@ -116,6 +116,7 @@ def run_scorer(config: ScorerConfig) -> dict[str, Any]:
     exclusions: Counter[str] = Counter()
     provenance_failures: list[dict[str, Any]] = []
     future_data_failures: list[dict[str, Any]] = []
+    future_data_failure_keys: set[str] = set()
     resolved_outcome_count = 0
 
     for path in outcome_paths:
@@ -143,12 +144,12 @@ def run_scorer(config: ScorerConfig) -> dict[str, Any]:
             continue
         if status == resolver.STATUS_BLOCKED_SOURCE_FUTURE_DATA:
             exclusions[EXCLUDED_BLOCKED_SOURCE_FUTURE_DATA] += 1
-            future_data_failures.append(
-                {
-                    "outcome_artifact": str(path),
-                    "source_decision_id": str(record.get("source_decision_id") or ""),
-                    "reason": resolver.STATUS_BLOCKED_SOURCE_FUTURE_DATA,
-                }
+            append_future_data_failure(
+                future_data_failures,
+                future_data_failure_keys,
+                path=path,
+                record=record,
+                reason=resolver.STATUS_BLOCKED_SOURCE_FUTURE_DATA,
             )
             continue
         if status != resolver.STATUS_RESOLVED:
@@ -157,12 +158,12 @@ def run_scorer(config: ScorerConfig) -> dict[str, Any]:
         resolved_outcome_count += 1
         if bool(record.get("source_future_data_violation")):
             exclusions[EXCLUDED_SOURCE_FUTURE_DATA] += 1
-            future_data_failures.append(
-                {
-                    "outcome_artifact": str(path),
-                    "source_decision_id": str(record.get("source_decision_id") or ""),
-                    "reason": EXCLUDED_SOURCE_FUTURE_DATA,
-                }
+            append_future_data_failure(
+                future_data_failures,
+                future_data_failure_keys,
+                path=path,
+                record=record,
+                reason=EXCLUDED_SOURCE_FUTURE_DATA,
             )
             continue
         outcome_field_error = missing_or_invalid_outcome_field_reason(record)
@@ -182,6 +183,18 @@ def run_scorer(config: ScorerConfig) -> dict[str, Any]:
                     "source_decision_id": str(record.get("source_decision_id") or ""),
                     "reason": provenance_error,
                 }
+            )
+            continue
+        source_future_reasons = source_future_data_reasons_from_capture(source_payload)
+        if source_future_reasons:
+            exclusions[EXCLUDED_SOURCE_FUTURE_DATA] += 1
+            append_future_data_failure(
+                future_data_failures,
+                future_data_failure_keys,
+                path=path,
+                record=record,
+                reason="source_capture_future_data_violation",
+                source_future_data_violation_reasons=source_future_reasons,
             )
             continue
         predicted_direction = predicted_direction_from_source(source_payload)
@@ -297,6 +310,44 @@ def future_data_violations_from_summaries(candidates: list[Path]) -> int:
     return count
 
 
+def append_future_data_failure(
+    failures: list[dict[str, Any]],
+    keys: set[str],
+    *,
+    path: Path,
+    record: dict[str, Any],
+    reason: str,
+    source_future_data_violation_reasons: list[str] | None = None,
+) -> None:
+    key = future_data_failure_key(path=path, record=record)
+    if key in keys:
+        return
+    keys.add(key)
+    failure = {
+        "violation_key": key,
+        "outcome_artifact": str(path),
+        "source_decision_id": str(record.get("source_decision_id") or ""),
+        "reason": reason,
+    }
+    if source_future_data_violation_reasons:
+        failure["source_future_data_violation_reasons"] = source_future_data_violation_reasons
+    failures.append(failure)
+
+
+def future_data_failure_key(*, path: Path, record: dict[str, Any]) -> str:
+    provenance = record.get("provenance")
+    if not isinstance(provenance, dict):
+        provenance = {}
+    source_id = str(record.get("source_decision_id") or provenance.get("source_decision_id") or "")
+    artifact_ref = str(provenance.get("source_artifact_ref") or "")
+    artifact_path = str(provenance.get("source_artifact_path") or "")
+    if source_id and (artifact_ref or artifact_path):
+        return f"{source_id}|{artifact_ref or artifact_path}"
+    if source_id:
+        return source_id
+    return str(path)
+
+
 def missing_or_invalid_outcome_field_reason(record: dict[str, Any]) -> str:
     for field in [
         "outcome_price",
@@ -321,6 +372,7 @@ def load_source_payload(record: dict[str, Any]) -> tuple[dict[str, Any] | None, 
     if not isinstance(provenance, dict):
         return None, "missing_provenance"
     required = [
+        "resolver_run_id",
         "source_capture_run_id",
         "source_decision_id",
         "source_artifact_path",
@@ -329,11 +381,18 @@ def load_source_payload(record: dict[str, Any]) -> tuple[dict[str, Any] | None, 
     missing = [field for field in required if not provenance.get(field)]
     if missing:
         return None, "missing_provenance_fields:" + ",".join(missing)
+    if not record.get("resolver_run_id"):
+        return None, "missing_resolver_run_id"
+    if str(record.get("resolver_run_id")) != str(provenance.get("resolver_run_id")):
+        return None, "resolver_run_id_mismatch"
     if not record.get("source_decision_id"):
         return None, "missing_source_decision_id"
     if str(record.get("source_decision_id")) != str(provenance.get("source_decision_id")):
         return None, "source_decision_id_mismatch"
     source_path = Path(str(provenance["source_artifact_path"]))
+    artifact_ref = str(provenance["source_artifact_ref"])
+    if not source_path_matches_ref(source_path, artifact_ref):
+        return None, "source_artifact_path_ref_mismatch"
     if not source_path.exists():
         return None, "source_artifact_missing"
     try:
@@ -344,7 +403,75 @@ def load_source_payload(record: dict[str, Any]) -> tuple[dict[str, Any] | None, 
         return None, "source_artifact_schema_mismatch"
     if str(source_payload.get("run_id") or "") != str(provenance.get("source_capture_run_id")):
         return None, "source_capture_run_id_mismatch"
+    expected_source_id = resolver.source_decision_id(source_payload, artifact_ref)
+    if str(record.get("source_decision_id")) != expected_source_id:
+        return None, "source_decision_id_recomputed_mismatch"
+    identity_error = source_identity_mismatch(record, source_payload)
+    if identity_error:
+        return None, identity_error
     return source_payload, None
+
+
+def source_path_matches_ref(source_path: Path, artifact_ref: str) -> bool:
+    ref_path = Path(artifact_ref)
+    if ref_path.is_absolute():
+        return source_path == ref_path
+    ref_parts = ref_path.parts
+    if not ref_parts:
+        return False
+    source_parts = source_path.parts
+    if len(source_parts) < len(ref_parts):
+        return False
+    return source_parts[-len(ref_parts) :] == ref_parts
+
+
+def source_identity_mismatch(record: dict[str, Any], source_payload: dict[str, Any]) -> str:
+    checks = [
+        ("ticker", str(source_payload.get("ticker") or ""), str(record.get("ticker") or "")),
+        ("arm", str(source_payload.get("arm") or ""), str(record.get("arm") or "")),
+        (
+            "input_layer",
+            str(source_payload.get("input_layer") or ""),
+            str(record.get("input_layer") or ""),
+        ),
+        (
+            "decision_date",
+            str(source_payload.get("decision_date_local") or source_payload.get("decision_date") or ""),
+            str(record.get("decision_date") or ""),
+        ),
+        (
+            "horizon_days",
+            str(source_payload.get("horizon_days") or v3.WINDOW_DAYS),
+            str(record.get("horizon_days") or ""),
+        ),
+    ]
+    for field, source_value, record_value in checks:
+        if source_value != record_value:
+            return f"source_{field}_mismatch"
+    return ""
+
+
+def source_future_data_reasons_from_capture(source_payload: dict[str, Any] | None) -> list[str]:
+    if not source_payload:
+        return []
+    try:
+        decision_date = resolver.date_from_capture(
+            source_payload,
+            "decision_date_local",
+            "decision_date",
+        )
+        latest_visible_date = resolver.date_from_capture(
+            source_payload,
+            "latest_visible_price_date",
+            "decision_date_local",
+        )
+    except Exception as exc:  # noqa: BLE001 - invalid date provenance is a source guard failure.
+        return ["source_future_data_guard_invalid_dates:" + v3.redact_error(str(exc))]
+    return resolver.source_future_data_violation_reasons(
+        payload=source_payload,
+        decision_date=decision_date,
+        latest_visible_date=latest_visible_date,
+    )
 
 
 def predicted_direction_from_source(source_payload: dict[str, Any] | None) -> str:
@@ -395,17 +522,18 @@ def summary_for(
     tickers = {str(row["ticker"]) for row in scored_rows}
     dates = {str(row["decision_date"]) for row in scored_rows}
     metric_rows = [row for row in scored_rows if row["metric_available"]]
-    future_data_violation_count = (
-        summary_future_data_violations
-        + len(future_data_failures)
-        + exclusions[EXCLUDED_BLOCKED_SOURCE_FUTURE_DATA]
-        + exclusions[EXCLUDED_SOURCE_FUTURE_DATA]
+    future_data_violation_count = len(
+        {
+            str(failure.get("violation_key") or failure.get("outcome_artifact") or "")
+            for failure in future_data_failures
+        }
     )
+    future_data_blocker_count = future_data_violation_count + summary_future_data_violations
     status = scorer_status(
         resolved_outcome_count=resolved_outcome_count,
         scored_count=scored_count,
         ticker_count=len(tickers),
-        future_data_violation_count=future_data_violation_count,
+        future_data_violation_count=future_data_blocker_count,
         provenance_failure_count=len(provenance_failures),
         min_scored_outcomes=config.min_scored_outcomes,
         min_clusters=config.min_clusters,
@@ -443,6 +571,8 @@ def summary_for(
             "provenance_failure_count": len(provenance_failures),
             "provenance_failures": provenance_failures[:20],
             "future_data_violation_count": future_data_violation_count,
+            "input_summary_future_data_violation_count": summary_future_data_violations,
+            "future_data_blocker_count": future_data_blocker_count,
             "future_data_failures": future_data_failures[:20],
             "started_at": started_at.isoformat().replace("+00:00", "Z"),
             "completed_at": completed_at.isoformat().replace("+00:00", "Z"),
@@ -475,6 +605,8 @@ def base_summary(*, config: ScorerConfig, output_root: Path) -> dict[str, Any]:
         "policy_return_status": POLICY_RETURN_NOT_COMPUTED,
         "provenance_link_count": 0,
         "future_data_violation_count": 0,
+        "input_summary_future_data_violation_count": 0,
+        "future_data_blocker_count": 0,
         "provider_or_backend_called": False,
         "codex_cli_called": False,
         "formal_lite_entered": False,

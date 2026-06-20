@@ -74,7 +74,8 @@ def test_scorer_excludes_immature_blocked_and_blocks_future_data(tmp_path: Path)
     assert summary["excluded_count_by_reason"][scorer.EXCLUDED_NOT_MATURED] == 1
     assert summary["excluded_count_by_reason"][scorer.EXCLUDED_BLOCKED_DATA] == 1
     assert summary["excluded_count_by_reason"][scorer.EXCLUDED_BLOCKED_SOURCE_FUTURE_DATA] == 1
-    assert summary["future_data_violation_count"] > 0
+    assert summary["future_data_violation_count"] == 1
+    assert summary["future_data_blocker_count"] == 1
 
 
 def test_scorer_excludes_unknown_direction_buckets(tmp_path: Path) -> None:
@@ -119,6 +120,134 @@ def test_scorer_blocks_missing_source_provenance(tmp_path: Path) -> None:
     assert summary["status"] == scorer.STATUS_BLOCKED_PROVENANCE
     assert summary["provenance_failure_count"] == 1
     assert summary["scored_outcome_count"] == 0
+
+
+def test_scorer_blocks_source_artifact_identity_mismatch(tmp_path: Path) -> None:
+    root = tmp_path / "outcomes"
+    outcome = _write_resolved_pair(root, ticker="AAPL", direction="long", expected=3.0, actual=4.0)
+    other_source = _write_source_capture(
+        root,
+        ticker="MSFT",
+        decision_date="2026-06-20",
+        direction="avoid",
+        expected=-3.0,
+    )
+    payload = json.loads(outcome.read_text(encoding="utf-8"))
+    payload["provenance"]["source_artifact_path"] = str(other_source)
+    outcome.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    config = _scorer_config(
+        tmp_path,
+        input_root=root,
+        run_id="baseline_v3_5e_matured_outcome_scorer_source_mismatch",
+    )
+
+    summary = scorer.run_scorer(config)
+
+    assert summary["status"] == scorer.STATUS_BLOCKED_PROVENANCE
+    assert summary["scored_outcome_count"] == 0
+    assert summary["provenance_failure_count"] == 1
+    assert summary["provenance_failures"][0]["reason"] in {
+        "source_artifact_path_ref_mismatch",
+        "source_decision_id_recomputed_mismatch",
+        "source_ticker_mismatch",
+    }
+
+
+def test_scorer_counts_each_future_data_violation_once(tmp_path: Path) -> None:
+    root = tmp_path / "outcomes"
+    _write_outcome(root, ticker="AAPL", status=resolver.STATUS_BLOCKED_SOURCE_FUTURE_DATA)
+    _write_resolved_pair(
+        root,
+        ticker="MSFT",
+        direction="long",
+        expected=3.0,
+        actual=4.0,
+        source_future_data_violation=True,
+    )
+    config = _scorer_config(
+        tmp_path,
+        input_root=root,
+        run_id="baseline_v3_5e_matured_outcome_scorer_unique_future_count",
+    )
+
+    summary = scorer.run_scorer(config)
+
+    assert summary["status"] == scorer.STATUS_BLOCKED_FUTURE_DATA
+    assert summary["future_data_violation_count"] == 2
+    assert summary["future_data_blocker_count"] == 2
+    assert summary["excluded_count_by_reason"][scorer.EXCLUDED_BLOCKED_SOURCE_FUTURE_DATA] == 1
+    assert summary["excluded_count_by_reason"][scorer.EXCLUDED_SOURCE_FUTURE_DATA] == 1
+
+
+def test_scorer_blocks_contaminated_source_capture_after_reverse_lookup(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "outcomes"
+    flag_outcome = _write_resolved_pair(
+        root,
+        ticker="AAPL",
+        direction="long",
+        expected=3.0,
+        actual=4.0,
+        source_updates={"future_data_violation": True},
+    )
+    latest_visible_outcome = _write_resolved_pair(
+        root,
+        ticker="MSFT",
+        direction="long",
+        expected=3.0,
+        actual=4.0,
+        source_updates={"latest_visible_price_date": "2026-06-21"},
+    )
+    for outcome in [flag_outcome, latest_visible_outcome]:
+        payload = json.loads(outcome.read_text(encoding="utf-8"))
+        payload["source_future_data_violation"] = False
+        payload["source_future_data_violation_reasons"] = []
+        outcome.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    config = _scorer_config(
+        tmp_path,
+        input_root=root,
+        run_id="baseline_v3_5e_matured_outcome_scorer_source_guard",
+    )
+
+    summary = scorer.run_scorer(config)
+
+    assert summary["status"] == scorer.STATUS_BLOCKED_FUTURE_DATA
+    assert summary["scored_outcome_count"] == 0
+    assert summary["future_data_violation_count"] == 2
+    reasons = {
+        reason
+        for failure in summary["future_data_failures"]
+        for reason in failure["source_future_data_violation_reasons"]
+    }
+    assert "source_future_data_violation_flag" in reasons
+    assert "latest_visible_price_date_after_capture_allowed_date" in reasons
+
+
+@pytest.mark.parametrize("missing_field", ["record_resolver_run_id", "provenance_resolver_run_id"])
+def test_scorer_requires_resolver_run_id_in_provenance(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    root = tmp_path / "outcomes"
+    outcome = _write_resolved_pair(root, ticker="AAPL", direction="long", expected=3.0, actual=4.0)
+    payload = json.loads(outcome.read_text(encoding="utf-8"))
+    if missing_field == "record_resolver_run_id":
+        payload.pop("resolver_run_id", None)
+    else:
+        payload["provenance"].pop("resolver_run_id", None)
+    outcome.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    config = _scorer_config(
+        tmp_path,
+        input_root=root,
+        run_id=f"baseline_v3_5e_matured_outcome_scorer_missing_{missing_field}",
+    )
+
+    summary = scorer.run_scorer(config)
+
+    assert summary["status"] == scorer.STATUS_BLOCKED_PROVENANCE
+    assert summary["scored_outcome_count"] == 0
+    assert summary["provenance_failure_count"] == 1
 
 
 def test_scorer_reports_data_not_matured_when_no_resolved_outcomes(tmp_path: Path) -> None:
@@ -223,6 +352,8 @@ def _write_resolved_pair(
     actual: float,
     actual_direction: str | None = None,
     decision_date: str = "2026-06-20",
+    source_updates: dict[str, object] | None = None,
+    source_future_data_violation: bool = False,
 ) -> Path:
     source = _write_source_capture(
         root,
@@ -230,6 +361,7 @@ def _write_resolved_pair(
         decision_date=decision_date,
         direction=direction,
         expected=expected,
+        updates=source_updates,
     )
     if actual_direction is None:
         actual_direction = "long" if actual >= 2.0 else "avoid" if actual <= -2.0 else "neutral"
@@ -241,6 +373,7 @@ def _write_resolved_pair(
         decision_date=decision_date,
         actual_change_pct=actual,
         actual_direction=actual_direction,
+        source_future_data_violation=source_future_data_violation,
     )
 
 
@@ -251,6 +384,7 @@ def _write_source_capture(
     decision_date: str,
     direction: str,
     expected: float | None,
+    updates: dict[str, object] | None = None,
 ) -> Path:
     path = root / "captures" / f"capture_{decision_date}_{ticker.lower()}.json"
     decision: dict[str, object] = {"direction": direction}
@@ -275,6 +409,8 @@ def _write_source_capture(
         "future_data_violation": False,
         "decision": decision,
     }
+    if updates:
+        payload.update(updates)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     return path
@@ -289,14 +425,18 @@ def _write_outcome(
     decision_date: str = "2026-06-20",
     actual_change_pct: float | None = None,
     actual_direction: str | None = None,
+    source_future_data_violation: bool | None = None,
 ) -> Path:
     source_run_id = "baseline_v3_5a_forward_live_scorer_fixture"
-    source_id = f"source:{ticker}:{decision_date}"
+    source_artifact_ref = f"captures/capture_{decision_date}_{ticker.lower()}.json"
+    source_id = _source_decision_id_for(source_path, source_artifact_ref)
+    if source_future_data_violation is None:
+        source_future_data_violation = status == resolver.STATUS_BLOCKED_SOURCE_FUTURE_DATA
     provenance = {
         "source_capture_run_id": source_run_id,
         "source_decision_id": source_id,
         "source_artifact_path": str(source_path or root / "captures" / "missing.json"),
-        "source_artifact_ref": f"captures/capture_{decision_date}_{ticker.lower()}.json",
+        "source_artifact_ref": source_artifact_ref,
         "resolver_run_id": "baseline_v3_5b_outcome_resolver_scorer_fixture",
     }
     resolved = status == resolver.STATUS_RESOLVED
@@ -319,10 +459,10 @@ def _write_outcome(
         "outcome_price": 100.0 + (actual_change_pct or 0.0) if resolved else None,
         "actual_change_pct": actual_change_pct if resolved else None,
         "actual_direction": actual_direction if resolved else None,
-        "source_future_data_violation": status == resolver.STATUS_BLOCKED_SOURCE_FUTURE_DATA,
+        "source_future_data_violation": source_future_data_violation,
         "source_future_data_violation_reasons": (
             ["source_future_data_violation_flag"]
-            if status == resolver.STATUS_BLOCKED_SOURCE_FUTURE_DATA
+            if source_future_data_violation
             else []
         ),
         "resolved_at": "2026-07-21T00:00:00Z",
@@ -339,6 +479,13 @@ def _write_outcome(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     return path
+
+
+def _source_decision_id_for(source_path: Path | None, artifact_ref: str) -> str:
+    if source_path is None:
+        return "missing_source_decision_id"
+    payload = json.loads(source_path.read_text(encoding="utf-8"))
+    return resolver.source_decision_id(payload, artifact_ref)
 
 
 def _scorer_config(
