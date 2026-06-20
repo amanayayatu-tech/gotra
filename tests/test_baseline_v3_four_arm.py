@@ -440,11 +440,145 @@ def test_v3_2_feedback_artifact_fixture_filters_independent_mature_feedback() ->
         "outcome:aapl:any:2024-01-02:wave1"
     ]
     assert len(later["accepted_feedback"]) == 3
+    assert later["accepted_feedback"][0]["error"] == pytest.approx(0.4)
+    assert later["accepted_feedback"][0]["mse"] == pytest.approx(0.16)
     assert later["feedback_source_kind_counts"]["outcome_feedback"] == 2
     assert later["feedback_source_kind_counts"]["realized_error_feedback"] == 1
     assert later["rejected_feedback_future_data_count"] == 1
-    assert later["rejected_feedback_schema_count"] == 1
+    assert later["rejected_feedback_schema_count"] == 3
     assert later["rejected_feedback_non_independent_count"] == 1
+
+
+def test_v3_2_feedback_artifact_rejects_nonfinite_and_inconsistent_numeric_fields() -> None:
+    base = {
+        "ticker": "AAPL",
+        "input_layer": "*",
+        "feedback_ref": "outcome:aapl:test",
+        "feedback_source_kind": "outcome_feedback",
+        "availability_date": "2024-02-02",
+        "source_run_id": "fixture_prior_run",
+        "source_step_id": "fixture_prior_run/full_gotra/test",
+        "source_decision_date": "2024-01-02",
+        "source_horizon_end_date": "2024-02-01",
+        "actual_return": 1.2,
+        "prior_prediction": 0.8,
+        "summary": "valid shape",
+    }
+    result = v3.filter_external_feedback_artifacts(
+        [
+            {**base, "feedback_ref": "nan-actual", "actual_return": "NaN"},
+            {**base, "feedback_ref": "inf-prediction", "prior_prediction": "inf"},
+            {**base, "feedback_ref": "nan-mse", "mse": "NaN"},
+            {**base, "feedback_ref": "bad-mse", "mse": 0.0},
+        ],
+        decision_date=date(2024, 4, 2),
+        ticker="AAPL",
+        input_layer="price_only_packet",
+    )
+
+    assert result["accepted_feedback"] == []
+    assert result["rejected_feedback_schema_count"] == 4
+
+
+def test_v3_2_feedback_artifact_rejects_current_run_and_duplicates() -> None:
+    base = {
+        "ticker": "AAPL",
+        "input_layer": "*",
+        "feedback_source_kind": "outcome_feedback",
+        "availability_date": "2024-02-02",
+        "source_run_id": "prior_run",
+        "source_decision_date": "2024-01-02",
+        "source_horizon_end_date": "2024-02-01",
+        "actual_return": 1.2,
+        "prior_prediction": 0.8,
+        "summary": "valid shape",
+    }
+    result = v3.filter_external_feedback_artifacts(
+        [
+            {
+                **base,
+                "feedback_ref": "feedback:aapl:unique-1",
+                "source_step_id": "prior_run/full_gotra/unique-1",
+            },
+            {
+                **base,
+                "feedback_ref": "feedback:aapl:unique-2",
+                "source_step_id": "prior_run/full_gotra/unique-2",
+                "source_decision_date": "2024-02-01",
+                "source_horizon_end_date": "2024-03-02",
+                "availability_date": "2024-03-04",
+            },
+            {
+                **base,
+                "feedback_ref": "feedback:aapl:unique-2",
+                "source_step_id": "prior_run/full_gotra/unique-2-duplicate",
+                "source_decision_date": "2024-02-01",
+                "source_horizon_end_date": "2024-03-02",
+                "availability_date": "2024-03-04",
+            },
+            {
+                **base,
+                "feedback_ref": "feedback:aapl:current-run",
+                "source_run_id": "baseline_v3_2_current_run",
+                "source_step_id": "baseline_v3_2_current_run/full_gotra/current",
+            },
+        ],
+        decision_date=date(2024, 4, 2),
+        ticker="AAPL",
+        input_layer="price_only_packet",
+        current_run_id="baseline_v3_2_current_run",
+    )
+    diagnostics = v3.strict_feedback_diagnostics(
+        feedback=result["accepted_feedback"],
+        decision_date=date(2024, 4, 2),
+    )
+
+    assert len(result["accepted_feedback"]) == 2
+    assert result["rejected_feedback_current_run_count"] == 1
+    assert result["rejected_feedback_duplicate_count"] == 1
+    assert diagnostics["true_independent_feedback_count"] == 2
+    assert diagnostics["strict_feedback_eligible"] is False
+    assert "true_independent_feedback_count_lt_3" in diagnostics[
+        "strict_feedback_insufficient_reason"
+    ]
+
+
+def test_v3_2_strict_feedback_deduplicates_even_without_filter() -> None:
+    feedback = [
+        {
+            "feedback_ref": "feedback:aapl:one",
+            "source_step_id": "prior/one",
+            "source_decision_date": "2024-01-02",
+            "prior_decision_date": "2024-01-02",
+            "outcome_availability_date": "2024-02-02",
+            "feedback_source_kind": "outcome_feedback",
+        },
+        {
+            "feedback_ref": "feedback:aapl:two",
+            "source_step_id": "prior/two",
+            "source_decision_date": "2024-02-01",
+            "prior_decision_date": "2024-02-01",
+            "outcome_availability_date": "2024-03-04",
+            "feedback_source_kind": "outcome_feedback",
+        },
+        {
+            "feedback_ref": "feedback:aapl:two",
+            "source_step_id": "prior/two-duplicate",
+            "source_decision_date": "2024-02-01",
+            "prior_decision_date": "2024-02-01",
+            "outcome_availability_date": "2024-03-04",
+            "feedback_source_kind": "outcome_feedback",
+        },
+    ]
+
+    diagnostics = v3.strict_feedback_diagnostics(
+        feedback=feedback,
+        decision_date=date(2024, 4, 2),
+    )
+
+    assert diagnostics["true_independent_feedback_count"] == 2
+    assert diagnostics["duplicate_independent_feedback_count"] == 1
+    assert diagnostics["strict_feedback_eligible"] is False
 
 
 def test_v3_2_strict_feedback_requires_true_independent_outcome_waves() -> None:
@@ -1000,6 +1134,72 @@ def test_failed_runtime_retry_is_not_scored_or_cached(tmp_path: Path) -> None:
     assert step["provider_attempts"] == 2
     assert step["provider_retry_count"] == 1
     assert step["last_retryable_error_type"] == "TimeoutException"
+    assert cache.values == {}
+
+
+def test_provider_error_step_preserves_feedback_filter_diagnostics(tmp_path: Path) -> None:
+    _write_prices(tmp_path / "prices", "AAPL", days=520)
+    run_root = tmp_path / "runs" / "baseline_v3_2_feedback_error_path"
+    run_root.mkdir(parents=True)
+    for arm in v3.ARMS:
+        (run_root / arm).mkdir(parents=True)
+    feedback_filter = v3.filter_external_feedback_artifacts(
+        v3.load_feedback_artifact_fixture(
+            Path("tests/fixtures/baseline_v3_2_feedback_artifacts.json")
+        ),
+        decision_date=date(2024, 4, 2),
+        ticker="AAPL",
+        input_layer="richer_research_packet",
+    )
+    feedback = feedback_filter["accepted_feedback"]
+    feedback_diagnostics = v3.feedback_filter_diagnostics(feedback_filter)
+
+    class TimeoutClient:
+        provider = "kimi"
+        provider_model = "Kimi-K2.6"
+        provider_base_url = "mock://kimi"
+        provider_transport = "sophnet_chat_completions"
+        last_raw_content = ""
+
+        def complete(self, *_args: object, **_kwargs: object) -> v3.ProviderDecision:
+            raise v3.ProviderRequestError(
+                "SophNet Kimi request timed out",
+                provider_error_class="TimeoutException",
+            )
+
+    cache = v3.LocalJsonCache(run_root / "cache.json")
+    step = v3.complete_step(
+        config=_config(tmp_path, run_id="baseline_v3_2_feedback_error_path"),
+        run_root=run_root,
+        cache=cache,
+        client=TimeoutClient(),  # type: ignore[arg-type]
+        point=v3.DecisionPoint("AAPL", date(2024, 4, 2), "richer_research_packet"),
+        arm="full_gotra",
+        feedback=feedback,
+        feedback_filter_diagnostics=feedback_diagnostics,
+    )
+    summary = v3.summarize_run(
+        config=_config(tmp_path, run_id="baseline_v3_2_feedback_error_path"),
+        steps=[step],
+        total_points=1,
+        provider_preflight_error="",
+        stop_reason="",
+        max_provider_concurrency_used=1,
+        downgrade_events=[],
+    )
+
+    assert step["status"] == "provider_error"
+    assert step["error_type"] == "provider_timeout"
+    assert step["rejected_feedback_future_data_count"] == 1
+    assert step["rejected_feedback_schema_count"] == 3
+    assert step["rejected_feedback_non_independent_count"] == 1
+    assert step["feedback_source_kind_counts"]["outcome_feedback"] == 2
+    assert step["feedback_source_kind_counts"]["realized_error_feedback"] == 1
+    assert len(step["alaya_feedback_history"]) == 3
+    assert not step.get("provider_raw_content_path")
+    assert summary["rejected_feedback_future_data_count"] == 1
+    assert summary["rejected_feedback_schema_count"] == 3
+    assert summary["feedback_source_kind_counts"]["outcome_feedback"] == 2
     assert cache.values == {}
 
 

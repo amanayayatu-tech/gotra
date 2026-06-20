@@ -82,6 +82,8 @@
       "source_horizon_end_date": "2024-02-01",
       "actual_return": 1.0,
       "summary": "Malformed row must be rejected because prior_prediction is missing."
-    }
+    },
+    null,
+    []
   ]
 }
