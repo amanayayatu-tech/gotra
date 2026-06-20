@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -239,6 +240,27 @@ class JudgeAgent:
                 "reasoning": "Simplified Chinese, <=300 chars; distinguish methodology disagreement vs potential error",
                 "knowledge_flag": "none|watch|strong_candidate|quarantine_candidate",
                 "audit_actor": AUDIT_ACTOR,
+                "reason_code_examples": [
+                    "calibrated_accept",
+                    "risk_or_future_source_leak",
+                    "duplicate_or_noise",
+                    "insufficient_or_uncertain",
+                    "low_value_or_low_quality",
+                    "strong_conflict",
+                    "methodology_disagreement",
+                    "factual_error",
+                    "needs_human_review",
+                ],
+                "rubric_dimensions": [
+                    "methodology_disagreement_vs_factual_error",
+                    "evidence_provenance_and_traceability",
+                    "future_source_leak_or_decision_date_boundary",
+                    "conflict_with_existing_strong_knowledge",
+                    "duplicate_noise_or_low_incremental_value",
+                    "insufficient_evidence_or_defer_conditions",
+                    "likely_clean_outcome_feedback_substrate",
+                ],
+                "strong_candidate_policy": "report flag only; never auto-promote strong knowledge",
             },
         }
 
@@ -352,7 +374,19 @@ def build_decision_provenance(
 def sanitize_error_message(exc: Exception | None) -> str | None:
     if exc is None:
         return None
-    return str(exc).replace("\n", " ")[:300]
+    message = str(exc).replace("\n", " ")
+    redaction_patterns = (
+        (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer [REDACTED]"),
+        (re.compile(r"(?i)\bAuthorization\s*:\s*[^;,\s]+(?:\s+[^;,\s]+)?"), "Authorization: [REDACTED]"),
+        (
+            re.compile(r"(?i)\b(api[_-]?key|apiKey|token|access[_-]?token)\s*=\s*[^\s,;&]+"),
+            lambda match: f"{match.group(1)}=[REDACTED]",
+        ),
+        (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "sk-[REDACTED]"),
+    )
+    for pattern, replacement in redaction_patterns:
+        message = pattern.sub(replacement, message)
+    return message[:300]
 
 
 def append_decision_provenance(path: str | Path, record: dict[str, Any]) -> None:
