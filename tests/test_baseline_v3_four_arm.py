@@ -140,6 +140,27 @@ def test_cache_key_contains_input_layer_and_definition_version() -> None:
     assert "price_only_packet" in price_key
     assert "richer_research_packet" in rich_key
     assert "max_tokens=1600" in rich_key
+    assert "temperature=omitted" in rich_key
+
+
+def test_cache_key_includes_provider_temperature_contract() -> None:
+    base_args = {
+        "arm": "direct_llm",
+        "input_layer": "richer_research_packet",
+        "provider": "kimi",
+        "provider_model": "Kimi-K2.6",
+        "provider_base_url": "https://api.sophnet.com/v1/chat/completions",
+        "provider_max_tokens": 2000,
+        "prompt_hash": "abc123",
+    }
+    omitted_key = v3.cache_key_for(**base_args)
+    temperature_key = v3.cache_key_for(**base_args, provider_temperature=1.0)
+    old_incompatible_key = v3.cache_key_for(**base_args, provider_temperature=0.0)
+
+    assert omitted_key != temperature_key
+    assert old_incompatible_key != temperature_key
+    assert "temperature=1" in temperature_key
+    assert "temperature=0" in old_incompatible_key
 
 
 def test_strict_decision_json_rejects_unknown_keys_without_invention() -> None:
@@ -997,6 +1018,44 @@ def test_glm_provider_max_tokens_is_sent_in_request_body(monkeypatch) -> None:
     assert client.provider_max_tokens_applied is True
 
 
+def test_kimi_k26_sophnet_request_uses_temperature_one(monkeypatch) -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        requests.append(body)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(_decision_payload())}}]},
+        )
+
+    monkeypatch.setenv("SOPHNET_API_KEY", "sophnet-secret")
+    client = v3.KimiDecisionClient(
+        model="Kimi-K2.6",
+        request_timeout_seconds=1,
+        provider_base_url="https://api.sophnet.com/v1/chat/completions",
+        provider_max_tokens=77,
+        transport=httpx.MockTransport(handler),
+    )
+    decision = client.complete(
+        v3.build_prompt_payload(
+            arm="direct_llm",
+            input_layer="price_only_packet",
+            ticker="AAPL",
+            decision_date=date(2024, 1, 2),
+            price_rows=_price_rows(),
+            feedback=[],
+            provider="kimi",
+            provider_model="Kimi-K2.6",
+        )
+    )
+
+    assert decision.schema == v3.DECISION_SCHEMA
+    assert decision.provider_temperature == 1.0
+    assert requests[0]["temperature"] == 1.0
+    assert requests[0]["max_tokens"] == 77
+
+
 def test_kimi_retryable_timeout_recovers_with_attempt_metadata() -> None:
     client = v3.KimiDecisionClient(
         model="Kimi-K2.6",
@@ -1034,6 +1093,331 @@ def test_kimi_retryable_timeout_recovers_with_attempt_metadata() -> None:
     assert decision.provider_attempts == 2
     assert decision.provider_retry_count == 1
     assert decision.last_retryable_error_type == "TimeoutException"
+    assert decision.provider_temperature == 1.0
+
+
+def test_provider_temperature_metadata_is_auditable_without_breaking_non_kimi(
+    tmp_path: Path,
+) -> None:
+    _write_prices(tmp_path / "prices", "AAPL", days=520)
+    config = replace(
+        _config(
+            tmp_path,
+            run_id="baseline_v3_2_kimi_temperature_metadata_mock_test",
+            dates=(date(2024, 1, 2), date(2024, 2, 1)),
+        ),
+        provider="kimi",
+        provider_model="Kimi-K2.6",
+        provider_base_url="https://api.sophnet.com/v1/chat/completions",
+    )
+
+    summary = v3.run_four_arm(config)
+    run_root = tmp_path / "runs" / "baseline_v3_2_kimi_temperature_metadata_mock_test"
+    manifest = json.loads((run_root / "manifest.json").read_text(encoding="utf-8"))
+    step = json.loads(
+        (
+            run_root
+            / "direct_llm"
+            / "step_2024-02-01_aapl_richer_research_packet.json"
+        ).read_text(encoding="utf-8")
+    )
+    glm_metadata = v3.provider_temperature_metadata(
+        replace(config, provider="glm_sophnet", provider_model="GLM-5.2")
+    )
+
+    assert summary["status"] == "MOCK_PASS"
+    assert summary["provider_temperature"] == 1.0
+    assert summary["provider_temperature_applied"] is False
+    assert manifest["provider_temperature"] == 1.0
+    assert manifest["provider_temperature_applied"] is False
+    assert step["provider_temperature"] == 1.0
+    assert step["provider_temperature_applied"] is False
+    assert "temperature=1" in step["cache_key"]
+    assert summary["request_diagnostics_by_arm"]["direct_llm"]["provider_temperature"] == {
+        "min": 1.0,
+        "max": 1.0,
+    }
+    assert glm_metadata["provider_temperature"] is None
+    assert glm_metadata["provider_temperature_applied"] is False
+
+
+def test_codex_cli_backend_fake_client_records_metadata_and_transcript(
+    tmp_path: Path,
+) -> None:
+    payload = v3.build_prompt_payload(
+        arm="direct_llm",
+        input_layer="price_only_packet",
+        ticker="AAPL",
+        decision_date=date(2024, 1, 2),
+        price_rows=_price_rows(days=370),
+        feedback=[],
+        provider=v3.CODEX_CLI_BACKEND,
+        provider_model="gpt-5.5",
+    )
+
+    class FakeCompletionClient:
+        def complete(self, **_kwargs: object) -> str:
+            return json.dumps(_decision_payload())
+
+    client = v3.CodexCliBackendDecisionClient(
+        model="gpt-5.5",
+        reasoning_setting="low",
+        run_root=tmp_path,
+        provider_max_tokens=800,
+        completion_client=FakeCompletionClient(),
+        codex_cli_version_text="codex-cli 0.test",
+    )
+
+    decision = client.complete(payload, request_timeout_seconds=30)
+
+    transcript_path = Path(decision.output_transcript_path)
+    assert decision.backend_name == v3.CODEX_CLI_BACKEND
+    assert decision.codex_cli_version == "codex-cli 0.test"
+    assert decision.codex_cli_model == "gpt-5.5"
+    assert decision.codex_cli_reasoning_setting == "low"
+    assert transcript_path.exists()
+    assert transcript_path.is_relative_to(tmp_path)
+    assert decision.parsed_decision_hash == v3.stable_json_hash(
+        v3.decision_to_cache_payload(decision)
+    )
+
+
+def test_codex_cli_backend_metadata_surfaces_in_run_summary_without_provider_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_prices(tmp_path / "prices", "AAPL", days=520)
+    monkeypatch.delenv("SOPHNET_API_KEY", raising=False)
+    monkeypatch.setattr(v3.shutil, "which", lambda _binary: "/usr/local/bin/codex")
+    monkeypatch.setattr(v3, "codex_cli_version", lambda _binary="codex": "codex-cli 0.test")
+
+    class FakeCodexClient:
+        provider = v3.CODEX_CLI_BACKEND
+        provider_transport = v3.CODEX_CLI_BACKEND
+
+        def __init__(
+            self,
+            *,
+            model: str,
+            reasoning_setting: str,
+            run_root: Path,
+            provider_max_tokens: int,
+            codex_binary: str = "codex",
+            project_root: Path | None = None,
+        ) -> None:
+            del provider_max_tokens, codex_binary, project_root
+            self.provider_model = model
+            self.provider_base_url = "local://codex-cli"
+            self.reasoning_setting = reasoning_setting
+            self.run_root = run_root
+            self.last_raw_content = ""
+
+        def complete(
+            self,
+            payload: dict[str, object],
+            *,
+            request_timeout_seconds: float | None = None,
+        ) -> v3.ProviderDecision:
+            del request_timeout_seconds
+            decision_payload = _decision_payload(arm=v3.normalize_arm(payload["arm"]))
+            decision_payload["ticker"] = payload["ticker"]
+            decision_payload["decision_date"] = payload["decision_date"]
+            decision_payload["input_cutoff"] = payload["decision_date"]
+            self.last_raw_content = json.dumps(decision_payload)
+            transcript_path = v3.codex_cli_transcript_path(self.run_root, payload)
+            transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            transcript_path.write_text(self.last_raw_content, encoding="utf-8")
+            decision = v3.parse_provider_decision(self.last_raw_content)
+            return replace(
+                decision,
+                backend_name=v3.CODEX_CLI_BACKEND,
+                codex_cli_version="codex-cli 0.test",
+                codex_cli_model=self.provider_model,
+                codex_cli_reasoning_setting=self.reasoning_setting,
+                output_transcript_path=str(transcript_path),
+                parsed_decision_hash=v3.stable_json_hash(
+                    v3.decision_to_cache_payload(decision)
+                ),
+            )
+
+    monkeypatch.setattr(v3, "CodexCliBackendDecisionClient", FakeCodexClient)
+    config = replace(
+        _config(
+            tmp_path,
+            mode="provider-canary",
+            run_id="baseline_v3_4_codex_cli_fake_canary",
+            dates=(date(2024, 1, 2), date(2024, 2, 1)),
+        ),
+        provider=v3.CODEX_CLI_BACKEND,
+        provider_model="gpt-5.5",
+        provider_base_url="local://codex-cli",
+        input_layers=("price_only_packet",),
+        codex_cli_reasoning_setting="low",
+    )
+
+    summary = v3.run_four_arm(config)
+    run_root = tmp_path / "runs" / "baseline_v3_4_codex_cli_fake_canary"
+    manifest = json.loads((run_root / "manifest.json").read_text(encoding="utf-8"))
+    step = json.loads(
+        (
+            run_root
+            / "direct_llm"
+            / "step_2024-02-01_aapl_price_only_packet.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert summary["status"] == "PROVIDER_CANARY_PASS"
+    assert summary["provider_execution_mode"] == v3.CODEX_CLI_BACKEND
+    assert summary["provider_call_status"] == "Codex CLI backend canary attempted"
+    assert summary["backend_name"] == v3.CODEX_CLI_BACKEND
+    assert summary["codex_cli_version"] == "codex-cli 0.test"
+    assert summary["codex_cli_transcript_path_count"] == 8
+    assert summary["parsed_decision_hash_count"] == 8
+    assert manifest["backend_name"] == v3.CODEX_CLI_BACKEND
+    assert step["backend_name"] == v3.CODEX_CLI_BACKEND
+    assert step["output_transcript_path"]
+    assert step["parsed_decision_hash"]
+
+
+def test_deterministic_price_only_baseline_excludes_future_rows() -> None:
+    rows_with_future = _price_rows(days=430)
+    decision_date = date(2024, 1, 2)
+    rows_visible_only = rows_with_future[
+        pd.to_datetime(rows_with_future["date"]).dt.date <= decision_date
+    ]
+
+    baseline_with_future = v3.deterministic_price_only_baseline_decision(
+        ticker="AAPL",
+        decision_date=decision_date,
+        price_rows=rows_with_future,
+    )
+    baseline_visible_only = v3.deterministic_price_only_baseline_decision(
+        ticker="AAPL",
+        decision_date=decision_date,
+        price_rows=rows_visible_only,
+    )
+
+    assert baseline_with_future["baseline"] == "deterministic_price_only_baseline"
+    assert baseline_with_future["llm_used"] is False
+    assert baseline_with_future["future_data_allowed"] is False
+    assert baseline_with_future["future_rows_excluded"] > 0
+    assert baseline_with_future["latest_visible_price_date"] <= decision_date.isoformat()
+    assert baseline_with_future["expected_change_pct"] == baseline_visible_only["expected_change_pct"]
+    assert baseline_with_future["direction"] == baseline_visible_only["direction"]
+
+
+def test_deterministic_reference_dedupes_layers_and_scores_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_prices(tmp_path / "prices", "AAPL", days=520)
+    _write_prices(tmp_path / "prices", "MSFT", days=520)
+
+    def fail_if_llm_client_used(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("deterministic reference must not instantiate an LLM client")
+
+    monkeypatch.setattr(v3, "MockDecisionClient", fail_if_llm_client_used)
+    monkeypatch.setattr(v3, "KimiDecisionClient", fail_if_llm_client_used)
+    monkeypatch.setattr(v3, "GlmSophnetDecisionClient", fail_if_llm_client_used)
+    monkeypatch.setattr(v3, "CodexCliBackendDecisionClient", fail_if_llm_client_used)
+
+    config = _config(
+        tmp_path,
+        run_id="baseline_v3_4_det_reference_direct",
+        tickers=("AAPL", "MSFT"),
+        dates=(date(2024, 1, 2), date(2024, 2, 1), date(2024, 3, 1)),
+    )
+    run_root = tmp_path / "runs" / config.run_id
+    reference = v3.deterministic_price_only_reference_for_run(
+        config=config,
+        run_root=run_root,
+    )
+
+    assert reference["status"] == "REFERENCE_READY"
+    assert reference["count"] == 4
+    assert reference["unique_scored_point_count"] == 4
+    assert reference["raw_mirrored_count"] == 8
+    assert reference["future_data_violations"] == 0
+    assert reference["llm_used"] is False
+    assert reference["provider_or_backend_called"] is False
+    assert reference["metrics"]["scored_steps"] == 4
+    assert reference["metrics"]["mse"] is not None
+    artifact_paths = sorted((run_root / "deterministic_price_only_baseline").glob("*.json"))
+    assert len(artifact_paths) == 4
+    for path in artifact_paths:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        assert record["llm_used"] is False
+        assert record["provider_or_backend_called"] is False
+        assert record["latest_visible_price_date"] <= record["decision_date"]
+        assert record["future_rows_excluded"] > 0
+        assert record["actual_change_pct"] is not None
+
+
+def test_run_summary_includes_deterministic_reference_without_changing_steps(
+    tmp_path: Path,
+) -> None:
+    _write_prices(tmp_path / "prices", "AAPL", days=520)
+    summary = v3.run_four_arm(
+        _config(
+            tmp_path,
+            run_id="baseline_v3_4_det_reference_summary",
+            tickers=("AAPL",),
+            dates=(date(2024, 1, 2), date(2024, 2, 1), date(2024, 3, 1)),
+        )
+    )
+
+    assert summary["status"] == "MOCK_PASS"
+    assert summary["expected_steps"] == 24
+    assert summary["actual_step_files"] == 24
+    assert summary["scored_step_count"] == 24
+    assert summary["deterministic_price_only_baseline_status"] == "REFERENCE_READY"
+    assert summary["clean_historical_reference_status"] == (
+        "PRESENT_DETERMINISTIC_PRICE_ONLY_BASELINE"
+    )
+    assert summary["deterministic_price_only_baseline_count"] == 2
+    assert summary["deterministic_price_only_baseline_raw_mirrored_count"] == 4
+    assert summary["deterministic_price_only_baseline_future_data_violations"] == 0
+    assert summary["deterministic_price_only_baseline_provider_or_backend_called"] is False
+    assert summary["deterministic_price_only_baseline_metrics"]["scored_steps"] == 2
+    assert summary["paired_complete_points"] == 4
+    assert summary["paired_coverage"] == 1.0
+
+
+def test_blocked_run_id_exists_summary_has_empty_deterministic_reference_shape(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, run_id="baseline_v3_4_blocked_existing")
+    run_root = tmp_path / "runs" / config.run_id
+    run_root.mkdir(parents=True)
+    (run_root / "sentinel.json").write_text("{}", encoding="utf-8")
+
+    summary = v3.run_four_arm(config)
+
+    assert summary["status"] == "BLOCKED_RUN_ID_EXISTS"
+    _assert_empty_deterministic_reference_fields(summary)
+    assert not (run_root / "deterministic_price_only_baseline").exists()
+
+
+def test_blocked_resume_manifest_mismatch_summary_has_empty_deterministic_reference_shape(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        _config(tmp_path, run_id="baseline_v3_4_blocked_resume_mismatch"),
+        resume=True,
+    )
+    run_root = tmp_path / "runs" / config.run_id
+    run_root.mkdir(parents=True)
+    (run_root / "manifest.json").write_text(
+        json.dumps({"run_id": config.run_id, "provider": "different-provider"}),
+        encoding="utf-8",
+    )
+
+    summary = v3.run_four_arm(config)
+
+    assert summary["status"] == "BLOCKED_RESUME_MANIFEST_MISMATCH"
+    assert "resume manifest mismatch" in summary["stop_reason"]
+    _assert_empty_deterministic_reference_fields(summary)
+    assert not (run_root / "deterministic_price_only_baseline").exists()
 
 
 def test_kimi_schema_and_input_echo_errors_are_not_retried() -> None:
@@ -1512,6 +1896,28 @@ def _config(
         timeout_retry_backoff_seconds=0.0,
         scheduler_policy="per_date_feedback_snapshot_interleaved_point_layer_arm_v3",
     )
+
+
+def _assert_empty_deterministic_reference_fields(summary: dict[str, object]) -> None:
+    assert summary["deterministic_price_only_baseline_status"] == "REFERENCE_NOT_COMPUTED"
+    assert summary["deterministic_price_only_baseline_count"] == 0
+    assert summary["deterministic_price_only_baseline_unique_scored_point_count"] == 0
+    assert summary["deterministic_price_only_baseline_raw_mirrored_count"] == 0
+    assert summary["deterministic_price_only_baseline_input_layer_count"] == 0
+    assert summary["deterministic_price_only_baseline_future_data_violations"] == 0
+    assert summary["deterministic_price_only_baseline_latest_visible_price_date_max"] == ""
+    assert summary["deterministic_price_only_baseline_provider_or_backend_called"] is False
+    assert summary["deterministic_price_only_baseline_llm_used"] is False
+    assert summary["clean_historical_reference_status"] == (
+        "MISSING_OR_BLOCKED_DETERMINISTIC_PRICE_ONLY_BASELINE"
+    )
+    metrics = summary["deterministic_price_only_baseline_metrics"]
+    assert isinstance(metrics, dict)
+    assert metrics["scored_steps"] == 0
+    nested = summary["deterministic_price_only_baseline"]
+    assert isinstance(nested, dict)
+    assert nested["status"] == summary["deterministic_price_only_baseline_status"]
+    assert nested["metrics"] == metrics
 
 
 def _step(
