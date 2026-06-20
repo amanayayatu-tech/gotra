@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -15,6 +18,7 @@ from gotra.judge_agent.alaya_client import AlayaClient
 
 AUDIT_ACTOR = "judge_agent/codex"
 MAX_REASONING_CHARS = 300
+PROVENANCE_SCHEMA_VERSION = "gotra.judge.decision_provenance.v1"
 
 
 class DecisionProvider(Protocol):
@@ -80,6 +84,7 @@ class JudgeRunResult:
     decision: JudgeDecision
     routed_action: str
     response: dict[str, Any] | None = None
+    provenance: dict[str, Any] | None = None
 
 
 class JudgeAgent:
@@ -91,10 +96,12 @@ class JudgeAgent:
         alaya_client: AlayaClient,
         decision_provider: DecisionProvider,
         data_dir: str | Path = "engine/ksana/data",
+        provenance_log_path: str | Path | None = None,
     ) -> None:
         self.alaya_client = alaya_client
         self.decision_provider = decision_provider
         self.data_dir = Path(data_dir)
+        self.provenance_log_path = Path(provenance_log_path) if provenance_log_path else None
 
     def judge_gate(self, gate_id: str, *, apply: bool = True) -> JudgeRunResult:
         """Evaluate one gate and optionally route approve/reject through Alaya."""
@@ -102,8 +109,10 @@ class JudgeAgent:
         gate = self.alaya_client.get_human_gate(gate_id)
         context = self.build_context(gate)
         if context["gate_type"] == "risk" and context["quarantine_list"].get("missing"):
-            return JudgeRunResult(
+            return self._result(
                 gate_id=gate_id,
+                gate=gate,
+                context=context,
                 decision=JudgeDecision(
                     decision="defer",
                     confidence=1.0,
@@ -112,28 +121,76 @@ class JudgeAgent:
                     audit_actor=AUDIT_ACTOR,
                 ),
                 routed_action="none",
+                apply=apply,
+                alaya_write_attempted=False,
             )
         decision = parse_judge_decision(self.decision_provider(context))
         if not apply or decision.decision == "defer":
-            return JudgeRunResult(gate_id=gate_id, decision=decision, routed_action="none")
-        if decision.decision == "approve":
-            response = self.alaya_client.approve_gate(gate_id, rationale=decision.reasoning)
-            return JudgeRunResult(
+            return self._result(
                 gate_id=gate_id,
+                gate=gate,
+                context=context,
+                decision=decision,
+                routed_action="none",
+                apply=apply,
+                alaya_write_attempted=False,
+            )
+        if decision.decision == "approve":
+            try:
+                response = self.alaya_client.approve_gate(gate_id, rationale=decision.reasoning)
+            except Exception as exc:
+                self._result(
+                    gate_id=gate_id,
+                    gate=gate,
+                    context=context,
+                    decision=decision,
+                    routed_action="approve_gate",
+                    apply=apply,
+                    alaya_write_attempted=True,
+                    routed_action_status="failed",
+                    alaya_write_error=exc,
+                )
+                raise
+            return self._result(
+                gate_id=gate_id,
+                gate=gate,
+                context=context,
                 decision=decision,
                 routed_action="approve_gate",
                 response=response,
+                apply=apply,
+                alaya_write_attempted=True,
+                routed_action_status="succeeded",
             )
-        response = self.alaya_client.reject_gate(
-            gate_id,
-            rationale=decision.reasoning,
-            reason_code=decision.reason_code or "risk_too_high",
-        )
-        return JudgeRunResult(
+        try:
+            response = self.alaya_client.reject_gate(
+                gate_id,
+                rationale=decision.reasoning,
+                reason_code=decision.reason_code or "risk_too_high",
+            )
+        except Exception as exc:
+            self._result(
+                gate_id=gate_id,
+                gate=gate,
+                context=context,
+                decision=decision,
+                routed_action="reject_gate",
+                apply=apply,
+                alaya_write_attempted=True,
+                routed_action_status="failed",
+                alaya_write_error=exc,
+            )
+            raise
+        return self._result(
             gate_id=gate_id,
+            gate=gate,
+            context=context,
             decision=decision,
             routed_action="reject_gate",
             response=response,
+            apply=apply,
+            alaya_write_attempted=True,
+            routed_action_status="succeeded",
         )
 
     def build_context(self, gate: dict[str, Any]) -> dict[str, Any]:
@@ -166,6 +223,9 @@ class JudgeAgent:
         }
         return {
             "gate": gate,
+            "gate_id": str(gate.get("id") or ""),
+            "project_id": project_id,
+            "run_id": run_id,
             "ticker": ticker,
             "gate_type": gate_type,
             "prompt_text": prompt_text,
@@ -180,8 +240,64 @@ class JudgeAgent:
                 "reasoning": "Simplified Chinese, <=300 chars; distinguish methodology disagreement vs potential error",
                 "knowledge_flag": "none|watch|strong_candidate|quarantine_candidate",
                 "audit_actor": AUDIT_ACTOR,
+                "reason_code_examples": [
+                    "calibrated_accept",
+                    "risk_or_future_source_leak",
+                    "duplicate_or_noise",
+                    "insufficient_or_uncertain",
+                    "low_value_or_low_quality",
+                    "strong_conflict",
+                    "methodology_disagreement",
+                    "factual_error",
+                    "needs_human_review",
+                ],
+                "rubric_dimensions": [
+                    "methodology_disagreement_vs_factual_error",
+                    "evidence_provenance_and_traceability",
+                    "future_source_leak_or_decision_date_boundary",
+                    "conflict_with_existing_strong_knowledge",
+                    "duplicate_noise_or_low_incremental_value",
+                    "insufficient_evidence_or_defer_conditions",
+                    "likely_clean_outcome_feedback_substrate",
+                ],
+                "strong_candidate_policy": "report flag only; never auto-promote strong knowledge",
             },
         }
+
+    def _result(
+        self,
+        *,
+        gate_id: str,
+        gate: dict[str, Any],
+        context: dict[str, Any],
+        decision: JudgeDecision,
+        routed_action: str,
+        apply: bool,
+        alaya_write_attempted: bool,
+        response: dict[str, Any] | None = None,
+        routed_action_status: str = "not_attempted",
+        alaya_write_error: Exception | None = None,
+    ) -> JudgeRunResult:
+        provenance = build_decision_provenance(
+            gate_id=gate_id,
+            gate=gate,
+            context=context,
+            decision=decision,
+            apply=apply,
+            routed_action=routed_action,
+            alaya_write_attempted=alaya_write_attempted,
+            routed_action_status=routed_action_status,
+            alaya_write_error=alaya_write_error,
+        )
+        if self.provenance_log_path is not None:
+            append_decision_provenance(self.provenance_log_path, provenance)
+        return JudgeRunResult(
+            gate_id=gate_id,
+            decision=decision,
+            routed_action=routed_action,
+            response=response,
+            provenance=provenance,
+        )
 
 
 def parse_judge_decision(value: str | dict[str, Any]) -> JudgeDecision:
@@ -198,6 +314,129 @@ def parse_judge_decision(value: str | dict[str, Any]) -> JudgeDecision:
         return JudgeDecision.model_validate(payload)
     except ValidationError as exc:
         raise ValueError(f"Judge provider returned invalid decision: {exc}") from exc
+
+
+def build_decision_provenance(
+    *,
+    gate_id: str,
+    gate: dict[str, Any],
+    context: dict[str, Any],
+    decision: JudgeDecision,
+    apply: bool,
+    routed_action: str,
+    alaya_write_attempted: bool,
+    routed_action_status: str = "not_attempted",
+    alaya_write_error: Exception | None = None,
+) -> dict[str, Any]:
+    """Build one append-only Judge decision provenance record without raw model output."""
+
+    payload = _decode_jsonish(gate.get("payload"))
+    decision_payload = decision.model_dump()
+    context_fingerprint = {
+        "gate_id": gate_id,
+        "project_id": context.get("project_id") or payload.get("projectId") or payload.get("project_id"),
+        "run_id": context.get("run_id") or payload.get("run_id") or payload.get("runId") or gate.get("cycleId"),
+        "ticker": context.get("ticker"),
+        "gate_type": context.get("gate_type"),
+        "prompt_text": context.get("prompt_text"),
+        "active_knowledge_count": len(context.get("existing_knowledge", {}).get("active", [])),
+        "strong_knowledge_count": len(context.get("existing_knowledge", {}).get("strong", [])),
+        "historical_accuracy_count": len(context.get("historical_accuracy") or []),
+        "fwg_recommendation_count": len(context.get("fwg_recommendations") or []),
+        "red_team_finding_count": len(context.get("red_team_findings") or []),
+    }
+    return {
+        "provenance_schema_version": PROVENANCE_SCHEMA_VERSION,
+        "run_id": str(context_fingerprint["run_id"] or ""),
+        "gate_id": gate_id,
+        "decision": decision.decision,
+        "confidence": decision.confidence,
+        "reason_code": decision.reason_code,
+        "knowledge_flag": decision.knowledge_flag,
+        "audit_actor": decision.audit_actor,
+        "knowledge_id": _first_text(payload, gate, keys=("knowledge_id", "knowledgeId", "knowledge_ref", "knowledgeRef")),
+        "prediction_id": _first_text(payload, gate, keys=("prediction_id", "predictionId")),
+        "feedback_ref": _first_text(payload, gate, keys=("feedback_ref", "feedbackRef")),
+        "apply": apply,
+        "dry_run": not apply,
+        "routed_action": routed_action,
+        "routed_action_status": routed_action_status,
+        "alaya_write_attempted": alaya_write_attempted,
+        "alaya_write_error_class": type(alaya_write_error).__name__ if alaya_write_error else None,
+        "alaya_write_error_message": sanitize_error_message(alaya_write_error),
+        "decision_timestamp_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "input_hash": stable_json_hash(context_fingerprint),
+        "decision_hash": stable_json_hash(decision_payload),
+        "gate_payload_hash": stable_json_hash(payload),
+    }
+
+
+def sanitize_error_message(exc: Exception | None) -> str | None:
+    if exc is None:
+        return None
+    message = str(exc).replace("\n", " ")
+    redaction_patterns = (
+        (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer [REDACTED]"),
+        (re.compile(r"(?i)\bAuthorization\s*:\s*[^;,\s]+(?:\s+[^;,\s]+)?"), "Authorization: [REDACTED]"),
+        (
+            re.compile(r"(?i)\b(api[_-]?key|apiKey|token|access[_-]?token)\s*=\s*[^\s,;&]+"),
+            lambda match: f"{match.group(1)}=[REDACTED]",
+        ),
+        (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "sk-[REDACTED]"),
+    )
+    for pattern, replacement in redaction_patterns:
+        message = pattern.sub(replacement, message)
+    return message[:300]
+
+
+def append_decision_provenance(path: str | Path, record: dict[str, Any]) -> None:
+    """Append one Judge decision provenance JSONL record."""
+
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def read_decision_provenance(path: str | Path) -> list[dict[str, Any]]:
+    """Read Judge decision provenance JSONL records."""
+
+    input_path = Path(path)
+    if not input_path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in input_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def find_provenance_by_feedback_ref(path: str | Path, feedback_ref: str) -> dict[str, Any] | None:
+    """Resolve one feedback_ref back to the Judge provenance record that produced it."""
+
+    for record in read_decision_provenance(path):
+        if str(record.get("feedback_ref") or "") == feedback_ref:
+            return record
+    return None
+
+
+def stable_json_hash(value: Any) -> str:
+    """Return a stable SHA-256 hash for structured audit metadata."""
+
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _first_text(*containers: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    for container in containers:
+        for key in keys:
+            value = container.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+    return None
 
 
 def load_fwg_recommendations(data_dir: str | Path, *, run_id: str, ticker: str) -> list[dict[str, Any]]:
