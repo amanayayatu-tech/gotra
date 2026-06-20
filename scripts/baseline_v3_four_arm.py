@@ -95,6 +95,9 @@ RUN_ID_PREFIX_V3_4 = "baseline_v3_4_"
 CODEX_CLI_BACKEND = "codex_cli_llm_backend"
 DEFAULT_CODEX_CLI_MODEL = "gpt-5.5"
 DEFAULT_CODEX_CLI_REASONING = "low"
+DETERMINISTIC_REFERENCE_SCHEMA = (
+    "gotra.baseline_v3_4b.deterministic_price_only_reference.v1"
+)
 WINDOW_DAYS = 30
 DEFAULT_TICKERS = v2.V1_PILOT_TICKERS
 DEFAULT_DATES = v2.V1_PILOT_DATES
@@ -1835,6 +1838,199 @@ def deterministic_price_only_baseline_decision(
     }
 
 
+def deterministic_price_only_reference_for_run(
+    *,
+    config: RunConfig,
+    run_root: Path,
+) -> dict[str, Any]:
+    reference_dir = run_root / "deterministic_price_only_baseline"
+    reference_dir.mkdir(parents=True, exist_ok=True)
+    records: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, int]] = set()
+    raw_mirrored_count = 0
+    for decision_date in config.dates:
+        if scoring_segment_for(config, decision_date) != "scored":
+            continue
+        for ticker in config.tickers:
+            key = (ticker, decision_date.isoformat(), WINDOW_DAYS)
+            if key in seen:
+                continue
+            seen.add(key)
+            raw_mirrored_count += len(config.input_layers)
+            point = DecisionPoint(ticker, decision_date, "price_only_packet")
+            try:
+                context = price_context_for(point, price_dir=config.price_dir)
+                full_price_rows = read_price_cache(ticker, price_dir=config.price_dir)
+                record = deterministic_price_only_reference_record(
+                    run_id=config.run_id,
+                    ticker=ticker,
+                    decision_date=decision_date,
+                    context=context,
+                    full_price_rows=full_price_rows,
+                    input_layers=config.input_layers,
+                )
+                records.append(record)
+                path = reference_dir / (
+                    f"reference_{decision_date.isoformat()}_{ticker_slug(ticker)}.json"
+                )
+                path.write_text(
+                    json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+            except Exception as exc:  # noqa: BLE001 - local price cache can be incomplete.
+                errors.append(
+                    {
+                        "ticker": ticker,
+                        "decision_date": decision_date.isoformat(),
+                        "error_type": exc.__class__.__name__,
+                        "error_message": redact_error(str(exc)),
+                    }
+                )
+    scored = [record for record in records if record.get("status") == "scored"]
+    future_violations = [
+        record for record in scored if record.get("future_data_violation")
+    ]
+    if errors or future_violations:
+        status = "REFERENCE_NEEDS_FIX"
+    elif scored:
+        status = "REFERENCE_READY"
+    else:
+        status = "REFERENCE_DATA_INSUFFICIENT"
+    latest_dates = [
+        str(record.get("latest_visible_price_date"))
+        for record in scored
+        if record.get("latest_visible_price_date")
+    ]
+    return {
+        "schema": DETERMINISTIC_REFERENCE_SCHEMA,
+        "status": status,
+        "artifact_dir": str(reference_dir),
+        "count": len(scored),
+        "unique_scored_point_count": len(scored),
+        "raw_mirrored_count": raw_mirrored_count,
+        "input_layer_count": len(config.input_layers),
+        "metrics": deterministic_price_only_reference_metrics(scored),
+        "future_data_violations": len(future_violations),
+        "latest_visible_price_date_max": max(latest_dates) if latest_dates else "",
+        "error_count": len(errors),
+        "errors": errors[:10],
+        "llm_used": False,
+        "provider_or_backend_called": False,
+        "clean_historical_reference_status": (
+            "PRESENT_DETERMINISTIC_PRICE_ONLY_BASELINE"
+            if status == "REFERENCE_READY"
+            else "MISSING_OR_BLOCKED_DETERMINISTIC_PRICE_ONLY_BASELINE"
+        ),
+    }
+
+
+def deterministic_price_only_reference_record(
+    *,
+    run_id: str,
+    ticker: str,
+    decision_date: date,
+    context: PriceContext,
+    full_price_rows: pd.DataFrame,
+    input_layers: tuple[InputLayer, ...],
+) -> dict[str, Any]:
+    decision = deterministic_price_only_baseline_decision(
+        ticker=ticker,
+        decision_date=decision_date,
+        price_rows=full_price_rows,
+    )
+    actual = change_pct(float(context.start_row["adj_close"]), float(context.end_row["adj_close"]))
+    error = round(actual - float(decision["expected_change_pct"]), 6)
+    latest_visible_date = parse_date(str(decision["latest_visible_price_date"]))
+    future_data_violation = latest_visible_date > decision_date
+    direction_hit = direction_hit_for(
+        predicted_direction=str(decision["direction"]),
+        actual_change_pct=actual,
+    )
+    return {
+        "schema": DETERMINISTIC_REFERENCE_SCHEMA,
+        "run_id": run_id,
+        "status": "scored",
+        "baseline": "deterministic_price_only_baseline",
+        "reference_key": f"{ticker}|{decision_date.isoformat()}|{WINDOW_DAYS}",
+        "ticker": ticker,
+        "decision_date": decision_date.isoformat(),
+        "horizon_days": WINDOW_DAYS,
+        "window_end_date": context.outcome_date.isoformat(),
+        "outcome_as_of": str(context.end_row["date"]),
+        "input_layers_represented": list(input_layers),
+        "input_layer_mirrored_equivalent_count": len(input_layers),
+        "direction": decision["direction"],
+        "expected_change_pct": decision["expected_change_pct"],
+        "confidence": decision["confidence"],
+        "input_cutoff": decision["input_cutoff"],
+        "latest_visible_price_date": decision["latest_visible_price_date"],
+        "visible_price_rows": decision["visible_price_rows"],
+        "future_rows_excluded": decision["future_rows_excluded"],
+        "future_data_allowed": False,
+        "future_data_violation": future_data_violation,
+        "llm_used": False,
+        "provider_or_backend_called": False,
+        "actual_change_pct": actual,
+        "actual_direction": actual_direction(actual),
+        "direction_hit": direction_hit,
+        "error": error,
+        "mse": round(error * error, 6),
+        "mae": round(abs(error), 6),
+        "policy_a_return_pct": actual if decision["direction"] == "long" else 0.0,
+        "abstain_reason": "",
+        "decision_inputs": decision_inputs(
+            context.price_rows,
+            research_artifacts=[],
+            feedback=[],
+        ),
+        "outcome_inputs": outcome_inputs(context.end_row),
+    }
+
+
+def deterministic_price_only_reference_metrics(
+    records: list[dict[str, Any]]
+) -> dict[str, Any]:
+    if not records:
+        return {
+            "scored_steps": 0,
+            "direction_hit_rate": None,
+            "mse": None,
+            "mae": None,
+            "policy_a_cumulative_return_pct": None,
+            "calibration": calibration_and_abstain_metrics([]),
+        }
+    direction_hits = [1 if record.get("direction_hit") else 0 for record in records]
+    return {
+        "scored_steps": len(records),
+        "direction_hit_rate": sum(direction_hits) / len(direction_hits),
+        "mse": mean_float(record["mse"] for record in records),
+        "mae": mean_float(record["mae"] for record in records),
+        "policy_a_cumulative_return_pct": policy_a_cumulative_return(records),
+        "calibration": calibration_and_abstain_metrics(records),
+    }
+
+
+def deterministic_price_only_reference_empty() -> dict[str, Any]:
+    return {
+        "schema": DETERMINISTIC_REFERENCE_SCHEMA,
+        "status": "REFERENCE_NOT_COMPUTED",
+        "artifact_dir": "",
+        "count": 0,
+        "unique_scored_point_count": 0,
+        "raw_mirrored_count": 0,
+        "input_layer_count": 0,
+        "metrics": deterministic_price_only_reference_metrics([]),
+        "future_data_violations": 0,
+        "latest_visible_price_date_max": "",
+        "error_count": 0,
+        "errors": [],
+        "llm_used": False,
+        "provider_or_backend_called": False,
+        "clean_historical_reference_status": "MISSING_OR_BLOCKED_DETERMINISTIC_PRICE_ONLY_BASELINE",
+    }
+
+
 def scoring_segment_for(config: RunConfig, decision_date: date) -> ScoringSegment:
     ordered_dates = sorted(config.dates)
     warm_up_dates = set(ordered_dates[: max(0, config.warm_up_dates)])
@@ -2998,6 +3194,10 @@ def run_four_arm(config: RunConfig) -> dict[str, Any]:
             if should_increase_concurrency(config=config, wave_steps=wave_steps):
                 concurrency_used = min(config.max_provider_concurrency, concurrency_used + 1)
 
+    deterministic_reference = deterministic_price_only_reference_for_run(
+        config=config,
+        run_root=run_root,
+    )
     summary = summarize_run(
         config=config,
         steps=steps,
@@ -3007,6 +3207,7 @@ def run_four_arm(config: RunConfig) -> dict[str, Any]:
         max_provider_concurrency_used=concurrency_used,
         downgrade_events=downgrade_events,
         circuit_breaker=circuit_breaker,
+        deterministic_reference=deterministic_reference,
     )
     (run_root / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True),
@@ -3341,8 +3542,10 @@ def summarize_run(
     max_provider_concurrency_used: int,
     downgrade_events: list[dict[str, Any]],
     circuit_breaker: CircuitBreakerState | None = None,
+    deterministic_reference: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     circuit_breaker = circuit_breaker or CircuitBreakerState()
+    deterministic_reference = deterministic_reference or deterministic_price_only_reference_empty()
     provider_errors = sum(1 for step in steps if step.get("status") == "provider_error")
     schema_pass = sum(1 for step in steps if step.get("status") == "scored")
     timeout_count = count_error_type(steps, "provider_timeout")
@@ -3501,6 +3704,39 @@ def summarize_run(
         "stop_reason": stop_reason,
         "arms": list(ARMS),
         "arm_interpretation": arm_interpretation_summary(),
+        "deterministic_price_only_baseline_status": deterministic_reference["status"],
+        "deterministic_price_only_baseline_count": deterministic_reference["count"],
+        "deterministic_price_only_baseline_unique_scored_point_count": deterministic_reference[
+            "unique_scored_point_count"
+        ],
+        "deterministic_price_only_baseline_raw_mirrored_count": deterministic_reference[
+            "raw_mirrored_count"
+        ],
+        "deterministic_price_only_baseline_input_layer_count": deterministic_reference[
+            "input_layer_count"
+        ],
+        "deterministic_price_only_baseline_metrics": deterministic_reference["metrics"],
+        "deterministic_price_only_baseline_future_data_violations": deterministic_reference[
+            "future_data_violations"
+        ],
+        "deterministic_price_only_baseline_latest_visible_price_date_max": deterministic_reference[
+            "latest_visible_price_date_max"
+        ],
+        "deterministic_price_only_baseline_artifact_dir": deterministic_reference[
+            "artifact_dir"
+        ],
+        "deterministic_price_only_baseline_error_count": deterministic_reference[
+            "error_count"
+        ],
+        "deterministic_price_only_baseline_errors": deterministic_reference["errors"],
+        "deterministic_price_only_baseline_llm_used": deterministic_reference["llm_used"],
+        "deterministic_price_only_baseline_provider_or_backend_called": deterministic_reference[
+            "provider_or_backend_called"
+        ],
+        "clean_historical_reference_status": deterministic_reference[
+            "clean_historical_reference_status"
+        ],
+        "deterministic_price_only_baseline": deterministic_reference,
         "input_layers": list(config.input_layers),
         "warm_up_dates": config.warm_up_dates,
         "repeat_run_index": config.repeat_run_index,

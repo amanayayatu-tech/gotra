@@ -1306,6 +1306,83 @@ def test_deterministic_price_only_baseline_excludes_future_rows() -> None:
     assert baseline_with_future["direction"] == baseline_visible_only["direction"]
 
 
+def test_deterministic_reference_dedupes_layers_and_scores_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_prices(tmp_path / "prices", "AAPL", days=520)
+    _write_prices(tmp_path / "prices", "MSFT", days=520)
+
+    def fail_if_llm_client_used(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("deterministic reference must not instantiate an LLM client")
+
+    monkeypatch.setattr(v3, "MockDecisionClient", fail_if_llm_client_used)
+    monkeypatch.setattr(v3, "KimiDecisionClient", fail_if_llm_client_used)
+    monkeypatch.setattr(v3, "GlmSophnetDecisionClient", fail_if_llm_client_used)
+    monkeypatch.setattr(v3, "CodexCliBackendDecisionClient", fail_if_llm_client_used)
+
+    config = _config(
+        tmp_path,
+        run_id="baseline_v3_4_det_reference_direct",
+        tickers=("AAPL", "MSFT"),
+        dates=(date(2024, 1, 2), date(2024, 2, 1), date(2024, 3, 1)),
+    )
+    run_root = tmp_path / "runs" / config.run_id
+    reference = v3.deterministic_price_only_reference_for_run(
+        config=config,
+        run_root=run_root,
+    )
+
+    assert reference["status"] == "REFERENCE_READY"
+    assert reference["count"] == 4
+    assert reference["unique_scored_point_count"] == 4
+    assert reference["raw_mirrored_count"] == 8
+    assert reference["future_data_violations"] == 0
+    assert reference["llm_used"] is False
+    assert reference["provider_or_backend_called"] is False
+    assert reference["metrics"]["scored_steps"] == 4
+    assert reference["metrics"]["mse"] is not None
+    artifact_paths = sorted((run_root / "deterministic_price_only_baseline").glob("*.json"))
+    assert len(artifact_paths) == 4
+    for path in artifact_paths:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        assert record["llm_used"] is False
+        assert record["provider_or_backend_called"] is False
+        assert record["latest_visible_price_date"] <= record["decision_date"]
+        assert record["future_rows_excluded"] > 0
+        assert record["actual_change_pct"] is not None
+
+
+def test_run_summary_includes_deterministic_reference_without_changing_steps(
+    tmp_path: Path,
+) -> None:
+    _write_prices(tmp_path / "prices", "AAPL", days=520)
+    summary = v3.run_four_arm(
+        _config(
+            tmp_path,
+            run_id="baseline_v3_4_det_reference_summary",
+            tickers=("AAPL",),
+            dates=(date(2024, 1, 2), date(2024, 2, 1), date(2024, 3, 1)),
+        )
+    )
+
+    assert summary["status"] == "MOCK_PASS"
+    assert summary["expected_steps"] == 24
+    assert summary["actual_step_files"] == 24
+    assert summary["scored_step_count"] == 24
+    assert summary["deterministic_price_only_baseline_status"] == "REFERENCE_READY"
+    assert summary["clean_historical_reference_status"] == (
+        "PRESENT_DETERMINISTIC_PRICE_ONLY_BASELINE"
+    )
+    assert summary["deterministic_price_only_baseline_count"] == 2
+    assert summary["deterministic_price_only_baseline_raw_mirrored_count"] == 4
+    assert summary["deterministic_price_only_baseline_future_data_violations"] == 0
+    assert summary["deterministic_price_only_baseline_provider_or_backend_called"] is False
+    assert summary["deterministic_price_only_baseline_metrics"]["scored_steps"] == 2
+    assert summary["paired_complete_points"] == 4
+    assert summary["paired_coverage"] == 1.0
+
+
 def test_kimi_schema_and_input_echo_errors_are_not_retried() -> None:
     schema_client = v3.KimiDecisionClient(
         model="Kimi-K2.6",
