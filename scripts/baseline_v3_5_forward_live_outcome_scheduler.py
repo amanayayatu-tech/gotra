@@ -64,7 +64,7 @@ def resolver_run_id_for(config: SchedulerConfig) -> str:
 
 def resolver_config_for(config: SchedulerConfig) -> resolver.ResolverConfig:
     return resolver.ResolverConfig(
-        capture_run_dir=config.capture_run_dir,
+        capture_run_dir=canonical_capture_run_root(config.capture_run_dir),
         resolver_run_id=resolver_run_id_for(config),
         as_of_timestamp_utc=config.as_of_timestamp_utc,
         price_dir=config.price_dir,
@@ -76,6 +76,14 @@ def resolver_config_for(config: SchedulerConfig) -> resolver.ResolverConfig:
 
 def load_json(path: Path) -> dict[str, Any]:
     return resolver.load_json(path)
+
+
+def canonical_capture_run_root(capture_run_dir: Path) -> Path:
+    """Return the capture run root for either run root or its captures/ child."""
+
+    if capture_run_dir.name == "captures":
+        return capture_run_dir.parent
+    return capture_run_dir
 
 
 def capture_source_run_ids(capture_paths: list[Path]) -> list[str]:
@@ -92,9 +100,84 @@ def capture_source_run_ids(capture_paths: list[Path]) -> list[str]:
 
 
 def source_id_for_capture(path: Path, capture_run_dir: Path) -> str:
+    capture_run_dir = canonical_capture_run_root(capture_run_dir)
     payload = load_json(path)
     artifact_ref = resolver.source_artifact_ref(path, capture_run_dir)
     return resolver.source_decision_id(payload, artifact_ref)
+
+
+def source_future_data_guard_record(
+    *,
+    config: SchedulerConfig,
+    source_path: Path,
+    capture_run_dir: Path,
+) -> dict[str, Any] | None:
+    capture_run_dir = canonical_capture_run_root(capture_run_dir)
+    payload = load_json(source_path)
+    decision_date = resolver.date_from_capture(payload, "decision_date_local", "decision_date")
+    latest_visible_date = resolver.date_from_capture(
+        payload,
+        "latest_visible_price_date",
+        "decision_date_local",
+    )
+    reasons = resolver.source_future_data_violation_reasons(
+        payload=payload,
+        decision_date=decision_date,
+        latest_visible_date=latest_visible_date,
+    )
+    if not reasons:
+        return None
+    artifact_ref = resolver.source_artifact_ref(source_path, capture_run_dir)
+    source_id = resolver.source_decision_id(payload, artifact_ref)
+    horizon_end = resolver.date_from_capture(payload, "horizon_end_date")
+    record = {
+        "schema": resolver.RESOLVER_SCHEMA,
+        "resolver_run_id": resolver_run_id_for(config),
+        "source_run_id": str(payload.get("run_id") or ""),
+        "source_decision_id": source_id,
+        "source_decision_artifact": artifact_ref,
+        "ticker": str(payload["ticker"]),
+        "arm": str(payload.get("arm") or ""),
+        "input_layer": str(payload.get("input_layer") or ""),
+        "decision_date": decision_date.isoformat(),
+        "horizon_days": int(payload.get("horizon_days") or v3.WINDOW_DAYS),
+        "horizon_end_date": horizon_end.isoformat(),
+        "outcome_status": resolver.STATUS_BLOCKED_SOURCE_FUTURE_DATA,
+        "outcome_price_date": None,
+        "decision_price_date": None,
+        "decision_price": None,
+        "outcome_price": None,
+        "actual_change_pct": None,
+        "actual_direction": None,
+        "source_future_data_violation": True,
+        "source_future_data_violation_reasons": reasons,
+        "resolved_at": config.as_of_timestamp_utc.isoformat().replace("+00:00", "Z"),
+        "provenance": {
+            "source_capture_run_id": str(payload.get("run_id") or ""),
+            "source_decision_id": source_id,
+            "source_artifact_path": str(source_path),
+            "source_artifact_ref": artifact_ref,
+            "resolver_run_id": resolver_run_id_for(config),
+            "resolver_script_version": resolver.RESOLVER_SCRIPT_VERSION,
+            "resolver_schema": resolver.RESOLVER_SCHEMA,
+            "price_source_path": "",
+            "price_row_dates_used": [],
+            "as_of_date": config.as_of_timestamp_utc.date().isoformat(),
+            "as_of_timestamp_utc": config.as_of_timestamp_utc.isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "daily_close_availability_rule": (
+                "daily close row D is visible at D+1 00:00:00 UTC or later"
+            ),
+            "outcome_window_days": config.outcome_window_days,
+            "no_future_data_decision": (
+                "source capture artifact had decision-side future-data contamination; "
+                f"blocked before duplicate/existing outcome skip: {', '.join(reasons)}"
+            ),
+        },
+    }
+    resolver.validate_resolution_record(record)
+    return record
 
 
 def existing_resolved_source_ids(output_dir: Path, *, exclude_root: Path | None = None) -> set[str]:
@@ -168,7 +251,7 @@ def blocked_run_id_summary(config: SchedulerConfig, output_root: Path) -> dict[s
         "run_root": str(output_root),
         "source_capture_run_id": "",
         "source_capture_run_ids": [],
-        "source_capture_path": str(config.capture_run_dir),
+        "source_capture_path": str(canonical_capture_run_root(config.capture_run_dir)),
         "resolver_run_ids": [],
         "scanned_decision_count": 0,
         "not_matured_count": 0,
@@ -190,6 +273,7 @@ def blocked_run_id_summary(config: SchedulerConfig, output_root: Path) -> dict[s
 
 def run_scheduler(config: SchedulerConfig) -> dict[str, Any]:
     validate_config(config)
+    capture_root = canonical_capture_run_root(config.capture_run_dir)
     output_root = config.output_dir / config.scheduler_run_id
     if output_root.exists() and any(output_root.iterdir()) and not config.allow_overwrite:
         return blocked_run_id_summary(config, output_root)
@@ -198,7 +282,7 @@ def run_scheduler(config: SchedulerConfig) -> dict[str, Any]:
     output_root.mkdir(parents=True, exist_ok=True)
 
     started_at = datetime.now(UTC).replace(microsecond=0)
-    capture_paths = resolver.find_capture_artifacts(config.capture_run_dir)
+    capture_paths = resolver.find_capture_artifacts(capture_root)
     source_run_ids = capture_source_run_ids(capture_paths)
     resolver_run_id = resolver_run_id_for(config)
     resolver_output_root = output_root / "resolver_outputs" / resolver_run_id
@@ -222,7 +306,22 @@ def run_scheduler(config: SchedulerConfig) -> dict[str, Any]:
     resolver_config = resolver_config_for(config)
     for source_path in capture_paths:
         try:
-            source_id = source_id_for_capture(source_path, config.capture_run_dir)
+            source_id = source_id_for_capture(source_path, capture_root)
+            guard_record = source_future_data_guard_record(
+                config=config,
+                source_path=source_path,
+                capture_run_dir=capture_root,
+            )
+            if guard_record is not None:
+                guard_record = add_scheduler_provenance(
+                    guard_record,
+                    config=config,
+                    resolver_run_id=resolver_run_id,
+                )
+                resolver.write_resolution_record(guard_record, resolver_output_root)
+                records.append(guard_record)
+                seen_source_ids.add(source_id)
+                continue
             if source_id in existing_resolved or source_id in seen_source_ids:
                 duplicate_or_existing += 1
                 continue
@@ -281,7 +380,7 @@ def manifest_for(
         "run_root": str(output_root),
         "source_capture_run_id": source_run_ids[0] if len(source_run_ids) == 1 else "",
         "source_capture_run_ids": source_run_ids,
-        "source_capture_path": str(config.capture_run_dir),
+        "source_capture_path": str(canonical_capture_run_root(config.capture_run_dir)),
         "resolver_run_ids": [resolver_run_id],
         "as_of_timestamp_utc": config.as_of_timestamp_utc.isoformat().replace(
             "+00:00", "Z"
@@ -333,7 +432,7 @@ def summary_for(
         "run_root": str(output_root),
         "source_capture_run_id": source_run_ids[0] if len(source_run_ids) == 1 else "",
         "source_capture_run_ids": source_run_ids,
-        "source_capture_path": str(config.capture_run_dir),
+        "source_capture_path": str(canonical_capture_run_root(config.capture_run_dir)),
         "resolver_run_ids": [resolver_run_id] if records else [],
         "scanned_decision_count": len(capture_paths),
         "not_matured_count": status_counts[resolver.STATUS_NOT_MATURED],

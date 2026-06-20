@@ -105,6 +105,84 @@ def test_scheduler_skips_existing_resolved_outcome_idempotently(tmp_path: Path) 
     assert not list(second_root.glob("resolver_outputs/**/outcomes/resolved/*.json"))
 
 
+def test_capture_root_and_captures_child_have_stable_source_decision_id(
+    tmp_path: Path,
+) -> None:
+    capture_dir = _write_capture_run(tmp_path, ticker="AAPL")
+    capture_path = _capture_artifact_path(capture_dir, "AAPL")
+    _write_prices(
+        tmp_path / "prices",
+        "AAPL",
+        [("2026-06-19", 100.0), ("2026-07-20", 110.0)],
+    )
+    first = _scheduler_config(
+        tmp_path,
+        capture_dir=capture_dir,
+        run_id="baseline_v3_5c_outcome_scheduler_root_path",
+        as_of="2026-07-21T00:00:00Z",
+    )
+    second = _scheduler_config(
+        tmp_path,
+        capture_dir=capture_dir / "captures",
+        run_id="baseline_v3_5c_outcome_scheduler_child_path",
+        as_of="2026-07-22T00:00:00Z",
+    )
+
+    root_id = scheduler.source_id_for_capture(capture_path, capture_dir)
+    child_id = scheduler.source_id_for_capture(capture_path, capture_dir / "captures")
+    first_summary = scheduler.run_scheduler(first)
+    second_summary = scheduler.run_scheduler(second)
+
+    assert root_id == child_id
+    assert first_summary["resolved_count"] == 1
+    assert second_summary["status"] == scheduler.STATUS_PASS
+    assert second_summary["resolved_count"] == 0
+    assert second_summary["duplicate_or_existing_outcome_count"] == 1
+    assert second_summary["source_capture_path"] == str(capture_dir)
+
+
+def test_existing_resolved_does_not_hide_later_source_future_data_contamination(
+    tmp_path: Path,
+) -> None:
+    capture_dir = _write_capture_run(tmp_path, ticker="AAPL")
+    capture_path = _capture_artifact_path(capture_dir, "AAPL")
+    _write_prices(
+        tmp_path / "prices",
+        "AAPL",
+        [("2026-06-19", 100.0), ("2026-07-20", 110.0)],
+    )
+    clean = _scheduler_config(
+        tmp_path,
+        capture_dir=capture_dir,
+        run_id="baseline_v3_5c_outcome_scheduler_clean_then_contaminated",
+        as_of="2026-07-21T00:00:00Z",
+    )
+    contaminated = _scheduler_config(
+        tmp_path,
+        capture_dir=capture_dir,
+        run_id="baseline_v3_5c_outcome_scheduler_contaminated_after_existing",
+        as_of="2026-07-22T00:00:00Z",
+    )
+
+    clean_summary = scheduler.run_scheduler(clean)
+    payload = json.loads(capture_path.read_text(encoding="utf-8"))
+    payload["future_data_violation"] = True
+    capture_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    contaminated_summary = scheduler.run_scheduler(contaminated)
+    record = _only_scheduler_record(
+        tmp_path,
+        contaminated.scheduler_run_id,
+        resolver.STATUS_BLOCKED_SOURCE_FUTURE_DATA,
+    )
+
+    assert clean_summary["resolved_count"] == 1
+    assert contaminated_summary["status"] == scheduler.STATUS_FAIL
+    assert contaminated_summary["blocked_future_data_count"] == 1
+    assert contaminated_summary["duplicate_or_existing_outcome_count"] == 0
+    assert contaminated_summary["future_data_violation_count"] == 1
+    assert record["source_future_data_violation"] is True
+
+
 def test_scheduler_blocks_and_counts_source_future_data(tmp_path: Path) -> None:
     capture_dir = _write_capture_run(
         tmp_path,
@@ -320,6 +398,15 @@ def _write_prices(price_dir: Path, ticker: str, rows: list[tuple[str, float]]) -
         ]
     )
     frame.to_csv(price_dir / f"{ticker}.csv", index=False)
+
+
+def _capture_artifact_path(capture_dir: Path, ticker: str) -> Path:
+    return (
+        capture_dir
+        / "captures"
+        / "direct_llm"
+        / f"capture_2026-06-20_{ticker.lower()}_price_only_packet.json"
+    )
 
 
 def _scheduler_config(

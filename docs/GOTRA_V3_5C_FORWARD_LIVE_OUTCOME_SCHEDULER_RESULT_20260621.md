@@ -30,8 +30,13 @@ New scheduler:
 The scheduler:
 
 - scans v3.5A capture artifacts with the existing v3.5B capture discovery logic
+- normalizes either a capture run root or its `captures/` child back to the
+  same capture run root before computing source decision ids
 - computes source decision ids with the v3.5B resolver identity function
-- skips already resolved source decisions idempotently
+- validates source capture future-data guards before skipping already resolved
+  source decisions, so a later-contaminated capture cannot be hidden by an
+  existing outcome
+- skips clean already resolved source decisions idempotently
 - delegates decision resolution to v3.5B `resolve_capture_artifact`
 - writes scheduler provenance into newly produced resolver artifacts
 - reports structured scheduler summary fields for maturity, blocked data,
@@ -53,14 +58,27 @@ No provider, Codex CLI, formal-lite, or old provider parser path is invoked.
 Existing `RESOLVED` outcomes are detected by `source_decision_id` under the
 configured output directory and are skipped rather than rewritten.
 
+## PR Review Hardening
+
+This revision addresses the active PR #31 review blockers:
+
+- equivalent capture paths are canonicalized before `artifact_ref` and
+  `source_decision_id` are computed, so `run_root` and `run_root/captures`
+  identify the same source decision
+- source capture future-data checks run before duplicate/existing outcome
+  skipping, and contaminated sources are written/count as
+  `BLOCKED_SOURCE_FUTURE_DATA`
+- local validation evidence was rerun with a real current UTC timestamp; no
+  future-dated validation run id or summary path is used
+
 ## Local Scheduler Validation
 
 Local/mock scheduler run:
 
-- run id: `baseline_v3_5c_outcome_scheduler_local_mock_20260621T173235Z`
+- run id: `baseline_v3_5c_outcome_scheduler_local_mock_20260620T175614Z`
 - summary status: `OUTCOME_SCHEDULER_PASS`
 - summary path:
-  `/tmp/gotra_v3_5c_scheduler_validation/runs/baseline_v3_5c_outcome_scheduler_local_mock_20260621T173235Z/summary.json`
+  `/tmp/gotra_v3_5c_scheduler_validation_reviewfix_20260620T175614Z/runs/baseline_v3_5c_outcome_scheduler_local_mock_20260620T175614Z/summary.json`
 
 Validation summary:
 
@@ -111,11 +129,11 @@ Commands run:
 
 ```bash
 uv run python -m py_compile scripts/baseline_v3_5_forward_live_outcome_scheduler.py scripts/baseline_v3_5_forward_live_outcome_resolver.py scripts/baseline_v3_5_forward_live_capture.py
-uv run ruff check --no-cache scripts/baseline_v3_5_forward_live_outcome_scheduler.py tests/test_forward_live_outcome_scheduler.py scripts/baseline_v3_5_forward_live_outcome_resolver.py tests/test_forward_live_outcome_resolver.py scripts/baseline_v3_5_forward_live_capture.py tests/test_forward_live_capture.py
+uv run ruff check --no-cache scripts/baseline_v3_5_forward_live_outcome_scheduler.py tests/test_forward_live_outcome_scheduler.py
 uv run pytest -q tests/test_forward_live_outcome_scheduler.py
 uv run pytest -q tests/test_forward_live_outcome_resolver.py
 uv run pytest -q tests/test_forward_live_capture.py
-uv run python scripts/baseline_v3_5_forward_live_outcome_scheduler.py --capture-run-dir /tmp/gotra_v3_5c_scheduler_validation/capture_run --scheduler-run-id baseline_v3_5c_outcome_scheduler_local_mock_20260621T173235Z --as-of-timestamp-utc 2026-07-25T00:00:00Z --price-dir /tmp/gotra_v3_5c_scheduler_validation/prices --output-dir /tmp/gotra_v3_5c_scheduler_validation/runs
+uv run python scripts/baseline_v3_5_forward_live_outcome_scheduler.py --capture-run-dir /tmp/gotra_v3_5c_scheduler_validation_reviewfix_20260620T175614Z/capture_run --scheduler-run-id baseline_v3_5c_outcome_scheduler_local_mock_20260620T175614Z --as-of-timestamp-utc 2026-07-25T00:00:00Z --price-dir /tmp/gotra_v3_5c_scheduler_validation_reviewfix_20260620T175614Z/prices --output-dir /tmp/gotra_v3_5c_scheduler_validation_reviewfix_20260620T175614Z/runs
 uv run pytest -q
 ```
 
@@ -123,11 +141,11 @@ Results:
 
 - `py_compile`: PASS
 - `ruff`: PASS
-- `tests/test_forward_live_outcome_scheduler.py`: `10 passed`
+- `tests/test_forward_live_outcome_scheduler.py`: `12 passed`
 - `tests/test_forward_live_outcome_resolver.py`: `12 passed`
 - `tests/test_forward_live_capture.py`: `13 passed`
 - local/mock scheduler validation: `OUTCOME_SCHEDULER_PASS`
-- full pytest: `313 passed`
+- full pytest: `315 passed`
 
 ## Artifact Boundary
 
