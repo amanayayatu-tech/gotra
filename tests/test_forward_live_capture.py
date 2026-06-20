@@ -48,6 +48,10 @@ def test_mock_capture_writes_not_matured_artifacts_and_summary(tmp_path: Path) -
     assert summary["parsed_decision_hash_count"] == 0
     assert summary["deterministic_price_only_reference_count"] == 1
     assert summary["deterministic_price_only_reference_provider_or_backend_called"] is False
+    assert summary["deterministic_price_only_baseline_status"] == "REFERENCE_READY"
+    assert summary["deterministic_price_only_baseline_count"] == 1
+    assert summary["deterministic_price_only_baseline_future_data_violations"] == 0
+    assert summary["deterministic_price_only_baseline_provider_or_backend_called"] is False
     assert summary["clean_historical_reference_status"] == (
         "PRESENT_DETERMINISTIC_PRICE_ONLY_BASELINE"
     )
@@ -146,7 +150,7 @@ def test_codex_cli_capture_fake_client_records_backend_metadata(
     assert artifact["backend"] == v3.CODEX_CLI_BACKEND
     assert artifact["codex_cli_version"] == "codex-cli 0.test"
     assert artifact["model"] == "gpt-5.1"
-    assert artifact["reasoning"] == "low"
+    assert artifact["reasoning"] == "high"
     assert artifact["prompt_hash"]
     assert artifact["parsed_decision_hash"]
     assert Path(artifact["output_transcript_path"]).is_relative_to(run_root)
@@ -230,6 +234,7 @@ def test_deterministic_capture_reference_does_not_call_backend(tmp_path: Path) -
     assert reference["llm_used"] is False
     assert reference["provider_or_backend_called"] is False
     assert reference["future_rows_excluded"] > 0
+    assert reference["latest_visible_price_date"] < reference["decision_date_local"]
     assert "actual_change_pct" not in reference
     assert "actual_return" not in reference
 
@@ -249,6 +254,125 @@ def test_capture_blocks_existing_run_id_with_not_matured_summary(tmp_path: Path)
     assert summary["actual_capture_artifacts"] == 0
     assert summary["codex_cli_transcript_path_count"] == 0
     assert summary["deterministic_price_only_reference"]["provider_or_backend_called"] is False
+    assert summary["deterministic_price_only_baseline_status"] == "REFERENCE_NOT_COMPUTED"
+    assert summary["deterministic_price_only_baseline_count"] == 0
+    assert summary["deterministic_price_only_baseline_provider_or_backend_called"] is False
+
+
+def test_empty_grid_paths_are_rejected_before_pass(tmp_path: Path) -> None:
+    _write_prices(tmp_path / "prices", "AAPL")
+    cases = [
+        {"tickers": (), "arms": ("direct_llm",), "input_layers": ("price_only_packet",)},
+        {"tickers": ("AAPL",), "arms": (), "input_layers": ("price_only_packet",)},
+        {"tickers": ("AAPL",), "arms": ("direct_llm",), "input_layers": ()},
+    ]
+
+    for index, kwargs in enumerate(cases):
+        config = _capture_config(
+            tmp_path,
+            mode="mock",
+            run_id=f"baseline_v3_5a_forward_live_empty_grid_{index}",
+            **kwargs,
+        )
+        with pytest.raises(ValueError, match="at least one"):
+            capture.run_capture(config)
+        assert not (tmp_path / "runs" / config.run_id).exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("horizon_days", 0, "horizon_days=30 only"),
+        ("horizon_days", 31, "horizon_days=30 only"),
+        ("backend_concurrency", 0, "backend_concurrency must be > 0"),
+    ],
+)
+def test_capture_config_rejects_invalid_horizon_and_concurrency(
+    tmp_path: Path,
+    field: str,
+    value: int,
+    message: str,
+) -> None:
+    _write_prices(tmp_path / "prices", "AAPL")
+    config = _capture_config(
+        tmp_path,
+        mode="mock",
+        run_id=f"baseline_v3_5a_forward_live_invalid_{field}_{value}",
+        tickers=("AAPL",),
+    )
+    config = replace(config, **{field: value})
+
+    with pytest.raises(ValueError, match=message):
+        capture.run_capture(config)
+    assert not (tmp_path / "runs" / config.run_id).exists()
+
+
+def test_slug_colliding_tickers_are_rejected_before_artifacts(tmp_path: Path) -> None:
+    config = _capture_config(
+        tmp_path,
+        mode="mock",
+        run_id="baseline_v3_5a_forward_live_slug_collision",
+        tickers=("BRK.B", "BRK-B"),
+    )
+
+    with pytest.raises(ValueError, match="ticker slug collision"):
+        capture.run_capture(config)
+    assert not (tmp_path / "runs" / config.run_id).exists()
+
+
+def test_missing_reference_price_cache_fails_before_run_state(tmp_path: Path) -> None:
+    config = _capture_config(
+        tmp_path,
+        mode="mock",
+        run_id="baseline_v3_5a_forward_live_missing_price",
+        tickers=("MISSING",),
+    )
+
+    with pytest.raises(FileNotFoundError):
+        capture.run_capture(config)
+    assert not (tmp_path / "runs" / config.run_id).exists()
+
+
+def test_zero_expected_decisions_cannot_pass_summary(tmp_path: Path) -> None:
+    config = _capture_config(
+        tmp_path,
+        mode="mock",
+        run_id="baseline_v3_5a_forward_live_zero_expected",
+        tickers=(),
+        arms=(),
+        input_layers=(),
+    )
+    reference = {
+        "status": "REFERENCE_READY",
+        "count": 1,
+        "future_data_violations": 0,
+        "provider_or_backend_called": False,
+        "clean_historical_reference_status": "PRESENT_DETERMINISTIC_PRICE_ONLY_BASELINE",
+    }
+
+    summary = capture.summary_for(
+        config=config,
+        run_root=tmp_path / "runs" / config.run_id,
+        artifacts=[],
+        deterministic_reference=reference,
+        errors=[],
+    )
+
+    assert summary["expected_capture_decisions"] == 0
+    assert summary["status"] == "FORWARD_LIVE_CAPTURE_FAIL"
+
+
+def test_cli_defaults_to_high_reasoning_for_future_runs() -> None:
+    args = capture.parse_args(
+        [
+            "--mode",
+            "mock",
+            "--run-id",
+            "baseline_v3_5a_forward_live_cli_default",
+        ]
+    )
+
+    assert args.codex_cli_reasoning_setting == "high"
 
 
 def _price_rows(days: int = 620) -> pd.DataFrame:
@@ -296,7 +420,7 @@ def _capture_config(
         price_dir=root / "prices",
         provider_model="gpt-5.1",
         provider_max_tokens=2000,
-        codex_cli_reasoning_setting="low",
+        codex_cli_reasoning_setting=capture.DEFAULT_V3_5A_CODEX_CLI_REASONING,
         codex_cli_binary="codex",
         backend_concurrency=1,
         request_timeout_seconds=30.0,

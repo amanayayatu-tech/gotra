@@ -30,6 +30,7 @@ RUN_ID_PREFIX = "baseline_v3_5a_forward_live_"
 FUTURE_OUTCOME_STATUS = "not_matured"
 FUTURE_OUTCOME_SCORING_STATUS = "NOT_MATURED"
 DEFAULT_TICKERS = ("AAPL", "MSFT", "NVDA", "TSM", "0700.HK")
+DEFAULT_V3_5A_CODEX_CLI_REASONING = "high"
 FORBIDDEN_OUTCOME_FIELDS = {
     "actual_change_pct",
     "actual_return",
@@ -95,6 +96,41 @@ def validate_run_id(run_id: str) -> None:
         raise ValueError("run_id may contain only letters, numbers, '_' and '-'")
 
 
+def validate_config(config: CaptureConfig) -> None:
+    validate_run_id(config.run_id)
+    if not config.tickers:
+        raise ValueError("at least one ticker is required")
+    if not config.arms:
+        raise ValueError("at least one arm is required")
+    if not config.input_layers:
+        raise ValueError("at least one input layer is required")
+    if config.horizon_days != v3.WINDOW_DAYS:
+        raise ValueError(
+            f"v3.5A capture currently supports horizon_days={v3.WINDOW_DAYS} only"
+        )
+    if config.backend_concurrency <= 0:
+        raise ValueError("backend_concurrency must be > 0")
+    slugs: dict[str, str] = {}
+    for ticker in config.tickers:
+        slug = ticker_slug(ticker)
+        prior = slugs.get(slug)
+        if prior is not None and prior != ticker:
+            raise ValueError(
+                f"ticker slug collision: {prior!r} and {ticker!r} both map to {slug!r}"
+            )
+        slugs[slug] = ticker
+
+
+def preflight_visible_price_rows(config: CaptureConfig) -> None:
+    decision_date_local = local_capture_date(config)
+    for ticker in config.tickers:
+        visible_price_rows(
+            ticker,
+            decision_date_local=decision_date_local,
+            price_dir=config.price_dir,
+        )
+
+
 def visible_price_rows(
     ticker: str,
     *,
@@ -104,7 +140,9 @@ def visible_price_rows(
     frame = read_price_cache(ticker, price_dir=price_dir)
     dated = frame.copy()
     dated["_gotra_visible_date"] = pd.to_datetime(dated["date"]).dt.date
-    visible = dated[dated["_gotra_visible_date"] <= decision_date_local].drop(
+    # The cache has daily dates but no intraday availability timestamp, so v3.5A
+    # treats same-day rows as unavailable and defaults to the last prior row.
+    visible = dated[dated["_gotra_visible_date"] < decision_date_local].drop(
         columns=["_gotra_visible_date"]
     )
     if visible.empty:
@@ -258,6 +296,46 @@ def deterministic_reference_summary(records: list[dict[str, Any]]) -> dict[str, 
             if status == "REFERENCE_READY"
             else "MISSING_OR_BLOCKED_DETERMINISTIC_PRICE_ONLY_BASELINE"
         ),
+    }
+
+
+def deterministic_reference_empty_summary() -> dict[str, Any]:
+    return {
+        "schema": DETERMINISTIC_CAPTURE_SCHEMA,
+        "status": "REFERENCE_NOT_COMPUTED",
+        "count": 0,
+        "unique_capture_point_count": 0,
+        "future_data_violations": 0,
+        "latest_visible_price_date_max": "",
+        "llm_used": False,
+        "provider_or_backend_called": False,
+        "clean_historical_reference_status": (
+            "MISSING_OR_BLOCKED_DETERMINISTIC_PRICE_ONLY_BASELINE"
+        ),
+    }
+
+
+def deterministic_reference_summary_fields(reference: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "deterministic_price_only_reference": reference,
+        "deterministic_price_only_reference_status": reference["status"],
+        "deterministic_price_only_reference_count": reference["count"],
+        "deterministic_price_only_reference_future_data_violations": reference[
+            "future_data_violations"
+        ],
+        "deterministic_price_only_reference_provider_or_backend_called": reference[
+            "provider_or_backend_called"
+        ],
+        "deterministic_price_only_baseline": reference,
+        "deterministic_price_only_baseline_status": reference["status"],
+        "deterministic_price_only_baseline_count": reference["count"],
+        "deterministic_price_only_baseline_future_data_violations": reference[
+            "future_data_violations"
+        ],
+        "deterministic_price_only_baseline_provider_or_backend_called": reference[
+            "provider_or_backend_called"
+        ],
+        "clean_historical_reference_status": reference["clean_historical_reference_status"],
     }
 
 
@@ -500,10 +578,11 @@ def build_client(
 
 
 def run_capture(config: CaptureConfig) -> dict[str, Any]:
-    validate_run_id(config.run_id)
+    validate_config(config)
     run_root = config.runs_root / config.run_id
     if run_root.exists() and any(run_root.iterdir()):
         return blocked_summary(config=config, run_root=run_root)
+    preflight_visible_price_rows(config)
     run_root.mkdir(parents=True, exist_ok=True)
     client = build_client(config=config, run_root=run_root)
     manifest = manifest_for(config=config, run_root=run_root)
@@ -586,6 +665,7 @@ def run_capture(config: CaptureConfig) -> dict[str, Any]:
 
 
 def blocked_summary(*, config: CaptureConfig, run_root: Path) -> dict[str, Any]:
+    reference = deterministic_reference_empty_summary()
     summary = {
         "schema": SUMMARY_SCHEMA,
         "run_id": config.run_id,
@@ -601,13 +681,7 @@ def blocked_summary(*, config: CaptureConfig, run_root: Path) -> dict[str, Any]:
         "codex_cli_transcript_path_count": 0,
         "parsed_decision_hash_count": 0,
         "future_data_violation_count": 0,
-        "deterministic_price_only_reference": {
-            "status": "REFERENCE_NOT_COMPUTED",
-            "count": 0,
-            "future_data_violations": 0,
-            "provider_or_backend_called": False,
-            "clean_historical_reference_status": "MISSING_OR_BLOCKED_DETERMINISTIC_PRICE_ONLY_BASELINE",
-        },
+        **deterministic_reference_summary_fields(reference),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     return summary
@@ -654,12 +728,19 @@ def summary_for(
     parsed_hash_count = sum(1 for item in artifacts if item.get("parsed_decision_hash"))
     future_data_violations = sum(1 for item in artifacts if item.get("future_data_violation"))
     expected = expected_capture_decisions(config)
+    reference_ready = (
+        deterministic_reference["status"] == "REFERENCE_READY"
+        and int(deterministic_reference["count"]) > 0
+        and int(deterministic_reference["future_data_violations"]) == 0
+        and deterministic_reference["provider_or_backend_called"] is False
+    )
     status = (
         "FORWARD_LIVE_CAPTURE_PASS"
-        if len(artifacts) == expected
+        if expected > 0
+        and len(artifacts) == expected
         and not errors
         and future_data_violations == 0
-        and int(deterministic_reference["future_data_violations"]) == 0
+        and reference_ready
         else "FORWARD_LIVE_CAPTURE_FAIL"
     )
     return {
@@ -704,18 +785,7 @@ def summary_for(
         "feedback_future_data_rejected_count": sum(
             int(item.get("rejected_feedback_future_data_count") or 0) for item in artifacts
         ),
-        "deterministic_price_only_reference": deterministic_reference,
-        "deterministic_price_only_reference_status": deterministic_reference["status"],
-        "deterministic_price_only_reference_count": deterministic_reference["count"],
-        "deterministic_price_only_reference_future_data_violations": deterministic_reference[
-            "future_data_violations"
-        ],
-        "deterministic_price_only_reference_provider_or_backend_called": deterministic_reference[
-            "provider_or_backend_called"
-        ],
-        "clean_historical_reference_status": deterministic_reference[
-            "clean_historical_reference_status"
-        ],
+        **deterministic_reference_summary_fields(deterministic_reference),
         "arm_interpretation": {
             "direct_llm": (
                 "direct_llm_parametric_memory_control; forward-live outcome has not happened yet"
@@ -756,7 +826,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--price-dir", type=Path, default=Path("data/backtest/prices"))
     parser.add_argument("--provider-model", default=v3.DEFAULT_CODEX_CLI_MODEL)
     parser.add_argument("--provider-max-tokens", type=int, default=2000)
-    parser.add_argument("--codex-cli-reasoning-setting", default=v3.DEFAULT_CODEX_CLI_REASONING)
+    parser.add_argument(
+        "--codex-cli-reasoning-setting",
+        default=DEFAULT_V3_5A_CODEX_CLI_REASONING,
+    )
     parser.add_argument("--codex-cli-binary", default="codex")
     parser.add_argument("--backend-concurrency", type=int, default=1)
     parser.add_argument("--request-timeout-seconds", type=float, default=900.0)
