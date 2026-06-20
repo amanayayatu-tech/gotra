@@ -9,6 +9,7 @@ import pytest
 import yaml
 
 from gotra.judge_agent.gate_poller import GatePoller, auto_judge_enabled
+from gotra.judge_agent.audit_chain import verify_audit_chain
 from gotra.judge_agent.judge_agent import (
     AUDIT_ACTOR,
     PROVENANCE_SCHEMA_VERSION,
@@ -244,7 +245,12 @@ def test_judge_provenance_jsonl_records_approve_reject_defer_paths(tmp_path: Pat
         "none",
     ]
     assert [record["alaya_write_attempted"] for record in records] == [True, True, False]
+    assert records[0]["prev_event_hash"] is None
+    assert records[1]["prev_event_hash"] == records[0]["event_hash"]
+    assert records[2]["prev_event_hash"] == records[1]["event_hash"]
+    assert verify_audit_chain(log_path).ok is True
     for record in records:
+        assert record["event_type"] == "gate_decision"
         assert record["provenance_schema_version"] == PROVENANCE_SCHEMA_VERSION
         assert record["run_id"] == "RUN-1"
         assert record["audit_actor"] == AUDIT_ACTOR
@@ -254,9 +260,12 @@ def test_judge_provenance_jsonl_records_approve_reject_defer_paths(tmp_path: Pat
         assert record["apply"] is True
         assert record["dry_run"] is False
         assert record["decision_timestamp_utc"].endswith("Z")
+        assert len(record["event_hash"]) == 64
         assert len(record["input_hash"]) == 64
         assert len(record["decision_hash"]) == 64
         assert len(record["gate_payload_hash"]) == 64
+        assert record["transition_audit_status"] == "audited"
+        assert record["source_provenance_ids"]["gate_payload_hash"] == record["gate_payload_hash"]
 
 
 def test_risk_gate_defers_when_quarantine_filter_sync_is_missing(tmp_path: Path) -> None:

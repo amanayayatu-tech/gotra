@@ -14,6 +14,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from gotra.judge_agent.alaya_client import AlayaClient
+from gotra.judge_agent.audit_chain import append_audit_event
 
 
 AUDIT_ACTOR = "judge_agent/codex"
@@ -346,6 +347,7 @@ def build_decision_provenance(
         "red_team_finding_count": len(context.get("red_team_findings") or []),
     }
     return {
+        "event_type": "gate_decision",
         "provenance_schema_version": PROVENANCE_SCHEMA_VERSION,
         "run_id": str(context_fingerprint["run_id"] or ""),
         "gate_id": gate_id,
@@ -362,13 +364,46 @@ def build_decision_provenance(
         "routed_action": routed_action,
         "routed_action_status": routed_action_status,
         "alaya_write_attempted": alaya_write_attempted,
+        "previous_status": str(gate.get("status") or ""),
+        "new_status": _new_gate_status(
+            decision=decision.decision,
+            routed_action=routed_action,
+            routed_action_status=routed_action_status,
+            apply=apply,
+            previous_status=str(gate.get("status") or ""),
+        ),
         "alaya_write_error_class": type(alaya_write_error).__name__ if alaya_write_error else None,
         "alaya_write_error_message": sanitize_error_message(alaya_write_error),
         "decision_timestamp_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "source_provenance_ids": {
+            "project_id": str(context.get("project_id") or ""),
+            "ticker": str(context.get("ticker") or ""),
+            "gate_payload_hash": stable_json_hash(payload),
+        },
+        "transition_audit_status": "audited" if gate_id and decision.decision else "blocked_missing_provenance",
         "input_hash": stable_json_hash(context_fingerprint),
         "decision_hash": stable_json_hash(decision_payload),
         "gate_payload_hash": stable_json_hash(payload),
     }
+
+
+def _new_gate_status(
+    *,
+    decision: str,
+    routed_action: str,
+    routed_action_status: str,
+    apply: bool,
+    previous_status: str,
+) -> str:
+    if not apply or routed_action == "none":
+        return previous_status
+    if routed_action_status != "succeeded":
+        return previous_status
+    if decision == "approve":
+        return "approved"
+    if decision == "reject":
+        return "rejected"
+    return previous_status
 
 
 def sanitize_error_message(exc: Exception | None) -> str | None:
@@ -390,12 +425,9 @@ def sanitize_error_message(exc: Exception | None) -> str | None:
 
 
 def append_decision_provenance(path: str | Path, record: dict[str, Any]) -> None:
-    """Append one Judge decision provenance JSONL record."""
+    """Append one Judge decision provenance JSONL record with audit-chain hashes."""
 
-    output_path = Path(path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    append_audit_event(path, record)
 
 
 def read_decision_provenance(path: str | Path) -> list[dict[str, Any]]:
