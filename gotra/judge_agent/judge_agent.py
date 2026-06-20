@@ -135,7 +135,21 @@ class JudgeAgent:
                 alaya_write_attempted=False,
             )
         if decision.decision == "approve":
-            response = self.alaya_client.approve_gate(gate_id, rationale=decision.reasoning)
+            try:
+                response = self.alaya_client.approve_gate(gate_id, rationale=decision.reasoning)
+            except Exception as exc:
+                self._result(
+                    gate_id=gate_id,
+                    gate=gate,
+                    context=context,
+                    decision=decision,
+                    routed_action="approve_gate",
+                    apply=apply,
+                    alaya_write_attempted=True,
+                    routed_action_status="failed",
+                    alaya_write_error=exc,
+                )
+                raise
             return self._result(
                 gate_id=gate_id,
                 gate=gate,
@@ -145,12 +159,27 @@ class JudgeAgent:
                 response=response,
                 apply=apply,
                 alaya_write_attempted=True,
+                routed_action_status="succeeded",
             )
-        response = self.alaya_client.reject_gate(
-            gate_id,
-            rationale=decision.reasoning,
-            reason_code=decision.reason_code or "risk_too_high",
-        )
+        try:
+            response = self.alaya_client.reject_gate(
+                gate_id,
+                rationale=decision.reasoning,
+                reason_code=decision.reason_code or "risk_too_high",
+            )
+        except Exception as exc:
+            self._result(
+                gate_id=gate_id,
+                gate=gate,
+                context=context,
+                decision=decision,
+                routed_action="reject_gate",
+                apply=apply,
+                alaya_write_attempted=True,
+                routed_action_status="failed",
+                alaya_write_error=exc,
+            )
+            raise
         return self._result(
             gate_id=gate_id,
             gate=gate,
@@ -160,6 +189,7 @@ class JudgeAgent:
             response=response,
             apply=apply,
             alaya_write_attempted=True,
+            routed_action_status="succeeded",
         )
 
     def build_context(self, gate: dict[str, Any]) -> dict[str, Any]:
@@ -223,6 +253,8 @@ class JudgeAgent:
         apply: bool,
         alaya_write_attempted: bool,
         response: dict[str, Any] | None = None,
+        routed_action_status: str = "not_attempted",
+        alaya_write_error: Exception | None = None,
     ) -> JudgeRunResult:
         provenance = build_decision_provenance(
             gate_id=gate_id,
@@ -232,6 +264,8 @@ class JudgeAgent:
             apply=apply,
             routed_action=routed_action,
             alaya_write_attempted=alaya_write_attempted,
+            routed_action_status=routed_action_status,
+            alaya_write_error=alaya_write_error,
         )
         if self.provenance_log_path is not None:
             append_decision_provenance(self.provenance_log_path, provenance)
@@ -269,6 +303,8 @@ def build_decision_provenance(
     apply: bool,
     routed_action: str,
     alaya_write_attempted: bool,
+    routed_action_status: str = "not_attempted",
+    alaya_write_error: Exception | None = None,
 ) -> dict[str, Any]:
     """Build one append-only Judge decision provenance record without raw model output."""
 
@@ -302,12 +338,21 @@ def build_decision_provenance(
         "apply": apply,
         "dry_run": not apply,
         "routed_action": routed_action,
+        "routed_action_status": routed_action_status,
         "alaya_write_attempted": alaya_write_attempted,
+        "alaya_write_error_class": type(alaya_write_error).__name__ if alaya_write_error else None,
+        "alaya_write_error_message": sanitize_error_message(alaya_write_error),
         "decision_timestamp_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "input_hash": stable_json_hash(context_fingerprint),
         "decision_hash": stable_json_hash(decision_payload),
         "gate_payload_hash": stable_json_hash(payload),
     }
+
+
+def sanitize_error_message(exc: Exception | None) -> str | None:
+    if exc is None:
+        return None
+    return str(exc).replace("\n", " ")[:300]
 
 
 def append_decision_provenance(path: str | Path, record: dict[str, Any]) -> None:
