@@ -1,0 +1,297 @@
+{
+  "schema_version": "gotra.judge.temporal_replay.fixture.v1",
+  "cases": [
+    {
+      "case_id": "meaning_clear_useful_evidence",
+      "gate_type": "meaning",
+      "decision_date": "2026-02-01",
+      "available_at": "2026-02-01T09:00:00Z",
+      "visible": {
+        "gate_type": "meaning",
+        "decision_date": "2026-02-01",
+        "available_at": "2026-02-01T09:00:00Z",
+        "payload": {
+          "prompt_text": "High-quality evidence aligns with existing META ad-cycle knowledge."
+        },
+        "signals": {
+          "risk_score": 0.2,
+          "value_score": 0.9,
+          "uncertainty_score": 0.2,
+          "duplicate_score": 0.1,
+          "evidence_count": 3,
+          "source_quality": "high"
+        }
+      },
+      "labels": {
+        "expected_decision": "approve",
+        "risk_outcome": "safe",
+        "valuable_evidence": true,
+        "should_defer": false,
+        "would_create_independent_feedback": true
+      }
+    },
+    {
+      "case_id": "risk_future_source_leak",
+      "gate_type": "risk",
+      "decision_date": "2026-02-02",
+      "available_at": "2026-02-02T09:00:00Z",
+      "visible": {
+        "gate_type": "risk",
+        "decision_date": "2026-02-02",
+        "available_at": "2026-02-02T09:00:00Z",
+        "payload": {
+          "prompt_text": "Evidence source may have been captured after the decision boundary."
+        },
+        "signals": {
+          "risk_score": 0.82,
+          "value_score": 0.7,
+          "uncertainty_score": 0.3,
+          "duplicate_score": 0.1,
+          "evidence_count": 2,
+          "source_quality": "unverified",
+          "future_source_leak_risk": true
+        }
+      },
+      "labels": {
+        "expected_decision": "reject",
+        "risk_outcome": "high_risk",
+        "valuable_evidence": false,
+        "should_defer": false,
+        "would_create_independent_feedback": false
+      }
+    },
+    {
+      "case_id": "meaning_conflicts_with_strong_knowledge",
+      "gate_type": "meaning",
+      "decision_date": "2026-02-03",
+      "available_at": "2026-02-03T09:00:00Z",
+      "visible": {
+        "gate_type": "meaning",
+        "decision_date": "2026-02-03",
+        "available_at": "2026-02-03T09:00:00Z",
+        "payload": {
+          "prompt_text": "Candidate contradicts strong knowledge without enough provenance."
+        },
+        "signals": {
+          "risk_score": 0.76,
+          "value_score": 0.65,
+          "uncertainty_score": 0.4,
+          "duplicate_score": 0.2,
+          "evidence_count": 2,
+          "source_quality": "unverified",
+          "strong_conflict": true
+        }
+      },
+      "labels": {
+        "expected_decision": "reject",
+        "risk_outcome": "high_risk",
+        "valuable_evidence": false,
+        "should_defer": false,
+        "would_create_independent_feedback": false
+      }
+    },
+    {
+      "case_id": "meaning_duplicate_noise",
+      "gate_type": "meaning",
+      "decision_date": "2026-02-04",
+      "available_at": "2026-02-04T09:00:00Z",
+      "visible": {
+        "gate_type": "meaning",
+        "decision_date": "2026-02-04",
+        "available_at": "2026-02-04T09:00:00Z",
+        "payload": {
+          "prompt_text": "Near-duplicate candidate adds no new evidence."
+        },
+        "signals": {
+          "risk_score": 0.25,
+          "value_score": 0.25,
+          "uncertainty_score": 0.2,
+          "duplicate_score": 0.92,
+          "evidence_count": 2,
+          "source_quality": "low"
+        }
+      },
+      "labels": {
+        "expected_decision": "reject",
+        "risk_outcome": "safe",
+        "valuable_evidence": false,
+        "should_defer": false,
+        "would_create_independent_feedback": false
+      }
+    },
+    {
+      "case_id": "meaning_useful_but_uncertain",
+      "gate_type": "meaning",
+      "decision_date": "2026-02-05",
+      "available_at": "2026-02-05T09:00:00Z",
+      "visible": {
+        "gate_type": "meaning",
+        "decision_date": "2026-02-05",
+        "available_at": "2026-02-05T09:00:00Z",
+        "payload": {
+          "prompt_text": "Potentially useful but uncertain evidence needs human review."
+        },
+        "signals": {
+          "risk_score": 0.3,
+          "value_score": 0.78,
+          "uncertainty_score": 0.72,
+          "duplicate_score": 0.1,
+          "evidence_count": 2,
+          "source_quality": "unverified"
+        }
+      },
+      "labels": {
+        "expected_decision": "defer",
+        "risk_outcome": "uncertain",
+        "valuable_evidence": true,
+        "should_defer": true,
+        "would_create_independent_feedback": false
+      }
+    },
+    {
+      "case_id": "risk_missing_evidence_defer",
+      "gate_type": "risk",
+      "decision_date": "2026-02-06",
+      "available_at": "2026-02-06T09:00:00Z",
+      "visible": {
+        "gate_type": "risk",
+        "decision_date": "2026-02-06",
+        "available_at": "2026-02-06T09:00:00Z",
+        "payload": {
+          "prompt_text": "Risk gate lacks enough visible evidence."
+        },
+        "signals": {
+          "risk_score": 0.5,
+          "value_score": 0.4,
+          "uncertainty_score": 0.9,
+          "duplicate_score": 0.0,
+          "evidence_count": 0,
+          "source_quality": "unknown"
+        }
+      },
+      "labels": {
+        "expected_decision": "defer",
+        "risk_outcome": "uncertain",
+        "valuable_evidence": false,
+        "should_defer": true,
+        "would_create_independent_feedback": false
+      }
+    },
+    {
+      "case_id": "meaning_low_risk_high_value",
+      "gate_type": "meaning",
+      "decision_date": "2026-02-07",
+      "available_at": "2026-02-07T09:00:00Z",
+      "visible": {
+        "gate_type": "meaning",
+        "decision_date": "2026-02-07",
+        "available_at": "2026-02-07T09:00:00Z",
+        "payload": {
+          "prompt_text": "Low-risk high-value evidence should be accepted."
+        },
+        "signals": {
+          "risk_score": 0.2,
+          "value_score": 0.88,
+          "uncertainty_score": 0.25,
+          "duplicate_score": 0.05,
+          "evidence_count": 4,
+          "source_quality": "high"
+        }
+      },
+      "labels": {
+        "expected_decision": "approve",
+        "risk_outcome": "safe",
+        "valuable_evidence": true,
+        "should_defer": false,
+        "would_create_independent_feedback": true
+      }
+    },
+    {
+      "case_id": "meaning_low_value_noise",
+      "gate_type": "meaning",
+      "decision_date": "2026-02-08",
+      "available_at": "2026-02-08T09:00:00Z",
+      "visible": {
+        "gate_type": "meaning",
+        "decision_date": "2026-02-08",
+        "available_at": "2026-02-08T09:00:00Z",
+        "payload": {
+          "prompt_text": "Low-value weak evidence should not enter active knowledge."
+        },
+        "signals": {
+          "risk_score": 0.2,
+          "value_score": 0.2,
+          "uncertainty_score": 0.3,
+          "duplicate_score": 0.5,
+          "evidence_count": 2,
+          "source_quality": "low"
+        }
+      },
+      "labels": {
+        "expected_decision": "reject",
+        "risk_outcome": "safe",
+        "valuable_evidence": false,
+        "should_defer": false,
+        "would_create_independent_feedback": false
+      }
+    },
+    {
+      "case_id": "meaning_safe_useful_moderate",
+      "gate_type": "meaning",
+      "decision_date": "2026-02-09",
+      "available_at": "2026-02-09T09:00:00Z",
+      "visible": {
+        "gate_type": "meaning",
+        "decision_date": "2026-02-09",
+        "available_at": "2026-02-09T09:00:00Z",
+        "payload": {
+          "prompt_text": "Moderately useful evidence with good provenance."
+        },
+        "signals": {
+          "risk_score": 0.45,
+          "value_score": 0.72,
+          "uncertainty_score": 0.3,
+          "duplicate_score": 0.2,
+          "evidence_count": 3,
+          "source_quality": "high"
+        }
+      },
+      "labels": {
+        "expected_decision": "approve",
+        "risk_outcome": "safe",
+        "valuable_evidence": true,
+        "should_defer": false,
+        "would_create_independent_feedback": true
+      }
+    },
+    {
+      "case_id": "risk_obvious_high_risk",
+      "gate_type": "risk",
+      "decision_date": "2026-02-10",
+      "available_at": "2026-02-10T09:00:00Z",
+      "visible": {
+        "gate_type": "risk",
+        "decision_date": "2026-02-10",
+        "available_at": "2026-02-10T09:00:00Z",
+        "payload": {
+          "prompt_text": "Clear high-risk candidate should be rejected."
+        },
+        "signals": {
+          "risk_score": 0.95,
+          "value_score": 0.7,
+          "uncertainty_score": 0.2,
+          "duplicate_score": 0.1,
+          "evidence_count": 3,
+          "source_quality": "high"
+        }
+      },
+      "labels": {
+        "expected_decision": "reject",
+        "risk_outcome": "high_risk",
+        "valuable_evidence": false,
+        "should_defer": false,
+        "would_create_independent_feedback": false
+      }
+    }
+  ]
+}

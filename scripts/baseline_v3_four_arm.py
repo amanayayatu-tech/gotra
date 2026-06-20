@@ -12,6 +12,8 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -88,6 +90,14 @@ DEFAULT_GLM_BASE_URL = v2.DEFAULT_GLM_BASE_URL
 DEEPSEEK_RATE_LIMITS = v2.DEEPSEEK_RATE_LIMITS
 RUN_ID_PREFIX = "baseline_v3_four_arm_"
 RUN_ID_PREFIX_V3_1 = "baseline_v3_1_"
+RUN_ID_PREFIX_V3_2 = "baseline_v3_2_"
+RUN_ID_PREFIX_V3_4 = "baseline_v3_4_"
+CODEX_CLI_BACKEND = "codex_cli_llm_backend"
+DEFAULT_CODEX_CLI_MODEL = "gpt-5.5"
+DEFAULT_CODEX_CLI_REASONING = "low"
+DETERMINISTIC_REFERENCE_SCHEMA = (
+    "gotra.baseline_v3_4b.deterministic_price_only_reference.v1"
+)
 WINDOW_DAYS = 30
 DEFAULT_TICKERS = v2.V1_PILOT_TICKERS
 DEFAULT_DATES = v2.V1_PILOT_DATES
@@ -143,6 +153,9 @@ class RunConfig:
     provider_max_tokens: int = 1200
     resume: bool = False
     research_artifacts_path: Path | None = None
+    feedback_artifacts_path: Path | None = None
+    codex_cli_reasoning_setting: str = DEFAULT_CODEX_CLI_REASONING
+    codex_cli_binary: str = "codex"
 
 
 @dataclass(frozen=True)
@@ -150,6 +163,7 @@ class ArmTask:
     point: DecisionPoint
     arm: Arm
     feedback: list[dict[str, Any]]
+    feedback_filter_diagnostics: dict[str, Any]
 
 
 @dataclass
@@ -189,11 +203,18 @@ class ProviderDecision:
     provider_attempts: int = 0
     provider_retry_count: int = 0
     provider_error_class: str = ""
+    provider_temperature: float | None = None
     provider_temperature_fallback: bool = False
     last_retryable_error_type: str = ""
     normalization_applied: bool = False
     normalization_steps: tuple[str, ...] = ()
     normalization_failure_reason: str = ""
+    backend_name: str = ""
+    codex_cli_version: str = ""
+    codex_cli_model: str = ""
+    codex_cli_reasoning_setting: str = ""
+    output_transcript_path: str = ""
+    parsed_decision_hash: str = ""
 
 
 class MockDecisionClient:
@@ -287,6 +308,7 @@ class KimiDecisionClient:
         request_timeout_seconds: float,
         provider_base_url: str,
         provider_max_tokens: int,
+        provider_temperature: float | None = None,
         timeout_retries: int = 1,
         timeout_retry_backoff_seconds: float = 30,
         transport: httpx.BaseTransport | None = None,
@@ -294,10 +316,15 @@ class KimiDecisionClient:
         self.provider_model = model
         self.provider_base_url = provider_base_url
         self.provider_max_tokens = provider_max_tokens
+        self.provider_temperature = (
+            kimi_provider_temperature(model) if provider_temperature is None else float(provider_temperature)
+        )
         self.timeout_retries = max(0, int(timeout_retries))
         self.timeout_retry_backoff_seconds = max(0.0, float(timeout_retry_backoff_seconds))
         self.provider_max_tokens_applied = True
         self.provider_max_tokens_reason = "passed to KimiCompletionClient.complete"
+        self.provider_temperature_applied = True
+        self.provider_temperature_reason = "Kimi/SophNet K2.6 requires explicit temperature=1"
         self.last_raw_content = ""
         self.request_timeout_seconds = request_timeout_seconds
         self.client = KimiCompletionClient(
@@ -324,7 +351,7 @@ class KimiDecisionClient:
                     user_prompt=prompt,
                     max_tokens=self.provider_max_tokens,
                     timeout_seconds=int(request_timeout_seconds or self.request_timeout_seconds),
-                    temperature=0.0,
+                    temperature=self.provider_temperature,
                 )
                 break
             except RuntimeError as exc:
@@ -356,7 +383,11 @@ class KimiDecisionClient:
             attempts=attempts,
             retry_count=retry_count,
         )
-        return replace(decision, last_retryable_error_type=last_retryable_error_type)
+        return replace(
+            decision,
+            provider_temperature=self.provider_temperature,
+            last_retryable_error_type=last_retryable_error_type,
+        )
 
 
 def kimi_runtime_error_class(message: str) -> str:
@@ -487,6 +518,227 @@ class GlmSophnetDecisionClient(v2.GlmSophnetDecisionClient):
                 f"GLM SophNet request failed: {type(exc).__name__}",
                 provider_error_class=type(exc).__name__,
             ) from exc
+
+
+class CodexCliBackendDecisionClient:
+    provider = CODEX_CLI_BACKEND
+    provider_transport = CODEX_CLI_BACKEND
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        reasoning_setting: str,
+        run_root: Path,
+        provider_max_tokens: int,
+        codex_binary: str = "codex",
+        project_root: Path | None = None,
+        completion_client: Any | None = None,
+        codex_cli_version_text: str | None = None,
+    ) -> None:
+        self.provider_model = model or DEFAULT_CODEX_CLI_MODEL
+        self.provider_base_url = "local://codex-cli"
+        self.provider_max_tokens = max(1, int(provider_max_tokens))
+        self.codex_cli_reasoning_setting = reasoning_setting or DEFAULT_CODEX_CLI_REASONING
+        self.codex_cli_binary = codex_binary
+        self.project_root = project_root or Path.cwd()
+        self.run_root = run_root
+        self.completion_client = completion_client
+        self.codex_cli_version = codex_cli_version_text or codex_cli_version(codex_binary)
+        self.provider_max_tokens_applied = True
+        self.provider_max_tokens_reason = "prompt guidance passed to Codex CLI backend"
+        self.provider_temperature_applied = False
+        self.provider_temperature_reason = "Codex CLI backend has prompt guidance only"
+        self.last_raw_content = ""
+
+    def complete(
+        self,
+        payload: dict[str, Any],
+        *,
+        request_timeout_seconds: float | None = None,
+    ) -> ProviderDecision:
+        prompt = render_provider_prompt(payload)
+        transcript_path = codex_cli_transcript_path(self.run_root, payload)
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        timeout_seconds = int(request_timeout_seconds or 900)
+        if self.completion_client is not None:
+            raw_content = str(
+                self.completion_client.complete(
+                    system_prompt=SYSTEM_PROMPT,
+                    user_prompt=prompt,
+                    max_tokens=self.provider_max_tokens,
+                    timeout_seconds=timeout_seconds,
+                    temperature=0.0,
+                )
+            )
+            transcript_path.write_text(
+                redact_sensitive_text(raw_content),
+                encoding="utf-8",
+            )
+        else:
+            raw_content = self._complete_with_codex_cli(
+                prompt=prompt,
+                transcript_path=transcript_path,
+                timeout_seconds=timeout_seconds,
+            )
+        self.last_raw_content = raw_content
+        try:
+            decision = _parse_raw_provider_content(
+                raw_content=raw_content,
+                attempts=1,
+                retry_count=0,
+            )
+        except ProviderRequestError as exc:
+            exc.output_transcript_path = str(transcript_path)
+            exc.codex_cli_version = self.codex_cli_version
+            exc.codex_cli_model = self.provider_model
+            exc.codex_cli_reasoning_setting = self.codex_cli_reasoning_setting
+            raise
+        parsed_hash = stable_json_hash(decision_to_cache_payload(decision))
+        return replace(
+            decision,
+            backend_name=CODEX_CLI_BACKEND,
+            codex_cli_version=self.codex_cli_version,
+            codex_cli_model=self.provider_model,
+            codex_cli_reasoning_setting=self.codex_cli_reasoning_setting,
+            output_transcript_path=str(transcript_path),
+            parsed_decision_hash=parsed_hash,
+        )
+
+    def _complete_with_codex_cli(
+        self,
+        *,
+        prompt: str,
+        transcript_path: Path,
+        timeout_seconds: int,
+    ) -> str:
+        if not shutil.which(self.codex_cli_binary):
+            raise ProviderRequestError(
+                "codex CLI is not installed or not on PATH",
+                provider_error_class="CodexCliBackendBlocked",
+            )
+        provider_prompt = build_codex_cli_backend_prompt(
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt=prompt,
+            max_tokens=self.provider_max_tokens,
+        )
+        command = [
+            self.codex_cli_binary,
+            "--ask-for-approval",
+            "never",
+            "exec",
+            "--ignore-user-config",
+            "-c",
+            f'model_reasoning_effort="{self.codex_cli_reasoning_setting}"',
+            "--cd",
+            str(self.project_root),
+            "--sandbox",
+            "read-only",
+            "--output-last-message",
+            str(transcript_path),
+        ]
+        if self.provider_model:
+            command.extend(["--model", self.provider_model])
+        command.append(provider_prompt)
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+                cwd=self.project_root,
+                env=os.environ.copy(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ProviderRequestError(
+                "Codex CLI backend timed out",
+                provider_error_class="TimeoutException",
+            ) from exc
+        except FileNotFoundError as exc:
+            raise ProviderRequestError(
+                "codex CLI is not installed or not on PATH",
+                provider_error_class="CodexCliBackendBlocked",
+            ) from exc
+        if completed.returncode != 0:
+            detail = redact_error((completed.stderr or completed.stdout or "").strip())
+            raise ProviderRequestError(
+                "Codex CLI backend failed"
+                + (f": {detail[:500]}" if detail else ""),
+                provider_error_class="CodexCliBackendBlocked",
+            )
+        raw_content = ""
+        if transcript_path.exists():
+            raw_content = transcript_path.read_text(encoding="utf-8").strip()
+        if not raw_content:
+            raw_content = (completed.stdout or "").strip()
+            if raw_content:
+                transcript_path.write_text(
+                    redact_sensitive_text(raw_content),
+                    encoding="utf-8",
+                )
+        if not transcript_path.exists() or not raw_content:
+            raise ProviderRequestError(
+                "Codex CLI backend did not capture an output transcript",
+                provider_error_class="CodexCliBackendBlocked",
+            )
+        return raw_content
+
+
+def build_codex_cli_backend_prompt(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+) -> str:
+    return f"""You are Codex CLI acting as the {CODEX_CLI_BACKEND} decision backend for GOTRA v3.4.
+
+Hard constraints:
+- Do not modify files, run commands, call web search, call APIs, or inspect secrets.
+- Use only the supplied prompt context. Do not add external market data.
+- Return exactly one strict JSON object matching the requested decision schema.
+- Do not wrap JSON in Markdown fences and do not add prose before or after it.
+- Keep the response within roughly {max_tokens} tokens.
+
+<system_prompt>
+{system_prompt}
+</system_prompt>
+
+<user_prompt>
+{user_prompt}
+</user_prompt>
+"""
+
+
+def codex_cli_transcript_path(run_root: Path, payload: dict[str, Any]) -> Path:
+    arm = normalize_arm(payload.get("arm"))
+    input_layer = normalize_input_layer(payload.get("input_layer"))
+    decision_date = str(payload.get("decision_date"))
+    ticker = ticker_slug(str(payload.get("ticker")))
+    return (
+        run_root
+        / "codex_cli_transcripts"
+        / arm
+        / f"transcript_{decision_date}_{ticker}_{input_layer}.txt"
+    )
+
+
+def codex_cli_version(codex_binary: str = "codex") -> str:
+    if not shutil.which(codex_binary):
+        return ""
+    try:
+        completed = subprocess.run(
+            [codex_binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:  # noqa: BLE001 - preflight reports a backend blocker.
+        return ""
+    if completed.returncode != 0:
+        return ""
+    return (completed.stdout or completed.stderr or "").strip().splitlines()[0]
 
 
 def _parse_raw_provider_content(
@@ -696,6 +948,7 @@ def cache_key_for(
     provider_model: str,
     provider_base_url: str,
     provider_max_tokens: int,
+    provider_temperature: float | None = None,
     prompt_hash: str,
     definition_version: str = DEFINITION_VERSION,
 ) -> str:
@@ -707,11 +960,33 @@ def cache_key_for(
             provider_model,
             provider_base_url,
             f"max_tokens={int(provider_max_tokens)}",
+            f"temperature={provider_temperature_identity(provider_temperature)}",
             arm,
             input_layer,
             prompt_hash,
         ]
     )
+
+
+def stable_json_hash(value: dict[str, Any]) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def kimi_provider_temperature(_model: str) -> float:
+    return 1.0
+
+
+def provider_temperature_for(provider: str, provider_model: str) -> float | None:
+    if provider == "kimi":
+        return kimi_provider_temperature(provider_model)
+    return None
+
+
+def provider_temperature_identity(provider_temperature: float | None) -> str:
+    if provider_temperature is None:
+        return "omitted"
+    return f"{float(provider_temperature):g}"
 
 
 def build_prompt_payload(
@@ -889,6 +1164,34 @@ FORBIDDEN_RESEARCH_ARTIFACT_FIELDS = {
     "window_end_price",
     "future_price",
 }
+REQUIRED_FEEDBACK_ARTIFACT_FIELDS = {
+    "ticker",
+    "feedback_ref",
+    "feedback_source_kind",
+    "availability_date",
+    "source_run_id",
+    "source_step_id",
+    "source_decision_date",
+    "source_horizon_end_date",
+    "actual_return",
+    "prior_prediction",
+}
+TRUE_INDEPENDENT_FEEDBACK_SOURCE_KINDS = {
+    "outcome_feedback",
+    "realized_error_feedback",
+}
+NON_INDEPENDENT_FEEDBACK_SOURCE_KINDS = {
+    "self_feedback",
+    "synthetic_feedback",
+}
+FORBIDDEN_FEEDBACK_ARTIFACT_FIELDS = {
+    "current_actual_return",
+    "current_step_output",
+    "future_return",
+    "outcome_after_current_decision",
+    "realized_after_current_decision",
+    "same_date_future_outcome",
+}
 
 
 def empty_research_artifact_filter_result() -> dict[str, Any]:
@@ -915,6 +1218,21 @@ def load_research_artifact_fixture(path: Path) -> list[dict[str, Any]]:
     if not isinstance(payload, list):
         raise ValueError("research artifact fixture must be a list or {'artifacts': [...]}")
     return [dict(item) for item in payload if isinstance(item, dict)]
+
+
+def load_feedback_artifact_fixture(path: Path) -> list[Any]:
+    if path.suffix.lower() == ".jsonl":
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict):
+        payload = payload.get("feedback_artifacts", payload.get("artifacts", []))
+    if not isinstance(payload, list):
+        raise ValueError("feedback artifact fixture must be a list or {'feedback_artifacts': [...]}")
+    return list(payload)
 
 
 def filter_external_research_artifacts(
@@ -964,16 +1282,255 @@ def normalize_research_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "kind": "research_artifact",
         "source": str(artifact["source_url_or_id"]),
         "source_kind": str(artifact["source_kind"]),
+        "source_family": str(artifact.get("source_family") or ""),
         "availability_date": str(artifact["availability_date"]),
+        "captured_at": str(artifact.get("captured_at") or artifact["publish_timestamp"]),
         "summary": str(artifact["summary"]),
+        "text": str(artifact.get("text") or artifact["summary"]),
         "ticker": str(artifact["ticker"]),
         "source_name": str(artifact["source_name"]),
         "source_url_or_id": str(artifact["source_url_or_id"]),
+        "source_url": str(artifact.get("source_url") or artifact["source_url_or_id"]),
+        "source_id": str(artifact.get("source_id") or artifact["source_url_or_id"]),
         "publish_timestamp": str(artifact["publish_timestamp"]),
         "retrieval_method": str(artifact["retrieval_method"]),
         "evidence_ref": str(artifact["evidence_ref"]),
         "decision_date_scope": artifact.get("decision_date_scope"),
+        "decision_date_max": artifact.get("decision_date_max"),
+        "provenance_hash": str(artifact.get("provenance_hash") or ""),
     }
+
+
+def empty_feedback_artifact_filter_result() -> dict[str, Any]:
+    return {
+        "accepted_feedback": [],
+        "rejected_feedback_artifact_count": 0,
+        "rejected_feedback_future_data_count": 0,
+        "rejected_feedback_schema_count": 0,
+        "rejected_feedback_non_independent_count": 0,
+        "rejected_feedback_current_run_count": 0,
+        "rejected_feedback_duplicate_count": 0,
+        "feedback_source_kind_counts": feedback_source_kind_counts_for_feedback([]),
+    }
+
+
+def feedback_artifact_filter_result(
+    *,
+    feedback_artifacts_path: Path | None,
+    decision_date: date,
+    ticker: str,
+    input_layer: InputLayer,
+    current_run_id: str = "",
+) -> dict[str, Any]:
+    if not feedback_artifacts_path:
+        return empty_feedback_artifact_filter_result()
+    return filter_external_feedback_artifacts(
+        load_feedback_artifact_fixture(feedback_artifacts_path),
+        decision_date=decision_date,
+        ticker=ticker,
+        input_layer=input_layer,
+        current_run_id=current_run_id,
+    )
+
+
+def filter_external_feedback_artifacts(
+    artifacts: list[Any],
+    *,
+    decision_date: date,
+    ticker: str,
+    input_layer: InputLayer,
+    current_run_id: str = "",
+) -> dict[str, Any]:
+    accepted: list[dict[str, Any]] = []
+    rejected_future = 0
+    rejected_schema = 0
+    rejected_non_independent = 0
+    rejected_current_run = 0
+    rejected_duplicate = 0
+    accepted_keys: set[tuple[str, ...]] = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            rejected_schema += 1
+            continue
+        artifact_ticker = str(artifact.get("ticker") or "")
+        artifact_input_layer = str(artifact.get("input_layer") or "*")
+        if artifact_ticker not in {ticker, "*"}:
+            continue
+        if artifact_input_layer not in {input_layer, "*"}:
+            continue
+        source_kind = str(artifact.get("feedback_source_kind") or artifact.get("source_kind") or "")
+        missing = REQUIRED_FEEDBACK_ARTIFACT_FIELDS - set(artifact)
+        forbidden = sorted(FORBIDDEN_FEEDBACK_ARTIFACT_FIELDS & set(artifact))
+        if missing or source_kind not in (
+            TRUE_INDEPENDENT_FEEDBACK_SOURCE_KINDS | NON_INDEPENDENT_FEEDBACK_SOURCE_KINDS
+        ):
+            rejected_schema += 1
+            continue
+        if forbidden:
+            rejected_future += 1
+            continue
+        try:
+            availability_date = parse_date(str(artifact["availability_date"]))
+            horizon_end_date = parse_date(str(artifact["source_horizon_end_date"]))
+            source_decision_date = parse_date(str(artifact["source_decision_date"]))
+        except Exception:  # noqa: BLE001 - fixture rows are untrusted inputs.
+            rejected_schema += 1
+            continue
+        if (
+            availability_date > decision_date
+            or horizon_end_date > decision_date
+            or source_decision_date >= decision_date
+        ):
+            rejected_future += 1
+            continue
+        if current_run_id and str(artifact.get("source_run_id") or "") == current_run_id:
+            rejected_current_run += 1
+            continue
+        if source_kind not in TRUE_INDEPENDENT_FEEDBACK_SOURCE_KINDS:
+            rejected_non_independent += 1
+            continue
+        try:
+            normalized = normalize_feedback_artifact(
+                artifact, current_decision_date=decision_date
+            )
+        except Exception:  # noqa: BLE001 - malformed numeric/provenance fields are rejected.
+            rejected_schema += 1
+            continue
+        unique_key = feedback_unique_key(normalized)
+        if unique_key in accepted_keys:
+            rejected_duplicate += 1
+            continue
+        accepted_keys.add(unique_key)
+        accepted.append(normalized)
+    return {
+        "accepted_feedback": accepted,
+        "rejected_feedback_artifact_count": (
+            rejected_future
+            + rejected_schema
+            + rejected_non_independent
+            + rejected_current_run
+            + rejected_duplicate
+        ),
+        "rejected_feedback_future_data_count": rejected_future,
+        "rejected_feedback_schema_count": rejected_schema,
+        "rejected_feedback_non_independent_count": rejected_non_independent,
+        "rejected_feedback_current_run_count": rejected_current_run,
+        "rejected_feedback_duplicate_count": rejected_duplicate,
+        "feedback_source_kind_counts": feedback_source_kind_counts_for_feedback(accepted),
+    }
+
+
+def normalize_feedback_artifact(
+    artifact: dict[str, Any],
+    *,
+    current_decision_date: date,
+) -> dict[str, Any]:
+    availability_date = str(artifact["availability_date"])
+    source_kind = str(artifact["feedback_source_kind"])
+    actual_return = finite_float_field(artifact, "actual_return")
+    prior_prediction = finite_float_field(artifact, "prior_prediction")
+    computed_error = actual_return - prior_prediction
+    error = finite_float_field(artifact, "error", default=computed_error)
+    computed_mse = computed_error * computed_error
+    mse = finite_float_field(artifact, "mse", default=computed_mse)
+    if abs(mse - computed_mse) > 1e-6:
+        raise ValueError("feedback mse must match squared realized error")
+    return {
+        "feedback_ref": str(artifact["feedback_ref"]),
+        "ticker": str(artifact["ticker"]),
+        "input_layer": str(artifact.get("input_layer") or "*"),
+        "prior_decision_date": str(artifact["source_decision_date"]),
+        "decision_date": str(artifact["source_decision_date"]),
+        "source_decision_date": str(artifact["source_decision_date"]),
+        "source_horizon_end_date": str(artifact["source_horizon_end_date"]),
+        "outcome_availability_date": availability_date,
+        "availability_date": availability_date,
+        "age_days": (current_decision_date - parse_date(availability_date)).days,
+        "feedback_source_kind": source_kind,
+        "source_kind": source_kind,
+        "source_run_id": str(artifact["source_run_id"]),
+        "source_step_id": str(artifact["source_step_id"]),
+        "actual_return": actual_return,
+        "prior_prediction": prior_prediction,
+        "error": error,
+        "mse": mse,
+        "summary": str(artifact.get("summary") or ""),
+    }
+
+
+def finite_float_field(
+    artifact: dict[str, Any],
+    field: str,
+    *,
+    default: float | None = None,
+) -> float:
+    value = artifact.get(field)
+    if value is None:
+        if default is None:
+            raise ValueError(f"{field} is required")
+        value = default
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be numeric")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{field} must be finite")
+    return number
+
+
+def feedback_unique_key(item: dict[str, Any]) -> tuple[str, ...]:
+    feedback_ref = str(item.get("feedback_ref") or "")
+    if feedback_ref:
+        return ("feedback_ref", feedback_ref)
+    source_step_id = str(item.get("source_step_id") or "")
+    if source_step_id:
+        return ("source_step_id", source_step_id)
+    return (
+        "provenance",
+        str(item.get("source_run_id") or ""),
+        str(item.get("source_step_id") or ""),
+        str(item.get("source_decision_date") or ""),
+        str(item.get("source_horizon_end_date") or ""),
+        str(item.get("feedback_source_kind") or item.get("source_kind") or ""),
+    )
+
+
+def unique_feedback_artifacts(feedback: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, ...]] = set()
+    output: list[dict[str, Any]] = []
+    for item in feedback:
+        key = feedback_unique_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(item)
+    return output
+
+
+def feedback_filter_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "rejected_feedback_artifact_count": int(result.get("rejected_feedback_artifact_count") or 0),
+        "rejected_feedback_future_data_count": int(
+            result.get("rejected_feedback_future_data_count") or 0
+        ),
+        "rejected_feedback_schema_count": int(result.get("rejected_feedback_schema_count") or 0),
+        "rejected_feedback_non_independent_count": int(
+            result.get("rejected_feedback_non_independent_count") or 0
+        ),
+        "rejected_feedback_current_run_count": int(
+            result.get("rejected_feedback_current_run_count") or 0
+        ),
+        "rejected_feedback_duplicate_count": int(
+            result.get("rejected_feedback_duplicate_count") or 0
+        ),
+        "feedback_source_kind_counts": dict(
+            result.get("feedback_source_kind_counts")
+            or feedback_source_kind_counts_for_feedback([])
+        ),
+    }
+
+
+def feedback_filter_diagnostics_empty() -> dict[str, Any]:
+    return feedback_filter_diagnostics(empty_feedback_artifact_filter_result())
 
 
 def ksana_workflow_for(arm: Arm) -> dict[str, str]:
@@ -1236,6 +1793,276 @@ def direction_hit_for(*, predicted_direction: str, actual_change_pct: float) -> 
     return predicted_direction == actual
 
 
+def deterministic_price_only_baseline_decision(
+    *,
+    ticker: str,
+    decision_date: date,
+    price_rows: pd.DataFrame,
+) -> dict[str, Any]:
+    dated = price_rows.copy()
+    dated["_gotra_decision_visible_date"] = pd.to_datetime(dated["date"]).dt.date
+    visible = dated[dated["_gotra_decision_visible_date"] <= decision_date].drop(
+        columns=["_gotra_decision_visible_date"]
+    )
+    future_rows_excluded = int(len(dated) - len(visible))
+    if visible.empty:
+        raise ValueError("deterministic price-only baseline has no pre-decision price rows")
+    features = price_features(visible)
+    expected = round(
+        max(
+            min(
+                0.35 * features["return_21d_pct"] + 0.25 * features["return_63d_pct"],
+                25.0,
+            ),
+            -25.0,
+        ),
+        4,
+    )
+    direction = "long" if expected >= 2.0 else "avoid" if expected <= -2.0 else "neutral"
+    confidence = round(min(0.8, 0.45 + abs(expected) / 70), 4)
+    latest = visible.iloc[-1]
+    return {
+        "schema": "gotra.baseline_v3_4.deterministic_price_only_baseline.v1",
+        "baseline": "deterministic_price_only_baseline",
+        "ticker": ticker,
+        "decision_date": decision_date.isoformat(),
+        "input_cutoff": decision_date.isoformat(),
+        "latest_visible_price_date": str(latest["date"]),
+        "visible_price_rows": int(len(visible)),
+        "future_rows_excluded": future_rows_excluded,
+        "direction": direction,
+        "expected_change_pct": expected,
+        "confidence": confidence,
+        "future_data_allowed": False,
+        "llm_used": False,
+    }
+
+
+def deterministic_price_only_reference_for_run(
+    *,
+    config: RunConfig,
+    run_root: Path,
+) -> dict[str, Any]:
+    reference_dir = run_root / "deterministic_price_only_baseline"
+    reference_dir.mkdir(parents=True, exist_ok=True)
+    records: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, int]] = set()
+    raw_mirrored_count = 0
+    for decision_date in config.dates:
+        if scoring_segment_for(config, decision_date) != "scored":
+            continue
+        for ticker in config.tickers:
+            key = (ticker, decision_date.isoformat(), WINDOW_DAYS)
+            if key in seen:
+                continue
+            seen.add(key)
+            raw_mirrored_count += len(config.input_layers)
+            point = DecisionPoint(ticker, decision_date, "price_only_packet")
+            try:
+                context = price_context_for(point, price_dir=config.price_dir)
+                full_price_rows = read_price_cache(ticker, price_dir=config.price_dir)
+                record = deterministic_price_only_reference_record(
+                    run_id=config.run_id,
+                    ticker=ticker,
+                    decision_date=decision_date,
+                    context=context,
+                    full_price_rows=full_price_rows,
+                    input_layers=config.input_layers,
+                )
+                records.append(record)
+                path = reference_dir / (
+                    f"reference_{decision_date.isoformat()}_{ticker_slug(ticker)}.json"
+                )
+                path.write_text(
+                    json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+            except Exception as exc:  # noqa: BLE001 - local price cache can be incomplete.
+                errors.append(
+                    {
+                        "ticker": ticker,
+                        "decision_date": decision_date.isoformat(),
+                        "error_type": exc.__class__.__name__,
+                        "error_message": redact_error(str(exc)),
+                    }
+                )
+    scored = [record for record in records if record.get("status") == "scored"]
+    future_violations = [
+        record for record in scored if record.get("future_data_violation")
+    ]
+    if errors or future_violations:
+        status = "REFERENCE_NEEDS_FIX"
+    elif scored:
+        status = "REFERENCE_READY"
+    else:
+        status = "REFERENCE_DATA_INSUFFICIENT"
+    latest_dates = [
+        str(record.get("latest_visible_price_date"))
+        for record in scored
+        if record.get("latest_visible_price_date")
+    ]
+    return {
+        "schema": DETERMINISTIC_REFERENCE_SCHEMA,
+        "status": status,
+        "artifact_dir": str(reference_dir),
+        "count": len(scored),
+        "unique_scored_point_count": len(scored),
+        "raw_mirrored_count": raw_mirrored_count,
+        "input_layer_count": len(config.input_layers),
+        "metrics": deterministic_price_only_reference_metrics(scored),
+        "future_data_violations": len(future_violations),
+        "latest_visible_price_date_max": max(latest_dates) if latest_dates else "",
+        "error_count": len(errors),
+        "errors": errors[:10],
+        "llm_used": False,
+        "provider_or_backend_called": False,
+        "clean_historical_reference_status": (
+            "PRESENT_DETERMINISTIC_PRICE_ONLY_BASELINE"
+            if status == "REFERENCE_READY"
+            else "MISSING_OR_BLOCKED_DETERMINISTIC_PRICE_ONLY_BASELINE"
+        ),
+    }
+
+
+def deterministic_price_only_reference_record(
+    *,
+    run_id: str,
+    ticker: str,
+    decision_date: date,
+    context: PriceContext,
+    full_price_rows: pd.DataFrame,
+    input_layers: tuple[InputLayer, ...],
+) -> dict[str, Any]:
+    decision = deterministic_price_only_baseline_decision(
+        ticker=ticker,
+        decision_date=decision_date,
+        price_rows=full_price_rows,
+    )
+    actual = change_pct(float(context.start_row["adj_close"]), float(context.end_row["adj_close"]))
+    error = round(actual - float(decision["expected_change_pct"]), 6)
+    latest_visible_date = parse_date(str(decision["latest_visible_price_date"]))
+    future_data_violation = latest_visible_date > decision_date
+    direction_hit = direction_hit_for(
+        predicted_direction=str(decision["direction"]),
+        actual_change_pct=actual,
+    )
+    return {
+        "schema": DETERMINISTIC_REFERENCE_SCHEMA,
+        "run_id": run_id,
+        "status": "scored",
+        "baseline": "deterministic_price_only_baseline",
+        "reference_key": f"{ticker}|{decision_date.isoformat()}|{WINDOW_DAYS}",
+        "ticker": ticker,
+        "decision_date": decision_date.isoformat(),
+        "horizon_days": WINDOW_DAYS,
+        "window_end_date": context.outcome_date.isoformat(),
+        "outcome_as_of": str(context.end_row["date"]),
+        "input_layers_represented": list(input_layers),
+        "input_layer_mirrored_equivalent_count": len(input_layers),
+        "direction": decision["direction"],
+        "expected_change_pct": decision["expected_change_pct"],
+        "confidence": decision["confidence"],
+        "input_cutoff": decision["input_cutoff"],
+        "latest_visible_price_date": decision["latest_visible_price_date"],
+        "visible_price_rows": decision["visible_price_rows"],
+        "future_rows_excluded": decision["future_rows_excluded"],
+        "future_data_allowed": False,
+        "future_data_violation": future_data_violation,
+        "llm_used": False,
+        "provider_or_backend_called": False,
+        "actual_change_pct": actual,
+        "actual_direction": actual_direction(actual),
+        "direction_hit": direction_hit,
+        "error": error,
+        "mse": round(error * error, 6),
+        "mae": round(abs(error), 6),
+        "policy_a_return_pct": actual if decision["direction"] == "long" else 0.0,
+        "abstain_reason": "",
+        "decision_inputs": decision_inputs(
+            context.price_rows,
+            research_artifacts=[],
+            feedback=[],
+        ),
+        "outcome_inputs": outcome_inputs(context.end_row),
+    }
+
+
+def deterministic_price_only_reference_metrics(
+    records: list[dict[str, Any]]
+) -> dict[str, Any]:
+    if not records:
+        return {
+            "scored_steps": 0,
+            "direction_hit_rate": None,
+            "mse": None,
+            "mae": None,
+            "policy_a_cumulative_return_pct": None,
+            "calibration": calibration_and_abstain_metrics([]),
+        }
+    direction_hits = [1 if record.get("direction_hit") else 0 for record in records]
+    return {
+        "scored_steps": len(records),
+        "direction_hit_rate": sum(direction_hits) / len(direction_hits),
+        "mse": mean_float(record["mse"] for record in records),
+        "mae": mean_float(record["mae"] for record in records),
+        "policy_a_cumulative_return_pct": policy_a_cumulative_return(records),
+        "calibration": calibration_and_abstain_metrics(records),
+    }
+
+
+def deterministic_price_only_reference_empty() -> dict[str, Any]:
+    return {
+        "schema": DETERMINISTIC_REFERENCE_SCHEMA,
+        "status": "REFERENCE_NOT_COMPUTED",
+        "artifact_dir": "",
+        "count": 0,
+        "unique_scored_point_count": 0,
+        "raw_mirrored_count": 0,
+        "input_layer_count": 0,
+        "metrics": deterministic_price_only_reference_metrics([]),
+        "future_data_violations": 0,
+        "latest_visible_price_date_max": "",
+        "error_count": 0,
+        "errors": [],
+        "llm_used": False,
+        "provider_or_backend_called": False,
+        "clean_historical_reference_status": "MISSING_OR_BLOCKED_DETERMINISTIC_PRICE_ONLY_BASELINE",
+    }
+
+
+def deterministic_reference_summary_fields(reference: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "deterministic_price_only_baseline_status": reference["status"],
+        "deterministic_price_only_baseline_count": reference["count"],
+        "deterministic_price_only_baseline_unique_scored_point_count": reference[
+            "unique_scored_point_count"
+        ],
+        "deterministic_price_only_baseline_raw_mirrored_count": reference[
+            "raw_mirrored_count"
+        ],
+        "deterministic_price_only_baseline_input_layer_count": reference[
+            "input_layer_count"
+        ],
+        "deterministic_price_only_baseline_metrics": reference["metrics"],
+        "deterministic_price_only_baseline_future_data_violations": reference[
+            "future_data_violations"
+        ],
+        "deterministic_price_only_baseline_latest_visible_price_date_max": reference[
+            "latest_visible_price_date_max"
+        ],
+        "deterministic_price_only_baseline_artifact_dir": reference["artifact_dir"],
+        "deterministic_price_only_baseline_error_count": reference["error_count"],
+        "deterministic_price_only_baseline_errors": reference["errors"],
+        "deterministic_price_only_baseline_llm_used": reference["llm_used"],
+        "deterministic_price_only_baseline_provider_or_backend_called": reference[
+            "provider_or_backend_called"
+        ],
+        "clean_historical_reference_status": reference["clean_historical_reference_status"],
+        "deterministic_price_only_baseline": reference,
+    }
+
+
 def scoring_segment_for(config: RunConfig, decision_date: date) -> ScoringSegment:
     ordered_dates = sorted(config.dates)
     warm_up_dates = set(ordered_dates[: max(0, config.warm_up_dates)])
@@ -1260,6 +2087,7 @@ def build_scored_step(
     provider_base_url: str,
     provider_transport: str,
     diagnostics: dict[str, Any],
+    feedback_filter_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     actual = change_pct(float(context.start_row["adj_close"]), float(context.end_row["adj_close"]))
     error = round(actual - decision.expected_change_pct, 6)
@@ -1270,6 +2098,9 @@ def build_scored_step(
         decision_date=point.decision_date,
         arm=arm,
         scoring_segment=scoring_segment,
+    )
+    feedback_filter_diagnostics = (
+        feedback_filter_diagnostics or feedback_filter_diagnostics_empty()
     )
     available_evidence_count = 1 + len(research_artifacts) + (len(feedback) if arm == "full_gotra" else 0)
     step = {
@@ -1316,6 +2147,8 @@ def build_scored_step(
         **strict_feedback,
         "quarantine_excluded_count": 0,
         "strong_knowledge_auto_approved": False,
+        "alaya_feedback_history": feedback if arm == "full_gotra" else [],
+        **feedback_filter_diagnostics,
         "research_artifacts": research_artifacts,
         "research_artifact_count": len(research_artifacts),
         "synthetic_evidence_count": synthetic_evidence_count(research_artifacts),
@@ -1354,8 +2187,12 @@ def build_error_step(
     context: PriceContext | None = None,
     prompt_hash: str = "",
     diagnostics: dict[str, Any] | None = None,
+    feedback: list[dict[str, Any]] | None = None,
+    feedback_filter_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     diagnostics = diagnostics or default_request_diagnostics(timeout_seconds=0)
+    feedback = feedback or []
+    feedback_filter_diagnostics = feedback_filter_diagnostics or feedback_filter_diagnostics_empty()
     provider_error_types = {
         "provider_timeout",
         "provider_http_429",
@@ -1366,7 +2203,9 @@ def build_error_step(
         "input_echo_error",
         "future_data_violation",
         "research_source_leak",
+        "feedback_source_leak",
         "auth_missing",
+        "codex_cli_backend_blocked",
     }
     step: dict[str, Any] = {
         "schema": STEP_SCHEMA,
@@ -1404,6 +2243,8 @@ def build_error_step(
         "feedback_age_days_max": None,
         "quarantine_excluded_count": 0,
         "strong_knowledge_auto_approved": False,
+        "alaya_feedback_history": feedback if arm == "full_gotra" else [],
+        **feedback_filter_diagnostics,
         "research_artifacts": [],
         "research_artifact_count": 0,
         "synthetic_evidence_count": 0,
@@ -1424,7 +2265,11 @@ def build_error_step(
                 "window_end_date": context.outcome_date.isoformat(),
                 "outcome_as_of": str(context.end_row["date"]),
                 "actual_change_pct": actual,
-                "decision_inputs": decision_inputs(context.price_rows, research_artifacts=[], feedback=[]),
+                "decision_inputs": decision_inputs(
+                    context.price_rows,
+                    research_artifacts=[],
+                    feedback=feedback if arm == "full_gotra" else [],
+                ),
                 "outcome_inputs": outcome_inputs(context.end_row),
             }
         )
@@ -1435,6 +2280,8 @@ def build_error_step(
 
 
 def classify_exception(exc: Exception) -> str:
+    if str(getattr(exc, "provider_error_class", "") or "") == "CodexCliBackendBlocked":
+        return "codex_cli_backend_blocked"
     return v2.classify_exception(exc)
 
 
@@ -1469,9 +2316,14 @@ def decision_inputs(
             {
                 "name": str(item.get("feedback_ref") or f"alaya_matured_feedback_{index}"),
                 "kind": "alaya_feedback",
-                "source": "prior_step_outcome",
-                "source_kind": str(item.get("source_kind") or "self_feedback"),
-                "availability_date": item["outcome_availability_date"],
+                "source": str(item.get("source_step_id") or item.get("source_run_id") or "prior_step_outcome"),
+                "source_kind": str(
+                    item.get("feedback_source_kind") or item.get("source_kind") or "self_feedback"
+                ),
+                "availability_date": item.get("availability_date") or item["outcome_availability_date"],
+                "source_decision_date": item.get("source_decision_date")
+                or item.get("prior_decision_date"),
+                "source_horizon_end_date": item.get("source_horizon_end_date"),
             }
         )
     return inputs
@@ -1510,6 +2362,18 @@ def research_source_leak_violations(step: dict[str, Any]) -> list[str]:
     return violations
 
 
+def feedback_source_leak_violations(step: dict[str, Any]) -> list[str]:
+    violations: list[str] = []
+    has_feedback_input = any(
+        str(item.get("kind") or "") == "alaya_feedback"
+        for item in step.get("decision_inputs") or []
+        if isinstance(item, dict)
+    )
+    if has_feedback_input and step.get("arm") != "full_gotra":
+        violations.append("non-full_gotra arm received alaya_feedback")
+    return violations
+
+
 def feedback_age_days(*, feedback: list[dict[str, Any]], decision_date: date) -> list[int]:
     ages: list[int] = []
     for item in feedback:
@@ -1532,36 +2396,57 @@ def strict_feedback_diagnostics(
             "visible_mature_feedback_count": 0,
             "feedback_prior_wave_count": 0,
             "feedback_real_unverified_count": 0,
+            "true_independent_feedback_count": 0,
+            "true_independent_feedback_prior_wave_count": 0,
+            "duplicate_independent_feedback_count": 0,
+            "feedback_source_kind_counts": feedback_source_kind_counts_for_feedback([]),
+            "feedback_age_days_max_meets_horizon": False,
             "strict_feedback_eligible": False,
             "true_independent_feedback_eligible": False,
             "strict_feedback_insufficient_reason": "not_full_gotra_scored_segment",
         }
     ages = feedback_age_days(feedback=feedback, decision_date=decision_date)
+    independent_feedback = [
+        item
+        for item in feedback
+        if str(item.get("feedback_source_kind") or item.get("source_kind") or "")
+        in TRUE_INDEPENDENT_FEEDBACK_SOURCE_KINDS
+    ]
+    unique_independent_feedback = unique_feedback_artifacts(independent_feedback)
     prior_waves = {
         str(item.get("prior_decision_date") or item.get("decision_date"))
         for item in feedback
         if item.get("prior_decision_date") or item.get("decision_date")
     }
-    real_unverified_count = sum(
-        1 for item in feedback if str(item.get("source_kind") or "") in {"real", "unverified"}
-    )
+    independent_prior_waves = {
+        str(item.get("source_decision_date") or item.get("prior_decision_date") or item.get("decision_date"))
+        for item in unique_independent_feedback
+        if item.get("source_decision_date") or item.get("prior_decision_date") or item.get("decision_date")
+    }
     count = len(feedback)
+    independent_count = len(unique_independent_feedback)
+    duplicate_independent_count = max(0, len(independent_feedback) - independent_count)
     max_age = max(ages) if ages else None
     reasons: list[str] = []
     if count < 3:
         reasons.append("visible_mature_feedback_count_lt_3")
-    if max_age is None or max_age < WINDOW_DAYS:
-        reasons.append("feedback_age_days_max_lt_horizon_days")
-    if len(prior_waves) < 2:
-        reasons.append("prior_wave_count_lt_2")
-    if real_unverified_count < 1:
-        reasons.append("no_real_or_unverified_feedback_source_kind")
+    if independent_count < 3:
+        reasons.append("true_independent_feedback_count_lt_3")
+    if len(independent_prior_waves) < 2:
+        reasons.append("true_independent_prior_wave_count_lt_2")
+    if independent_count < 1:
+        reasons.append("no_outcome_derived_independent_feedback_source_kind")
     eligible = not reasons
     return {
         "self_feedback_available": count > 0,
         "visible_mature_feedback_count": count,
         "feedback_prior_wave_count": len(prior_waves),
-        "feedback_real_unverified_count": real_unverified_count,
+        "feedback_real_unverified_count": 0,
+        "true_independent_feedback_count": independent_count,
+        "true_independent_feedback_prior_wave_count": len(independent_prior_waves),
+        "duplicate_independent_feedback_count": duplicate_independent_count,
+        "feedback_source_kind_counts": feedback_source_kind_counts_for_feedback(feedback),
+        "feedback_age_days_max_meets_horizon": bool(max_age is not None and max_age >= WINDOW_DAYS),
         "strict_feedback_eligible": eligible,
         "true_independent_feedback_eligible": eligible,
         "strict_feedback_insufficient_reason": ",".join(reasons),
@@ -1592,6 +2477,38 @@ def source_kind_counts_for_steps(steps: list[dict[str, Any]]) -> dict[str, int]:
             continue
         for artifact in step.get("research_artifacts") or []:
             source_kind = str(artifact.get("source_kind") or "unknown")
+            counts[source_kind if source_kind in counts else "unknown"] += 1
+    return counts
+
+
+def feedback_source_kind_counts_for_feedback(feedback: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {
+        "outcome_feedback": 0,
+        "realized_error_feedback": 0,
+        "self_feedback": 0,
+        "synthetic_feedback": 0,
+        "unknown": 0,
+    }
+    for item in feedback:
+        source_kind = str(
+            item.get("feedback_source_kind") or item.get("source_kind") or "unknown"
+        )
+        counts[source_kind if source_kind in counts else "unknown"] += 1
+    return counts
+
+
+def feedback_source_kind_counts_for_steps(steps: list[dict[str, Any]]) -> dict[str, int]:
+    counts = feedback_source_kind_counts_for_feedback([])
+    for step in steps:
+        step_counts = step.get("feedback_source_kind_counts")
+        if isinstance(step_counts, dict):
+            for key, value in step_counts.items():
+                counts[str(key) if str(key) in counts else "unknown"] += int(value or 0)
+            continue
+        for item in step.get("alaya_feedback_history") or []:
+            source_kind = str(
+                item.get("feedback_source_kind") or item.get("source_kind") or "unknown"
+            )
             counts[source_kind if source_kind in counts else "unknown"] += 1
     return counts
 
@@ -1743,6 +2660,11 @@ def provider_max_tokens_metadata(config: RunConfig) -> dict[str, Any]:
             "provider_max_tokens_applied": False,
             "provider_max_tokens_reason": "local mock does not call provider token API",
         }
+    if config.provider == CODEX_CLI_BACKEND:
+        return {
+            "provider_max_tokens_applied": True,
+            "provider_max_tokens_reason": "prompt guidance passed to Codex CLI backend",
+        }
     if config.provider in {"glm_sophnet", "kimi"}:
         return {
             "provider_max_tokens_applied": True,
@@ -1751,6 +2673,49 @@ def provider_max_tokens_metadata(config: RunConfig) -> dict[str, Any]:
     return {
         "provider_max_tokens_applied": False,
         "provider_max_tokens_reason": f"unsupported provider: {config.provider}",
+    }
+
+
+def provider_temperature_metadata(config: RunConfig) -> dict[str, Any]:
+    temperature = provider_temperature_for(config.provider, config.provider_model)
+    if config.provider == CODEX_CLI_BACKEND:
+        return {
+            "provider_temperature": None,
+            "provider_temperature_applied": False,
+            "provider_temperature_reason": "Codex CLI backend has prompt guidance only",
+        }
+    if temperature is None:
+        return {
+            "provider_temperature": None,
+            "provider_temperature_applied": False,
+            "provider_temperature_reason": f"unsupported provider: {config.provider}",
+        }
+    if config.mode == "mock":
+        return {
+            "provider_temperature": temperature,
+            "provider_temperature_applied": False,
+            "provider_temperature_reason": "local mock does not call provider temperature API",
+        }
+    return {
+        "provider_temperature": temperature,
+        "provider_temperature_applied": True,
+        "provider_temperature_reason": "Kimi/SophNet K2.6 requires explicit temperature=1",
+    }
+
+
+def codex_cli_backend_metadata(config: RunConfig) -> dict[str, Any]:
+    if config.provider != CODEX_CLI_BACKEND:
+        return {
+            "backend_name": "",
+            "codex_cli_version": "",
+            "codex_cli_model": "",
+            "codex_cli_reasoning_setting": "",
+        }
+    return {
+        "backend_name": CODEX_CLI_BACKEND,
+        "codex_cli_version": codex_cli_version(config.codex_cli_binary),
+        "codex_cli_model": config.provider_model,
+        "codex_cli_reasoning_setting": config.codex_cli_reasoning_setting,
     }
 
 
@@ -1766,6 +2731,15 @@ def default_request_diagnostics(
     diagnostics["provider_max_tokens"] = 0
     diagnostics["provider_max_tokens_applied"] = False
     diagnostics["provider_max_tokens_reason"] = ""
+    diagnostics["provider_temperature"] = None
+    diagnostics["provider_temperature_applied"] = False
+    diagnostics["provider_temperature_reason"] = ""
+    diagnostics["backend_name"] = ""
+    diagnostics["codex_cli_version"] = ""
+    diagnostics["codex_cli_model"] = ""
+    diagnostics["codex_cli_reasoning_setting"] = ""
+    diagnostics["output_transcript_path"] = ""
+    diagnostics["parsed_decision_hash"] = ""
     return diagnostics
 
 
@@ -1784,6 +2758,8 @@ def prompt_request_diagnostics(*, prompt: str, config: RunConfig, arm: Arm) -> d
     diagnostics["prompt_bytes"] = prompt_bytes
     diagnostics["provider_max_tokens"] = config.provider_max_tokens
     diagnostics.update(provider_max_tokens_metadata(config))
+    diagnostics.update(provider_temperature_metadata(config))
+    diagnostics.update(codex_cli_backend_metadata(config))
     return diagnostics
 
 
@@ -1801,6 +2777,17 @@ def diagnostics_from_exception(
     last_retryable_error_type = str(getattr(exc, "last_retryable_error_type", "") or "")
     if last_retryable_error_type:
         updated["last_retryable_error_type"] = last_retryable_error_type
+    for field in (
+        "output_transcript_path",
+        "codex_cli_version",
+        "codex_cli_model",
+        "codex_cli_reasoning_setting",
+    ):
+        value = str(getattr(exc, field, "") or "")
+        if value:
+            updated[field] = value
+            if field != "output_transcript_path":
+                updated["backend_name"] = CODEX_CLI_BACKEND
     return updated
 
 
@@ -1838,10 +2825,11 @@ def complete_step(
     config: RunConfig,
     run_root: Path,
     cache: LocalJsonCache,
-    client: MockDecisionClient | KimiDecisionClient | GlmSophnetDecisionClient,
+    client: MockDecisionClient | KimiDecisionClient | GlmSophnetDecisionClient | CodexCliBackendDecisionClient,
     point: DecisionPoint,
     arm: Arm,
     feedback: list[dict[str, Any]],
+    feedback_filter_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     context: PriceContext | None = None
     prompt_hash = ""
@@ -1884,6 +2872,7 @@ def complete_step(
             provider_model=client.provider_model,
             provider_base_url=client.provider_base_url,
             provider_max_tokens=config.provider_max_tokens,
+            provider_temperature=provider_temperature_for(client.provider, client.provider_model),
             prompt_hash=prompt_hash,
         )
         cached = cache.get(cache_key)
@@ -1891,6 +2880,8 @@ def complete_step(
             decision = parse_provider_decision(cached)
             validate_provider_decision_identity(decision, point=point, arm=arm)
             validate_alaya_memory_refs(decision, arm=arm, feedback=feedback)
+            if config.provider == CODEX_CLI_BACKEND:
+                diagnostics["parsed_decision_hash"] = stable_json_hash(cached)
             cache_hit = True
         else:
             started_at = time.monotonic()
@@ -1914,11 +2905,20 @@ def complete_step(
             diagnostics["provider_attempts"] = decision.provider_attempts
             diagnostics["provider_retry_count"] = decision.provider_retry_count
             diagnostics["provider_error_class"] = decision.provider_error_class
+            if decision.provider_temperature is not None:
+                diagnostics["provider_temperature"] = decision.provider_temperature
+                diagnostics["provider_temperature_applied"] = True
             diagnostics["provider_temperature_fallback"] = decision.provider_temperature_fallback
             diagnostics["last_retryable_error_type"] = decision.last_retryable_error_type
             diagnostics["normalization_applied"] = decision.normalization_applied
             diagnostics["normalization_steps"] = list(decision.normalization_steps)
             diagnostics["normalization_failure_reason"] = decision.normalization_failure_reason
+            diagnostics["backend_name"] = decision.backend_name
+            diagnostics["codex_cli_version"] = decision.codex_cli_version
+            diagnostics["codex_cli_model"] = decision.codex_cli_model
+            diagnostics["codex_cli_reasoning_setting"] = decision.codex_cli_reasoning_setting
+            diagnostics["output_transcript_path"] = decision.output_transcript_path
+            diagnostics["parsed_decision_hash"] = decision.parsed_decision_hash
             cache.set(cache_key, decision_to_cache_payload(decision))
             cache_hit = False
         step = build_scored_step(
@@ -1938,6 +2938,7 @@ def complete_step(
             provider_base_url=client.provider_base_url,
             provider_transport=client.provider_transport,
             diagnostics=diagnostics,
+            feedback_filter_diagnostics=feedback_filter_diagnostics,
         )
         step.update(research_filter_diagnostics(research_filter))
         step["product_metrics"] = product_metrics_for_step(step)
@@ -1956,6 +2957,8 @@ def complete_step(
             scoring_segment=scoring_segment,
             prompt_hash=prompt_hash,
             diagnostics=diagnostics,
+            feedback=feedback if arm == "full_gotra" else [],
+            feedback_filter_diagnostics=feedback_filter_diagnostics,
         )
     except Exception as exc:  # noqa: BLE001 - provider and schema output are untrusted.
         diagnostics = diagnostics_from_exception(diagnostics=diagnostics, exc=exc, started_at=started_at)
@@ -1981,9 +2984,12 @@ def complete_step(
             scoring_segment=scoring_segment,
             prompt_hash=prompt_hash,
             diagnostics=diagnostics,
+            feedback=feedback if arm == "full_gotra" else [],
+            feedback_filter_diagnostics=feedback_filter_diagnostics,
         )
     violations = future_data_violations(step)
     leak_violations = research_source_leak_violations(step)
+    feedback_leak_violations = feedback_source_leak_violations(step)
     if violations:
         step["status"] = "provider_error"
         step["error_type"] = "future_data_violation"
@@ -1993,6 +2999,11 @@ def complete_step(
         step["error_type"] = "research_source_leak"
         step["research_source_leak"] = True
         step["research_source_leak_violations"] = leak_violations
+    if feedback_leak_violations:
+        step["status"] = "provider_error"
+        step["error_type"] = "feedback_source_leak"
+        step["feedback_source_leak"] = True
+        step["feedback_source_leak_violations"] = feedback_leak_violations
     write_step(run_root, step)
     append_ledger(run_root, step)
     return step
@@ -2090,12 +3101,21 @@ def run_four_arm(config: RunConfig) -> dict[str, Any]:
     if not (run_root / "manifest.json").exists():
         write_manifest(run_root, config)
     cache = LocalJsonCache(run_root / "cache.json")
-    client: MockDecisionClient | KimiDecisionClient | GlmSophnetDecisionClient
+    client: MockDecisionClient | KimiDecisionClient | GlmSophnetDecisionClient | CodexCliBackendDecisionClient
     if config.mode == "mock":
         client = MockDecisionClient(
             provider=config.provider,
             provider_model=config.provider_model,
             provider_base_url=config.provider_base_url,
+        )
+    elif config.provider == CODEX_CLI_BACKEND:
+        client = CodexCliBackendDecisionClient(
+            model=config.provider_model,
+            reasoning_setting=config.codex_cli_reasoning_setting,
+            run_root=run_root,
+            provider_max_tokens=config.provider_max_tokens,
+            codex_binary=config.codex_cli_binary,
+            project_root=Path.cwd(),
         )
     elif config.provider == "glm_sophnet":
         client = GlmSophnetDecisionClient(
@@ -2112,6 +3132,7 @@ def run_four_arm(config: RunConfig) -> dict[str, Any]:
             request_timeout_seconds=config.max_request_timeout_seconds,
             provider_base_url=config.provider_base_url,
             provider_max_tokens=config.provider_max_tokens,
+            provider_temperature=provider_temperature_for(config.provider, config.provider_model),
             timeout_retries=config.timeout_retries,
             timeout_retry_backoff_seconds=config.timeout_retry_backoff_seconds,
         )
@@ -2133,6 +3154,16 @@ def run_four_arm(config: RunConfig) -> dict[str, Any]:
     circuit_breaker = CircuitBreakerState()
 
     if provider_preflight_error:
+        preflight_error_type = (
+            "codex_cli_backend_blocked"
+            if provider_preflight_error.startswith("CODEX_CLI_BACKEND_BLOCKED")
+            else "auth_missing"
+        )
+        preflight_transport = (
+            CODEX_CLI_BACKEND
+            if config.provider == CODEX_CLI_BACKEND
+            else "sophnet_chat_completions"
+        )
         for point in points:
             for arm in ARMS:
                 context = try_price_context(point, price_dir=config.price_dir)
@@ -2144,15 +3175,20 @@ def run_four_arm(config: RunConfig) -> dict[str, Any]:
                     provider=config.provider,
                     provider_model=config.provider_model,
                     provider_base_url=config.provider_base_url,
-                    provider_transport="sophnet_chat_completions",
-                    error_type="auth_missing",
+                    provider_transport=preflight_transport,
+                    error_type=preflight_error_type,
                     error_message=provider_preflight_error,
                     scoring_segment=scoring_segment,
                     context=context,
-                    diagnostics=default_request_diagnostics(
-                        timeout_seconds=arm_base_timeout_seconds(config, arm),
-                        timeout_policy=request_timeout_policy(config, arm=arm, prompt_bytes=0),
-                    ),
+                    diagnostics={
+                        **default_request_diagnostics(
+                            timeout_seconds=arm_base_timeout_seconds(config, arm),
+                            timeout_policy=request_timeout_policy(config, arm=arm, prompt_bytes=0),
+                        ),
+                        **provider_max_tokens_metadata(config),
+                        **provider_temperature_metadata(config),
+                        **codex_cli_backend_metadata(config),
+                    },
                 )
                 write_step(run_root, step)
                 append_ledger(run_root, step)
@@ -2190,6 +3226,10 @@ def run_four_arm(config: RunConfig) -> dict[str, Any]:
             if should_increase_concurrency(config=config, wave_steps=wave_steps):
                 concurrency_used = min(config.max_provider_concurrency, concurrency_used + 1)
 
+    deterministic_reference = deterministic_price_only_reference_for_run(
+        config=config,
+        run_root=run_root,
+    )
     summary = summarize_run(
         config=config,
         steps=steps,
@@ -2199,6 +3239,7 @@ def run_four_arm(config: RunConfig) -> dict[str, Any]:
         max_provider_concurrency_used=concurrency_used,
         downgrade_events=downgrade_events,
         circuit_breaker=circuit_breaker,
+        deterministic_reference=deterministic_reference,
     )
     (run_root / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True),
@@ -2212,7 +3253,7 @@ def run_date_wave(
     config: RunConfig,
     run_root: Path,
     cache: LocalJsonCache,
-    client: MockDecisionClient | KimiDecisionClient | GlmSophnetDecisionClient,
+    client: MockDecisionClient | KimiDecisionClient | GlmSophnetDecisionClient | CodexCliBackendDecisionClient,
     points: list[DecisionPoint],
     feedback_by_key: dict[tuple[str, InputLayer], list[dict[str, Any]]],
     concurrency: int,
@@ -2224,24 +3265,45 @@ def run_date_wave(
     if not points:
         return steps
     decision_date = points[0].decision_date
-    feedback_snapshot_by_key = {
-        (point.ticker, point.input_layer): matured_feedback(
+    feedback_snapshot_by_key: dict[tuple[str, InputLayer], tuple[list[dict[str, Any]], dict[str, Any]]] = {}
+    for point in points:
+        self_feedback = matured_feedback(
             feedback_by_key.get((point.ticker, point.input_layer), []),
             decision_date=decision_date,
         )
-        for point in points
-    }
-    tasks = [
-        ArmTask(
-            point=point,
-            arm=arm,
-            feedback=feedback_snapshot_by_key.get((point.ticker, point.input_layer), [])
-            if arm == "full_gotra"
-            else [],
+        external_filter = feedback_artifact_filter_result(
+            feedback_artifacts_path=config.feedback_artifacts_path,
+            decision_date=decision_date,
+            ticker=point.ticker,
+            input_layer=point.input_layer,
+            current_run_id=config.run_id,
         )
-        for point in points
-        for arm in ARMS
-    ]
+        external_feedback = list(external_filter["accepted_feedback"])
+        diagnostics = feedback_filter_diagnostics(external_filter)
+        diagnostics["feedback_source_kind_counts"] = feedback_source_kind_counts_for_feedback(
+            [*external_feedback, *self_feedback]
+        )
+        feedback_snapshot_by_key[(point.ticker, point.input_layer)] = (
+            [*external_feedback, *self_feedback],
+            diagnostics,
+        )
+    tasks: list[ArmTask] = []
+    for point in points:
+        feedback_snapshot, feedback_diagnostics_row = feedback_snapshot_by_key.get(
+            (point.ticker, point.input_layer),
+            ([], feedback_filter_diagnostics_empty()),
+        )
+        for arm in ARMS:
+            tasks.append(
+                ArmTask(
+                    point=point,
+                    arm=arm,
+                    feedback=feedback_snapshot if arm == "full_gotra" else [],
+                    feedback_filter_diagnostics=(
+                        feedback_diagnostics_row if arm == "full_gotra" else feedback_filter_diagnostics_empty()
+                    ),
+                )
+            )
     next_task_index = 0
     futures: dict[Any, ArmTask] = {}
 
@@ -2264,6 +3326,7 @@ def run_date_wave(
                     point=task.point,
                     arm=task.arm,
                     feedback=task.feedback,
+                    feedback_filter_diagnostics=task.feedback_filter_diagnostics,
                 )
             ] = task
 
@@ -2297,6 +3360,7 @@ def run_date_wave(
                     "outcome_availability_date": step["outcome_as_of"],
                     "age_days": 0,
                     "source_kind": "self_feedback",
+                    "feedback_source_kind": "self_feedback",
                     "error": step["error"],
                     "mse": step["mse"],
                     "actual_change_pct": step["actual_change_pct"],
@@ -2331,6 +3395,7 @@ def matured_feedback(items: list[dict[str, Any]], *, decision_date: date) -> lis
         normalized["age_days"] = (decision_date - outcome_date).days
         normalized.setdefault("prior_decision_date", normalized.get("decision_date"))
         normalized.setdefault("source_kind", "self_feedback")
+        normalized.setdefault("feedback_source_kind", normalized.get("source_kind"))
         matured.append(normalized)
     return sorted(matured, key=lambda item: (str(item["decision_date"]), str(item.get("input_layer"))))
 
@@ -2360,6 +3425,8 @@ def circuit_breaker_reason(steps: list[dict[str, Any]]) -> str:
         return "future-data violation observed"
     if count_error_type(steps, "research_source_leak"):
         return "research source leak observed"
+    if count_error_type(steps, "feedback_source_leak"):
+        return "feedback source leak observed"
     if count_error_type(steps, "input_echo_error"):
         return "input echo error observed"
     if schema_error_count(steps):
@@ -2406,6 +3473,12 @@ def try_price_context(point: DecisionPoint, *, price_dir: Path) -> PriceContext 
 
 def provider_preflight_blocker(config: RunConfig) -> str:
     if config.mode == "mock":
+        return ""
+    if config.provider == CODEX_CLI_BACKEND:
+        if not shutil.which(config.codex_cli_binary):
+            return "CODEX_CLI_BACKEND_BLOCKED: codex_cli_executable_missing"
+        if not codex_cli_version(config.codex_cli_binary):
+            return "CODEX_CLI_BACKEND_BLOCKED: codex_cli_version_unavailable"
         return ""
     if config.provider not in {"glm_sophnet", "kimi"}:
         return f"unsupported provider: {config.provider}"
@@ -2501,8 +3574,10 @@ def summarize_run(
     max_provider_concurrency_used: int,
     downgrade_events: list[dict[str, Any]],
     circuit_breaker: CircuitBreakerState | None = None,
+    deterministic_reference: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     circuit_breaker = circuit_breaker or CircuitBreakerState()
+    deterministic_reference = deterministic_reference or deterministic_price_only_reference_empty()
     provider_errors = sum(1 for step in steps if step.get("status") == "provider_error")
     schema_pass = sum(1 for step in steps if step.get("status") == "scored")
     timeout_count = count_error_type(steps, "provider_timeout")
@@ -2523,7 +3598,13 @@ def summarize_run(
         for step in steps
         if step.get("error_type") == "research_source_leak" or step.get("research_source_leak")
     )
+    feedback_source_leak_count = sum(
+        1
+        for step in steps
+        if step.get("error_type") == "feedback_source_leak" or step.get("feedback_source_leak")
+    )
     auth_missing_count = count_error_type(steps, "auth_missing")
+    codex_cli_backend_blocked_count = count_error_type(steps, "codex_cli_backend_blocked")
     provider_http_error_count = count_error_type(steps, "provider_http_error")
     price_missing_count = count_error_type(steps, "price_missing")
     retryable_provider_error_recovered_count = sum(
@@ -2540,7 +3621,26 @@ def summarize_run(
     rejected_research_schema_count = sum(
         int(step.get("rejected_research_schema_count") or 0) for step in steps
     )
+    rejected_feedback_artifact_count = sum(
+        int(step.get("rejected_feedback_artifact_count") or 0) for step in steps
+    )
+    rejected_feedback_future_data_count = sum(
+        int(step.get("rejected_feedback_future_data_count") or 0) for step in steps
+    )
+    rejected_feedback_schema_count = sum(
+        int(step.get("rejected_feedback_schema_count") or 0) for step in steps
+    )
+    rejected_feedback_non_independent_count = sum(
+        int(step.get("rejected_feedback_non_independent_count") or 0) for step in steps
+    )
+    rejected_feedback_current_run_count = sum(
+        int(step.get("rejected_feedback_current_run_count") or 0) for step in steps
+    )
+    rejected_feedback_duplicate_count = sum(
+        int(step.get("rejected_feedback_duplicate_count") or 0) for step in steps
+    )
     source_kind_counts = source_kind_counts_for_steps(steps)
+    feedback_source_kind_counts = feedback_source_kind_counts_for_steps(steps)
     strict_feedback_points = strict_feedback_eligible_count(steps)
     true_independent_feedback_points = true_independent_feedback_eligible_count(steps)
     paired = paired_complete_count(steps)
@@ -2554,6 +3654,7 @@ def summarize_run(
             and future_violations == 0
             and schema_errors == 0
             and research_source_leak_count == 0
+            and feedback_source_leak_count == 0
             and price_missing_count == 0
             and len(steps) == expected_steps
             and scored_step_count == expected_steps
@@ -2567,18 +3668,25 @@ def summarize_run(
     elif config.mode == "provider-canary":
         if provider_preflight_error.startswith("PROVIDER_BLOCKED_PRE_HTTP"):
             status = "PROVIDER_BLOCKED_PRE_HTTP"
+        elif provider_preflight_error.startswith("CODEX_CLI_BACKEND_BLOCKED"):
+            status = "CODEX_CLI_BACKEND_BLOCKED"
         else:
             canary_passed = (
                 provider_errors == 0
                 and future_violations == 0
                 and schema_errors == 0
                 and research_source_leak_count == 0
+                and feedback_source_leak_count == 0
                 and price_missing_count == 0
                 and schema_pass == expected_steps
             )
             status = "PROVIDER_CANARY_PASS" if canary_passed else "PROVIDER_CANARY_FAIL"
     else:
-        if circuit_breaker.triggered:
+        if provider_preflight_error.startswith("CODEX_CLI_BACKEND_BLOCKED"):
+            status = "CODEX_CLI_BACKEND_BLOCKED"
+        elif provider_preflight_error.startswith("PROVIDER_BLOCKED_PRE_HTTP"):
+            status = "PROVIDER_BLOCKED_PRE_HTTP"
+        elif circuit_breaker.triggered:
             status = "STOPPED_BY_CIRCUIT_BREAKER"
         else:
             status = (
@@ -2587,12 +3695,15 @@ def summarize_run(
                 and future_violations == 0
                 and schema_errors == 0
                 and research_source_leak_count == 0
+                and feedback_source_leak_count == 0
                 and price_missing_count == 0
                 and paired / max(1, scored_points) >= 0.95
                 else "PROVIDER_PILOT_FAIL"
             )
     provider_limits = provider_limit_metadata(config)
     provider_tokens = provider_max_tokens_metadata(config)
+    provider_temperature = provider_temperature_metadata(config)
+    codex_backend = codex_cli_backend_metadata(config)
     paired_diff_summary = paired_diffs(steps)
     statistical_test_summary = statistical_tests(steps)
     return {
@@ -2607,12 +3718,15 @@ def summarize_run(
         "target_provider": config.provider,
         "target_provider_model": config.provider_model,
         "provider_model": config.provider_model,
-        "provider_execution_mode": "local_mock" if config.mode == "mock" else "provider_http",
+        "provider_execution_mode": provider_execution_mode(config),
         "provider_base_url": config.provider_base_url,
         "provider_max_tokens": config.provider_max_tokens,
         **provider_tokens,
+        **provider_temperature,
+        **codex_backend,
         "provider_call_status": provider_call_status(
             mode=config.mode,
+            provider=config.provider,
             provider_preflight_error=provider_preflight_error,
         ),
         "provider_limits": provider_limits,
@@ -2621,10 +3735,13 @@ def summarize_run(
         "provider_preflight_error": provider_preflight_error,
         "stop_reason": stop_reason,
         "arms": list(ARMS),
+        "arm_interpretation": arm_interpretation_summary(),
+        **deterministic_reference_summary_fields(deterministic_reference),
         "input_layers": list(config.input_layers),
         "warm_up_dates": config.warm_up_dates,
         "repeat_run_index": config.repeat_run_index,
         "research_artifacts_path": str(config.research_artifacts_path or ""),
+        "feedback_artifacts_path": str(config.feedback_artifacts_path or ""),
         "expected_points": total_points,
         "expected_scored_points": scored_points,
         "expected_steps": expected_steps,
@@ -2636,9 +3753,16 @@ def summarize_run(
         "paired_coverage": paired / scored_points if scored_points else 0.0,
         "future_data_violations": future_violations,
         "research_source_leak_count": research_source_leak_count,
+        "feedback_source_leak_count": feedback_source_leak_count,
         "rejected_research_artifact_count": rejected_research_artifact_count,
         "rejected_research_future_data_count": rejected_research_future_data_count,
         "rejected_research_schema_count": rejected_research_schema_count,
+        "rejected_feedback_artifact_count": rejected_feedback_artifact_count,
+        "rejected_feedback_future_data_count": rejected_feedback_future_data_count,
+        "rejected_feedback_schema_count": rejected_feedback_schema_count,
+        "rejected_feedback_non_independent_count": rejected_feedback_non_independent_count,
+        "rejected_feedback_current_run_count": rejected_feedback_current_run_count,
+        "rejected_feedback_duplicate_count": rejected_feedback_duplicate_count,
         "h1_research_evidence_status": h1_research_evidence_status(source_kind_counts),
         "provider_error_count": provider_errors,
         "provider_error_rate": provider_error_rate,
@@ -2657,6 +3781,7 @@ def summarize_run(
         "input_echo_error_count": input_echo_errors,
         "future_data_violation_count": future_violations,
         "auth_missing_count": auth_missing_count,
+        "codex_cli_backend_blocked_count": codex_cli_backend_blocked_count,
         "provider_http_error_count": provider_http_error_count,
         "retryable_provider_error_recovered_count": retryable_provider_error_recovered_count,
         "unrecovered_provider_timeout_count": timeout_count,
@@ -2665,6 +3790,12 @@ def summarize_run(
         "normalization_counts": normalization_counts(steps),
         "raw_content_saved_count": sum(
             1 for step in steps if step.get("provider_raw_content_path")
+        ),
+        "codex_cli_transcript_path_count": sum(
+            1 for step in steps if step.get("output_transcript_path")
+        ),
+        "parsed_decision_hash_count": sum(
+            1 for step in steps if step.get("parsed_decision_hash")
         ),
         "full_gotra_scored_points": full_gotra_scored_count(steps),
         "full_gotra_feedback_available_scored_points": full_gotra_feedback_available_count(steps),
@@ -2680,6 +3811,8 @@ def summarize_run(
         "feedback_path_exercised": full_gotra_feedback_available_count(steps) > 0,
         "synthetic_evidence_count": sum(int(step.get("synthetic_evidence_count") or 0) for step in steps),
         "source_kind_counts": source_kind_counts,
+        "feedback_source_kind_counts": feedback_source_kind_counts,
+        "feedback_eligibility_diagnostics": feedback_diagnostics(steps),
         "reasoning_chars_by_arm": reasoning_chars_by_arm(steps),
         "circuit_breaker_triggered": circuit_breaker.triggered,
         "trigger_reason": circuit_breaker.trigger_reason,
@@ -2701,9 +3834,23 @@ def total_scored_points(config: RunConfig) -> int:
     return len(config.tickers) * scored_dates * len(config.input_layers)
 
 
-def provider_call_status(*, mode: Mode, provider_preflight_error: str) -> str:
+def provider_execution_mode(config: RunConfig) -> str:
+    if config.mode == "mock":
+        return "local_mock"
+    if config.provider == CODEX_CLI_BACKEND:
+        return CODEX_CLI_BACKEND
+    return "provider_http"
+
+
+def provider_call_status(*, mode: Mode, provider: str, provider_preflight_error: str) -> str:
     if mode == "mock" or provider_preflight_error.startswith("PROVIDER_BLOCKED_PRE_HTTP"):
         return "no real provider HTTP call"
+    if provider_preflight_error.startswith("CODEX_CLI_BACKEND_BLOCKED"):
+        return "no Codex CLI backend call"
+    if provider == CODEX_CLI_BACKEND:
+        if mode == "provider-pilot":
+            return "Codex CLI backend pilot attempted"
+        return "Codex CLI backend canary attempted"
     if mode == "provider-pilot":
         return "provider HTTP pilot attempted"
     return "provider HTTP canary attempted"
@@ -2730,6 +3877,18 @@ def evidence_layer_summary() -> dict[str, str]:
         "provider_runtime_health": "not entered unless provider-canary/provider-pilot is run",
         "formal_lite_acceptance": "not entered by this implementation goal",
         "science_public_claim": "not entered",
+    }
+
+
+def arm_interpretation_summary() -> dict[str, str]:
+    return {
+        "direct_llm": (
+            "direct_llm_parametric_memory_control; not a clean historical no-future baseline"
+        ),
+        "ksana_formatting_only": "formatting/scaffold control arm",
+        "ksana_real_research": "time-bounded research packet arm when evidence is available",
+        "full_gotra": "research plus eligible Alaya feedback arm",
+        "clean_historical_reference": "deterministic_price_only_baseline or future-only/forward-live evidence",
     }
 
 
@@ -2827,6 +3986,7 @@ def request_diagnostics_by_arm(steps: list[dict[str, Any]]) -> dict[str, Any]:
             "request_timeout_seconds": min_max_value(arm_steps, "request_timeout_seconds"),
             "provider_attempts": min_max_value(arm_steps, "provider_attempts"),
             "provider_retry_count": min_max_value(arm_steps, "provider_retry_count"),
+            "provider_temperature": min_max_value(arm_steps, "provider_temperature"),
             "provider_temperature_fallback_count": sum(
                 1 for step in arm_steps if step.get("provider_temperature_fallback")
             ),
@@ -2855,6 +4015,12 @@ def request_diagnostics_by_arm(steps: list[dict[str, Any]]) -> dict[str, Any]:
             "input_echo_error_count": count_error_type(arm_steps, "input_echo_error"),
             "raw_content_saved_count": sum(
                 1 for step in arm_steps if step.get("provider_raw_content_path")
+            ),
+            "codex_cli_transcript_path_count": sum(
+                1 for step in arm_steps if step.get("output_transcript_path")
+            ),
+            "parsed_decision_hash_count": sum(
+                1 for step in arm_steps if step.get("parsed_decision_hash")
             ),
         }
     return output
@@ -2935,6 +4101,7 @@ def feedback_diagnostics(steps: list[dict[str, Any]]) -> dict[str, Any]:
                 "feedback_used_count_max": None,
                 "feedback_age_days_max_min": None,
                 "feedback_age_days_max_max": None,
+                "feedback_source_kind_counts": feedback_source_kind_counts_for_feedback([]),
             },
         )
         row["points"] += 1
@@ -2943,6 +4110,11 @@ def feedback_diagnostics(steps: list[dict[str, Any]]) -> dict[str, Any]:
         row["true_independent_feedback_eligible_points"] += (
             1 if step.get("true_independent_feedback_eligible") else 0
         )
+        step_counts = step.get("feedback_source_kind_counts") or {}
+        if isinstance(step_counts, dict):
+            for key, value in step_counts.items():
+                normalized_key = str(key) if str(key) in row["feedback_source_kind_counts"] else "unknown"
+                row["feedback_source_kind_counts"][normalized_key] += int(value or 0)
         update_min_max(row, "feedback_used_count", step.get("feedback_used_count"))
         update_min_max(row, "feedback_age_days_max", step.get("feedback_age_days_max"))
     return {
@@ -2954,6 +4126,30 @@ def feedback_diagnostics(steps: list[dict[str, Any]]) -> dict[str, Any]:
         "true_independent_feedback_eligible_points": true_independent_feedback_eligible_count(steps),
         "h2_data_status": h2_data_status(true_independent_feedback_eligible_count(steps)),
         "h2_data_insufficient_reason": h2_data_insufficient_reason(steps),
+        "feedback_source_kind_counts": feedback_source_kind_counts_for_steps(steps),
+        "rejected_feedback_artifact_count": sum(
+            int(step.get("rejected_feedback_artifact_count") or 0) for step in steps
+        ),
+        "rejected_feedback_future_data_count": sum(
+            int(step.get("rejected_feedback_future_data_count") or 0) for step in steps
+        ),
+        "rejected_feedback_schema_count": sum(
+            int(step.get("rejected_feedback_schema_count") or 0) for step in steps
+        ),
+        "rejected_feedback_non_independent_count": sum(
+            int(step.get("rejected_feedback_non_independent_count") or 0) for step in steps
+        ),
+        "rejected_feedback_current_run_count": sum(
+            int(step.get("rejected_feedback_current_run_count") or 0) for step in steps
+        ),
+        "rejected_feedback_duplicate_count": sum(
+            int(step.get("rejected_feedback_duplicate_count") or 0) for step in steps
+        ),
+        "feedback_source_leak_count": sum(
+            1
+            for step in steps
+            if step.get("error_type") == "feedback_source_leak" or step.get("feedback_source_leak")
+        ),
         "by_scored_date_input_layer": list(by_date_layer.values()),
     }
 
@@ -3071,7 +4267,7 @@ def feedback_eligible_paired_keys(steps: list[dict[str, Any]]) -> set[tuple[str,
         if step.get("arm") == "full_gotra"
         and step.get("status") == "scored"
         and step.get("scoring_segment") == "scored"
-        and int(step.get("feedback_used_count") or 0) > 0
+        and bool(step.get("true_independent_feedback_eligible"))
     }
 
 
@@ -3287,6 +4483,9 @@ def run_root_has_artifacts(run_root: Path) -> bool:
 def blocked_run_id_exists_summary(*, config: RunConfig, run_root: Path) -> dict[str, Any]:
     provider_limits = provider_limit_metadata(config)
     provider_tokens = provider_max_tokens_metadata(config)
+    provider_temperature = provider_temperature_metadata(config)
+    codex_backend = codex_cli_backend_metadata(config)
+    deterministic_reference = deterministic_price_only_reference_empty()
     return {
         "schema": SUMMARY_SCHEMA,
         "definition_version": DEFINITION_VERSION,
@@ -3300,6 +4499,8 @@ def blocked_run_id_exists_summary(*, config: RunConfig, run_root: Path) -> dict[
         "provider_base_url": config.provider_base_url,
         "provider_max_tokens": config.provider_max_tokens,
         **provider_tokens,
+        **provider_temperature,
+        **codex_backend,
         "provider_call_status": "no new provider HTTP call",
         "provider_limits": provider_limits,
         **provider_limits,
@@ -3307,6 +4508,9 @@ def blocked_run_id_exists_summary(*, config: RunConfig, run_root: Path) -> dict[
         "stop_reason": "run_root exists and contains artifacts; pass --resume only for exact manifest match",
         "existing_artifact_count": count_files(run_root),
         "scheduler_policy": config.scheduler_policy,
+        "research_artifacts_path": str(config.research_artifacts_path or ""),
+        "feedback_artifacts_path": str(config.feedback_artifacts_path or ""),
+        **deterministic_reference_summary_fields(deterministic_reference),
         "timeout_policy": timeout_policy_manifest(config),
         "circuit_breaker_triggered": False,
         "trigger_reason": "",
@@ -3348,6 +4552,9 @@ def manifest_identity(config: RunConfig) -> dict[str, Any]:
         "target_provider_model": config.provider_model,
         "provider_base_url": config.provider_base_url,
         "provider_max_tokens": config.provider_max_tokens,
+        "provider_temperature": provider_temperature_for(config.provider, config.provider_model),
+        "codex_cli_reasoning_setting": config.codex_cli_reasoning_setting,
+        "codex_cli_binary": config.codex_cli_binary,
         "tickers": list(config.tickers),
         "dates": [item.isoformat() for item in config.dates],
         "input_layers": list(config.input_layers),
@@ -3357,12 +4564,15 @@ def manifest_identity(config: RunConfig) -> dict[str, Any]:
         "timeout_policy": timeout_policy_manifest(config),
         "provider_limits": provider_limit_metadata(config),
         "research_artifacts_path": str(config.research_artifacts_path or ""),
+        "feedback_artifacts_path": str(config.feedback_artifacts_path or ""),
     }
 
 
 def write_manifest(run_root: Path, config: RunConfig) -> None:
     provider_limits = provider_limit_metadata(config)
     provider_tokens = provider_max_tokens_metadata(config)
+    provider_temperature = provider_temperature_metadata(config)
+    codex_backend = codex_cli_backend_metadata(config)
     manifest = {
         "schema": MANIFEST_SCHEMA,
         "definition_version": DEFINITION_VERSION,
@@ -3377,10 +4587,13 @@ def write_manifest(run_root: Path, config: RunConfig) -> None:
         "provider_base_url": config.provider_base_url,
         "provider_max_tokens": config.provider_max_tokens,
         **provider_tokens,
+        **provider_temperature,
+        **codex_backend,
         "provider_call_status": "no real provider HTTP call" if config.mode == "mock" else "pending",
         "provider_limits": provider_limits,
         **provider_limits,
         "arms": list(ARMS),
+        "arm_interpretation": arm_interpretation_summary(),
         "input_layers": list(config.input_layers),
         "warm_up_dates": config.warm_up_dates,
         "repeat_run_index": config.repeat_run_index,
@@ -3393,9 +4606,12 @@ def write_manifest(run_root: Path, config: RunConfig) -> None:
         "max_provider_concurrency": config.max_provider_concurrency,
         "scheduler_policy": config.scheduler_policy,
         "research_artifacts_path": str(config.research_artifacts_path or ""),
+        "feedback_artifacts_path": str(config.feedback_artifacts_path or ""),
         "timeout_policy": timeout_policy_manifest(config),
         "timeout_retries": config.timeout_retries,
         "timeout_retry_backoff_seconds": config.timeout_retry_backoff_seconds,
+        "codex_cli_reasoning_setting": config.codex_cli_reasoning_setting,
+        "codex_cli_binary": config.codex_cli_binary,
         "secret_values_printed": False,
     }
     (run_root / "manifest.json").write_text(
@@ -3438,8 +4654,13 @@ def append_ledger(run_root: Path, step: dict[str, Any]) -> None:
 
 
 def validate_run_id(run_id: str) -> None:
-    if not run_id.startswith((RUN_ID_PREFIX, RUN_ID_PREFIX_V3_1)):
-        raise ValueError(f"run_id must start with {RUN_ID_PREFIX!r} or {RUN_ID_PREFIX_V3_1!r}")
+    if not run_id.startswith(
+        (RUN_ID_PREFIX, RUN_ID_PREFIX_V3_1, RUN_ID_PREFIX_V3_2, RUN_ID_PREFIX_V3_4)
+    ):
+        raise ValueError(
+            f"run_id must start with {RUN_ID_PREFIX!r}, {RUN_ID_PREFIX_V3_1!r}, "
+            f"{RUN_ID_PREFIX_V3_2!r}, or {RUN_ID_PREFIX_V3_4!r}"
+        )
     if "/" in run_id or ".." in run_id:
         raise ValueError("run_id must be a single path segment")
 
@@ -3449,6 +4670,8 @@ def redact_error(message: str) -> str:
 
 
 def default_provider_base_url(provider: str) -> str:
+    if provider == CODEX_CLI_BACKEND:
+        return "local://codex-cli"
     return v2.default_provider_base_url(provider)
 
 
@@ -3532,7 +4755,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Required marker for --mode recompute to make the no-provider boundary explicit.",
     )
     parser.add_argument("--run-id", default="")
-    parser.add_argument("--provider", choices=["glm_sophnet", "kimi"], default=DEFAULT_PROVIDER)
+    parser.add_argument(
+        "--provider",
+        choices=["glm_sophnet", "kimi", CODEX_CLI_BACKEND],
+        default=DEFAULT_PROVIDER,
+    )
     parser.add_argument("--provider-model", default=DEFAULT_GLM_MODEL)
     parser.add_argument("--provider-base-url", default="")
     parser.add_argument("--provider-max-tokens", type=int, default=1200)
@@ -3570,7 +4797,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Local JSON/JSONL/CSV research artifact fixture; no network retrieval is performed.",
     )
+    parser.add_argument(
+        "--feedback-artifacts-path",
+        type=Path,
+        default=None,
+        help="Local JSON/JSONL feedback artifact fixture; no network retrieval is performed.",
+    )
     parser.add_argument("--env-file", default="")
+    parser.add_argument("--codex-cli-reasoning-setting", default=DEFAULT_CODEX_CLI_REASONING)
+    parser.add_argument("--codex-cli-binary", default="codex")
     parser.add_argument("--resume", action="store_true")
     return parser
 
@@ -3581,6 +4816,14 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
     normalize_sophnet_api_key_env()
     mode: Mode = args.mode
     run_id = args.run_id or default_run_id(mode)
+    provider_model = args.provider_model
+    if args.provider == CODEX_CLI_BACKEND and provider_model == DEFAULT_GLM_MODEL:
+        provider_model = (
+            os.getenv("GOTRA_CODEX_CLI_MODEL")
+            or os.getenv("JUDGE_LLM_MODEL")
+            or os.getenv("LLM_MODEL")
+            or DEFAULT_CODEX_CLI_MODEL
+        )
     provider_concurrency = max(1, int(args.provider_concurrency))
     max_provider_concurrency = max(provider_concurrency, int(args.max_provider_concurrency))
     legacy_timeout = float(args.request_timeout_seconds) if args.request_timeout_seconds else None
@@ -3588,7 +4831,7 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
     formatting_timeout = args.ksana_formatting_timeout_seconds
     real_research_timeout = args.ksana_real_research_timeout_seconds
     full_timeout = args.full_gotra_timeout_seconds
-    deepseek_defaults = args.provider_model == DEEPSEEK_FLASH_MODEL
+    deepseek_defaults = provider_model == DEEPSEEK_FLASH_MODEL
     default_direct_timeout = 90.0 if deepseek_defaults else 300.0
     default_formatting_timeout = 120.0 if deepseek_defaults else 420.0
     default_real_research_timeout = 150.0 if deepseek_defaults else 480.0
@@ -3614,7 +4857,7 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         mode=mode,
         run_id=run_id,
         provider=args.provider,
-        provider_model=args.provider_model,
+        provider_model=provider_model,
         provider_base_url=args.provider_base_url or default_provider_base_url(args.provider),
         provider_max_tokens=max(1, int(args.provider_max_tokens)),
         tickers=args.tickers,
@@ -3659,6 +4902,9 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         scheduler_policy="per_date_feedback_snapshot_interleaved_point_layer_arm_v3",
         resume=bool(args.resume),
         research_artifacts_path=args.research_artifacts_path,
+        feedback_artifacts_path=args.feedback_artifacts_path,
+        codex_cli_reasoning_setting=str(args.codex_cli_reasoning_setting or DEFAULT_CODEX_CLI_REASONING),
+        codex_cli_binary=str(args.codex_cli_binary or "codex"),
     )
 
 
