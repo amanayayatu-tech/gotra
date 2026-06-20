@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -135,7 +136,21 @@ class JudgeAgent:
                 alaya_write_attempted=False,
             )
         if decision.decision == "approve":
-            response = self.alaya_client.approve_gate(gate_id, rationale=decision.reasoning)
+            try:
+                response = self.alaya_client.approve_gate(gate_id, rationale=decision.reasoning)
+            except Exception as exc:
+                self._result(
+                    gate_id=gate_id,
+                    gate=gate,
+                    context=context,
+                    decision=decision,
+                    routed_action="approve_gate",
+                    apply=apply,
+                    alaya_write_attempted=True,
+                    routed_action_status="failed",
+                    alaya_write_error=exc,
+                )
+                raise
             return self._result(
                 gate_id=gate_id,
                 gate=gate,
@@ -145,12 +160,27 @@ class JudgeAgent:
                 response=response,
                 apply=apply,
                 alaya_write_attempted=True,
+                routed_action_status="succeeded",
             )
-        response = self.alaya_client.reject_gate(
-            gate_id,
-            rationale=decision.reasoning,
-            reason_code=decision.reason_code or "risk_too_high",
-        )
+        try:
+            response = self.alaya_client.reject_gate(
+                gate_id,
+                rationale=decision.reasoning,
+                reason_code=decision.reason_code or "risk_too_high",
+            )
+        except Exception as exc:
+            self._result(
+                gate_id=gate_id,
+                gate=gate,
+                context=context,
+                decision=decision,
+                routed_action="reject_gate",
+                apply=apply,
+                alaya_write_attempted=True,
+                routed_action_status="failed",
+                alaya_write_error=exc,
+            )
+            raise
         return self._result(
             gate_id=gate_id,
             gate=gate,
@@ -160,6 +190,7 @@ class JudgeAgent:
             response=response,
             apply=apply,
             alaya_write_attempted=True,
+            routed_action_status="succeeded",
         )
 
     def build_context(self, gate: dict[str, Any]) -> dict[str, Any]:
@@ -209,6 +240,27 @@ class JudgeAgent:
                 "reasoning": "Simplified Chinese, <=300 chars; distinguish methodology disagreement vs potential error",
                 "knowledge_flag": "none|watch|strong_candidate|quarantine_candidate",
                 "audit_actor": AUDIT_ACTOR,
+                "reason_code_examples": [
+                    "calibrated_accept",
+                    "risk_or_future_source_leak",
+                    "duplicate_or_noise",
+                    "insufficient_or_uncertain",
+                    "low_value_or_low_quality",
+                    "strong_conflict",
+                    "methodology_disagreement",
+                    "factual_error",
+                    "needs_human_review",
+                ],
+                "rubric_dimensions": [
+                    "methodology_disagreement_vs_factual_error",
+                    "evidence_provenance_and_traceability",
+                    "future_source_leak_or_decision_date_boundary",
+                    "conflict_with_existing_strong_knowledge",
+                    "duplicate_noise_or_low_incremental_value",
+                    "insufficient_evidence_or_defer_conditions",
+                    "likely_clean_outcome_feedback_substrate",
+                ],
+                "strong_candidate_policy": "report flag only; never auto-promote strong knowledge",
             },
         }
 
@@ -223,6 +275,8 @@ class JudgeAgent:
         apply: bool,
         alaya_write_attempted: bool,
         response: dict[str, Any] | None = None,
+        routed_action_status: str = "not_attempted",
+        alaya_write_error: Exception | None = None,
     ) -> JudgeRunResult:
         provenance = build_decision_provenance(
             gate_id=gate_id,
@@ -232,6 +286,8 @@ class JudgeAgent:
             apply=apply,
             routed_action=routed_action,
             alaya_write_attempted=alaya_write_attempted,
+            routed_action_status=routed_action_status,
+            alaya_write_error=alaya_write_error,
         )
         if self.provenance_log_path is not None:
             append_decision_provenance(self.provenance_log_path, provenance)
@@ -269,6 +325,8 @@ def build_decision_provenance(
     apply: bool,
     routed_action: str,
     alaya_write_attempted: bool,
+    routed_action_status: str = "not_attempted",
+    alaya_write_error: Exception | None = None,
 ) -> dict[str, Any]:
     """Build one append-only Judge decision provenance record without raw model output."""
 
@@ -302,12 +360,33 @@ def build_decision_provenance(
         "apply": apply,
         "dry_run": not apply,
         "routed_action": routed_action,
+        "routed_action_status": routed_action_status,
         "alaya_write_attempted": alaya_write_attempted,
+        "alaya_write_error_class": type(alaya_write_error).__name__ if alaya_write_error else None,
+        "alaya_write_error_message": sanitize_error_message(alaya_write_error),
         "decision_timestamp_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "input_hash": stable_json_hash(context_fingerprint),
         "decision_hash": stable_json_hash(decision_payload),
         "gate_payload_hash": stable_json_hash(payload),
     }
+
+
+def sanitize_error_message(exc: Exception | None) -> str | None:
+    if exc is None:
+        return None
+    message = str(exc).replace("\n", " ")
+    redaction_patterns = (
+        (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer [REDACTED]"),
+        (re.compile(r"(?i)\bAuthorization\s*:\s*[^;,\s]+(?:\s+[^;,\s]+)?"), "Authorization: [REDACTED]"),
+        (
+            re.compile(r"(?i)\b(api[_-]?key|apiKey|token|access[_-]?token)\s*=\s*[^\s,;&]+"),
+            lambda match: f"{match.group(1)}=[REDACTED]",
+        ),
+        (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "sk-[REDACTED]"),
+    )
+    for pattern, replacement in redaction_patterns:
+        message = pattern.sub(replacement, message)
+    return message[:300]
 
 
 def append_decision_provenance(path: str | Path, record: dict[str, Any]) -> None:
