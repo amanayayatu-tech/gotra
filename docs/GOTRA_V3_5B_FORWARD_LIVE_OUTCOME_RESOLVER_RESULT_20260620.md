@@ -27,15 +27,25 @@ The resolver reads v3.5A forward-live capture artifacts and price cache files, t
 
 - `NOT_MATURED`: `as_of_date < horizon_end_date`; realized outcome fields are withheld.
 - `BLOCKED_DATA`: horizon is mature but decision or bounded outcome price data is missing.
+- `BLOCKED_SOURCE_FUTURE_DATA`: source capture artifact is contaminated by decision-side future-data leakage.
 - `RESOLVED`: horizon is mature and both decision price plus allowed outcome price are available.
 
-The resolver uses the first valid price row on or after `horizon_end_date`, bounded by both `as_of_date` and `horizon_end_date + outcome_window_days`. It writes append-only resolver artifacts under the selected output directory and records provenance back to the source capture artifact.
+The resolver uses the first valid price row on or after `horizon_end_date`, bounded by both `as_of_date`, next-day daily-close availability, and `horizon_end_date + outcome_window_days`. It writes append-only resolver artifacts under the selected output directory and records provenance back to the source capture artifact.
+
+## PR Review Hardening
+
+This update addresses the PR #27 active P2 review comments:
+
+- Source capture future-data contamination is propagated into resolver artifacts and summary fields. Contaminated source artifacts are blocked as `BLOCKED_SOURCE_FUTURE_DATA`; `OUTCOME_RESOLVER_PASS` requires `source_future_data_violation_count == 0`.
+- CLI exit semantics now return non-zero for `BLOCKED_RUN_ID_EXISTS` and other non-pass terminal statuses.
+- Daily close rows use a conservative availability rule: row D is visible only at D+1 `00:00:00Z` or later. Same-day close cannot be used at the start of that UTC date.
+- `actual_direction` now follows the v3 bucket contract: `long` for `>= +2.0%`, `avoid` for `<= -2.0%`, otherwise `neutral`.
 
 ## Local Resolver Validation
 
 Local run id:
 
-`baseline_v3_5b_outcome_resolver_local_validation_20260620T152405Z`
+`baseline_v3_5b_outcome_resolver_review_fix_20260620T154803Z`
 
 Validation used synthetic temporary capture and price fixtures under `/tmp`, not committed artifacts.
 
@@ -47,7 +57,9 @@ Summary:
 | capture_artifact_count | 4 |
 | resolved_count | 1 |
 | blocked_data_count | 2 |
+| blocked_source_future_data_count | 0 |
 | not_matured_count | 1 |
+| source_future_data_violation_count | 0 |
 | future_data_violation_count | 0 |
 | resolver_error_count | 0 |
 | provenance_reverse_lookup_status | `PASS` |
@@ -60,15 +72,19 @@ Outcome status coverage:
 - `RESOLVED`: available decision price and allowed outcome price.
 - `BLOCKED_DATA`: missing outcome price, plus a price row outside the allowed outcome window.
 - `NOT_MATURED`: `as_of_date` before `horizon_end_date`, with no realized outcome fields populated.
+- `BLOCKED_SOURCE_FUTURE_DATA`: covered by focused tests for both `future_data_violation: true` and `latest_visible_price_date` beyond the capture-time allowed visible date.
 
 ## Future-Data Guard
 
 Validated behavior:
 
 - Immature decisions do not receive `outcome_price`, `actual_change_pct`, or `actual_direction`.
-- Matured decisions do not use price rows after `as_of_date`.
+- Matured decisions do not use price rows after the latest daily close visible at `as_of_timestamp_utc`.
 - Matured decisions do not use price rows after the preregistered outcome window.
+- Source capture future-data contamination blocks outcome resolution and prevents pass classification.
 - Missing prices remain `BLOCKED_DATA`; no prices are fabricated.
+- Blocked resolver run ids return non-zero from the CLI.
+- Resolved outcome direction uses `long` / `avoid` / `neutral`, not `up` / `down` / `flat`.
 
 ## Provenance / Reverse Lookup
 
@@ -101,9 +117,9 @@ Results:
 
 - `py_compile`: PASS
 - `ruff`: PASS
-- `tests/test_forward_live_outcome_resolver.py`: `7 passed`
+- `tests/test_forward_live_outcome_resolver.py`: `12 passed`
 - `tests/test_forward_live_capture.py`: `13 passed`
-- full pytest: `262 passed`
+- full pytest: `267 passed`
 
 ## Artifact Boundary
 

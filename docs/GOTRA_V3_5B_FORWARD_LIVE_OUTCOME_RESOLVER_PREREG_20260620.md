@@ -16,9 +16,10 @@ The resolver reads existing forward-live capture artifacts and price cache data,
 
 - `NOT_MATURED`: `as_of_date` is before `horizon_end_date`; no outcome fields are populated.
 - `BLOCKED_DATA`: horizon is mature but required decision/outcome price data is missing within the preregistered outcome window.
+- `BLOCKED_SOURCE_FUTURE_DATA`: source capture artifact is already contaminated by decision-side future-data leakage, such as `future_data_violation: true` or `latest_visible_price_date` after the capture-time allowed visible date.
 - `RESOLVED`: horizon is mature and both decision price and allowed outcome price are available.
 
-The resolver must not call LLMs, provider APIs, Codex CLI, or formal-lite harnesses.
+The resolver must not call LLMs, provider APIs, Codex CLI, or formal-lite harnesses. Blocked resolver runs, including reused resolver run ids, must exit non-zero from the CLI so automation cannot treat a no-op blocker as success.
 
 ## Inputs
 
@@ -41,6 +42,8 @@ For matured decisions, v3.5B selects the first valid price date on or after `hor
 - `as_of_date`
 - `horizon_end_date + outcome_window_days`
 
+Daily close availability rule: a daily price row for date D is only visible at D+1 `00:00:00Z` or later. For example, `2026-07-20` close is not usable at `2026-07-20T00:00:00Z`; it becomes usable at `2026-07-21T00:00:00Z`.
+
 The default `outcome_window_days` is 7 calendar days. If no price row exists inside that bounded window, the record is `BLOCKED_DATA`.
 
 ## Future-Data Guard
@@ -48,12 +51,20 @@ The default `outcome_window_days` is 7 calendar days. If no price row exists ins
 The resolver must:
 
 - Not resolve if `as_of_date < horizon_end_date`.
-- Not use price rows after `as_of_date`.
+- Not use price rows after the latest daily close visible at `as_of_timestamp_utc`.
 - Not use price rows after the allowed outcome window.
+- Not resolve source artifacts with `future_data_violation: true`.
+- Not resolve source artifacts whose `latest_visible_price_date` is after the capture-time allowed visible date.
 - Not fabricate missing prices.
-- Not populate `outcome_price`, `actual_change_pct`, or `actual_direction` for `NOT_MATURED` or `BLOCKED_DATA`.
+- Not populate `outcome_price`, `actual_change_pct`, or `actual_direction` for `NOT_MATURED`, `BLOCKED_DATA`, or `BLOCKED_SOURCE_FUTURE_DATA`.
 
-`NOT_MATURED` and `BLOCKED_DATA` records may carry decision-side metadata and provenance, but not realized outcome fields.
+`NOT_MATURED`, `BLOCKED_DATA`, and `BLOCKED_SOURCE_FUTURE_DATA` records may carry decision-side metadata and provenance, but not realized outcome fields.
+
+`actual_direction` must use the v3 direction bucket contract:
+
+- `actual_change_pct >= +2.0`: `long`
+- `actual_change_pct <= -2.0`: `avoid`
+- otherwise: `neutral`
 
 ## Outcome Artifact Schema
 
@@ -97,7 +108,9 @@ The resolver summary must report:
 - capture artifact count
 - `NOT_MATURED` count
 - `BLOCKED_DATA` count
+- `BLOCKED_SOURCE_FUTURE_DATA` count
 - `RESOLVED` count
+- source future-data violation count
 - future-data violation count
 - provider/backend called: false
 - Codex CLI called: false

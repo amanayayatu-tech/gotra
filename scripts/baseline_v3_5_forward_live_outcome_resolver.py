@@ -29,6 +29,7 @@ DEFAULT_OUTCOME_WINDOW_DAYS = 7
 
 STATUS_NOT_MATURED = "NOT_MATURED"
 STATUS_BLOCKED_DATA = "BLOCKED_DATA"
+STATUS_BLOCKED_SOURCE_FUTURE_DATA = "BLOCKED_SOURCE_FUTURE_DATA"
 STATUS_RESOLVED = "RESOLVED"
 STATUS_BLOCKED_RUN_ID_EXISTS = "BLOCKED_RUN_ID_EXISTS"
 
@@ -107,14 +108,20 @@ def float_from_row(row: pd.Series) -> float:
     return float(row["adj_close"])
 
 
+def daily_close_available_cutoff(as_of_timestamp_utc: datetime) -> date:
+    """Daily close row D is visible only at D+1 00:00:00 UTC or later."""
+    return as_of_timestamp_utc.astimezone(UTC).date() - timedelta(days=1)
+
+
 def price_on_or_before(
     *,
     ticker: str,
     target_date: date,
     price_dir: Path,
-    as_of_date: date,
+    as_of_timestamp_utc: datetime,
 ) -> tuple[date, float, str]:
-    frame = read_price_cache(ticker, price_dir=price_dir, cutoff=as_of_date)
+    available_cutoff = daily_close_available_cutoff(as_of_timestamp_utc)
+    frame = read_price_cache(ticker, price_dir=price_dir, cutoff=available_cutoff)
     dates = pd.to_datetime(frame["date"]).dt.date
     visible = frame.loc[dates <= target_date]
     if visible.empty:
@@ -127,12 +134,12 @@ def outcome_price_in_window(
     *,
     ticker: str,
     horizon_end_date: date,
-    as_of_date: date,
+    as_of_timestamp_utc: datetime,
     price_dir: Path,
     outcome_window_days: int,
 ) -> tuple[date, float, str] | None:
     allowed_end = horizon_end_date + timedelta(days=outcome_window_days)
-    cutoff = min(as_of_date, allowed_end)
+    cutoff = min(daily_close_available_cutoff(as_of_timestamp_utc), allowed_end)
     frame = read_price_cache(ticker, price_dir=price_dir, cutoff=cutoff)
     dates = pd.to_datetime(frame["date"]).dt.date
     candidates = frame.loc[(dates >= horizon_end_date) & (dates <= cutoff)]
@@ -174,11 +181,48 @@ def empty_outcome_fields() -> dict[str, Any]:
 
 
 def actual_direction(actual_change_pct: float) -> str:
-    if actual_change_pct > 0:
-        return "up"
-    if actual_change_pct < 0:
-        return "down"
-    return "flat"
+    return v3.actual_direction(actual_change_pct)
+
+
+def boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
+def source_capture_timestamp(payload: dict[str, Any]) -> datetime | None:
+    value = payload.get("decision_timestamp_utc")
+    if not value:
+        return None
+    try:
+        return parse_as_of_timestamp(str(value))
+    except ValueError:
+        return None
+
+
+def source_future_data_violation_reasons(
+    *,
+    payload: dict[str, Any],
+    decision_date: date,
+    latest_visible_date: date,
+) -> list[str]:
+    reasons: list[str] = []
+    if boolish(payload.get("future_data_violation")):
+        reasons.append("source_future_data_violation_flag")
+    capture_timestamp = source_capture_timestamp(payload)
+    allowed_visible_date = decision_date
+    if capture_timestamp is not None:
+        allowed_visible_date = min(
+            allowed_visible_date,
+            daily_close_available_cutoff(capture_timestamp),
+        )
+    if latest_visible_date > allowed_visible_date:
+        reasons.append("latest_visible_price_date_after_capture_allowed_date")
+    return reasons
 
 
 def resolve_capture_artifact(
@@ -196,20 +240,26 @@ def resolve_capture_artifact(
     as_of_date = config.as_of_timestamp_utc.date()
     source_id = source_decision_id(payload, artifact_ref)
     latest_visible_date = date_from_capture(payload, "latest_visible_price_date", "decision_date_local")
+    source_future_reasons = source_future_data_violation_reasons(
+        payload=payload,
+        decision_date=decision_date,
+        latest_visible_date=latest_visible_date,
+    )
 
     decision_price_date: date | None = None
     decision_price: float | None = None
     decision_price_source = ""
-    try:
-        decision_price_date, decision_price, decision_price_source = price_on_or_before(
-            ticker=ticker,
-            target_date=latest_visible_date,
-            price_dir=config.price_dir,
-            as_of_date=as_of_date,
-        )
-    except (FileNotFoundError, LookupError, ValueError):
-        decision_price_date = None
-        decision_price = None
+    if not source_future_reasons:
+        try:
+            decision_price_date, decision_price, decision_price_source = price_on_or_before(
+                ticker=ticker,
+                target_date=latest_visible_date,
+                price_dir=config.price_dir,
+                as_of_timestamp_utc=config.as_of_timestamp_utc,
+            )
+        except (FileNotFoundError, LookupError, ValueError):
+            decision_price_date = None
+            decision_price = None
 
     outcome_status = STATUS_NOT_MATURED
     outcome = empty_outcome_fields()
@@ -220,15 +270,24 @@ def resolve_capture_artifact(
     price_source_path = decision_price_source
     price_row_dates_used = [decision_price_date.isoformat()] if decision_price_date else []
 
-    if as_of_date >= horizon_end:
+    if source_future_reasons:
+        outcome_status = STATUS_BLOCKED_SOURCE_FUTURE_DATA
+        no_future_decision = (
+            "source capture artifact had decision-side future-data contamination; "
+            f"blocked before outcome resolution: {', '.join(source_future_reasons)}"
+        )
+    elif as_of_date >= horizon_end:
         outcome_status = STATUS_BLOCKED_DATA
-        no_future_decision = "matured horizon, but required decision or outcome price was unavailable"
+        no_future_decision = (
+            "matured horizon, but required decision or outcome price was unavailable "
+            "under next-day daily-close availability"
+        )
         selected = None
         if decision_price is not None:
             selected = outcome_price_in_window(
                 ticker=ticker,
                 horizon_end_date=horizon_end,
-                as_of_date=as_of_date,
+                as_of_timestamp_utc=config.as_of_timestamp_utc,
                 price_dir=config.price_dir,
                 outcome_window_days=config.outcome_window_days,
             )
@@ -246,7 +305,8 @@ def resolve_capture_artifact(
             price_row_dates_used.append(outcome_date.isoformat())
             no_future_decision = (
                 "selected first valid price date on or after horizon_end_date "
-                f"within {config.outcome_window_days}-day outcome window and <= as_of_date"
+                f"within {config.outcome_window_days}-day outcome window, <= as_of_date, "
+                "and visible under next-day daily-close availability"
             )
 
     record = {
@@ -268,6 +328,8 @@ def resolve_capture_artifact(
         "outcome_price": outcome["outcome_price"],
         "actual_change_pct": outcome["actual_change_pct"],
         "actual_direction": outcome["actual_direction"],
+        "source_future_data_violation": bool(source_future_reasons),
+        "source_future_data_violation_reasons": source_future_reasons,
         "resolved_at": config.as_of_timestamp_utc.isoformat().replace("+00:00", "Z"),
         "provenance": {
             "source_capture_run_id": str(payload.get("run_id") or ""),
@@ -280,6 +342,12 @@ def resolve_capture_artifact(
             "price_source_path": price_source_path,
             "price_row_dates_used": price_row_dates_used,
             "as_of_date": as_of_date.isoformat(),
+            "as_of_timestamp_utc": config.as_of_timestamp_utc.isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "daily_close_availability_rule": (
+                "daily close row D is visible at D+1 00:00:00 UTC or later"
+            ),
             "outcome_window_days": config.outcome_window_days,
             "no_future_data_decision": no_future_decision,
         },
@@ -291,7 +359,7 @@ def resolve_capture_artifact(
 
 def validate_resolution_record(record: dict[str, Any]) -> None:
     status = str(record["outcome_status"])
-    if status in {STATUS_NOT_MATURED, STATUS_BLOCKED_DATA}:
+    if status in {STATUS_NOT_MATURED, STATUS_BLOCKED_DATA, STATUS_BLOCKED_SOURCE_FUTURE_DATA}:
         present = [field for field in OUTCOME_FIELDS if record.get(field) is not None]
         if present:
             raise ValueError(f"{status} record must not populate outcome fields: {present}")
@@ -326,7 +394,9 @@ def blocked_run_id_summary(config: ResolverConfig, output_root: Path) -> dict[st
         "capture_artifact_count": 0,
         "not_matured_count": 0,
         "blocked_data_count": 0,
+        "blocked_source_future_data_count": 0,
         "resolved_count": 0,
+        "source_future_data_violation_count": 0,
         "future_data_violation_count": 0,
         "provenance_reverse_lookup_status": "NOT_RUN",
     }
@@ -404,10 +474,14 @@ def summary_for(
     status_counts = {
         STATUS_NOT_MATURED: 0,
         STATUS_BLOCKED_DATA: 0,
+        STATUS_BLOCKED_SOURCE_FUTURE_DATA: 0,
         STATUS_RESOLVED: 0,
     }
     for record in records:
         status_counts[str(record["outcome_status"])] += 1
+    source_future_violations = sum(
+        1 for record in records if bool(record.get("source_future_data_violation"))
+    )
     provenance_ok = all(
         record.get("provenance", {}).get("source_capture_run_id")
         and record.get("provenance", {}).get("source_decision_id")
@@ -416,7 +490,7 @@ def summary_for(
     )
     summary_status = (
         "OUTCOME_RESOLVER_PASS"
-        if records and not errors and provenance_ok
+        if records and not errors and provenance_ok and source_future_violations == 0
         else "OUTCOME_RESOLVER_FAIL"
     )
     return {
@@ -432,10 +506,12 @@ def summary_for(
         "capture_artifact_count": len(records),
         "not_matured_count": status_counts[STATUS_NOT_MATURED],
         "blocked_data_count": status_counts[STATUS_BLOCKED_DATA],
+        "blocked_source_future_data_count": status_counts[STATUS_BLOCKED_SOURCE_FUTURE_DATA],
         "resolved_count": status_counts[STATUS_RESOLVED],
         "resolver_error_count": len(errors),
         "resolver_errors": errors[:10],
-        "future_data_violation_count": 0,
+        "source_future_data_violation_count": source_future_violations,
+        "future_data_violation_count": source_future_violations,
         "provider_or_backend_called": False,
         "codex_cli_called": False,
         "formal_lite_entered": False,
@@ -476,7 +552,7 @@ def config_from_args(args: argparse.Namespace) -> ResolverConfig:
 
 def main(argv: list[str] | None = None) -> int:
     summary = run_resolver(config_from_args(parse_args(argv)))
-    return 0 if str(summary.get("status")) in {"OUTCOME_RESOLVER_PASS", STATUS_BLOCKED_RUN_ID_EXISTS} else 1
+    return 0 if str(summary.get("status")) == "OUTCOME_RESOLVER_PASS" else 1
 
 
 if __name__ == "__main__":
