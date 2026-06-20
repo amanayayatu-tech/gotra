@@ -47,17 +47,24 @@ Source summary SHA-256:
 
 `d0962b5d26eb36c718d89d5f9a836a5c2546b67a54125d7aeaf0de56f96dd9f8`
 
+Source audit gate after PR review hardening:
+
+- source status must be clean (`PROVIDER_PILOT_PASS` for this source)
+- deterministic reference status must be `REFERENCE_READY`
+- source future-data, research leak, and feedback leak counts must all be 0
+- any failed source audit reason downgrades the result to `DATA_INSUFFICIENT_FOR_DETERMINISTIC_VERDICT`
+
 No run artifacts are committed in this PR.
 
 ## Verdict Run
 
 Run id:
 
-`deterministic_price_only_vs_full_gotra_verdict_20260620T161507Z`
+`deterministic_price_only_vs_full_gotra_verdict_reviewfix_20260620T163339Z`
 
 Local summary path, not committed:
 
-`data/backtest/runs/deterministic_price_only_vs_full_gotra_verdict_20260620T161507Z/summary.json`
+`data/backtest/runs/deterministic_price_only_vs_full_gotra_verdict_reviewfix_20260620T163339Z/summary.json`
 
 Configuration:
 
@@ -75,6 +82,15 @@ Configuration:
 - provider_or_backend_called: `false`
 - codex_cli_called: `false`
 - formal_lite_entered: `false`
+- source_audit_status: `passed`
+- duplicate_deterministic_reference_key_count: 0
+
+PR review hardening added these extra guards:
+
+- existing output run ids are blocked with `BLOCKED_RUN_ID_EXISTS`; the CLI exits non-zero and does not overwrite source or verdict artifacts
+- duplicate deterministic reference keys cannot inflate paired_count/bootstrap and force `DATA_INSUFFICIENT_FOR_DETERMINISTIC_VERDICT`
+- deterministic reference artifacts must be price-only/no-backend records with the deterministic reference schema
+- paired scored artifacts must be `arm=full_gotra`, use the primary `richer_research_packet` input layer, and match ticker/date/horizon identity
 
 ## Metrics
 

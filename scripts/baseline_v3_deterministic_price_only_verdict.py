@@ -33,6 +33,9 @@ VERDICT_FULL_GOTRA_BETTER = "FULL_GOTRA_BETTER"
 VERDICT_DETERMINISTIC_BETTER = "DETERMINISTIC_BETTER"
 VERDICT_INCONCLUSIVE = "INCONCLUSIVE"
 VERDICT_DATA_INSUFFICIENT = "DATA_INSUFFICIENT_FOR_DETERMINISTIC_VERDICT"
+STATUS_BLOCKED_RUN_ID_EXISTS = "BLOCKED_RUN_ID_EXISTS"
+SOURCE_STATUS_READY_VALUES = frozenset({"PROVIDER_PILOT_PASS", "MOCK_PASS"})
+DETERMINISTIC_BASELINE_NAME = "deterministic_price_only_baseline"
 
 
 @dataclass(frozen=True)
@@ -167,6 +170,41 @@ def record_has_provenance(path: Path, record: dict[str, Any]) -> bool:
     return path.exists() and bool(record.get("run_id")) and bool(record.get("schema"))
 
 
+def deterministic_identity_reason(record: dict[str, Any]) -> str:
+    if record.get("schema") != v3.DETERMINISTIC_REFERENCE_SCHEMA:
+        return "deterministic_identity_mismatch"
+    if record.get("baseline") != DETERMINISTIC_BASELINE_NAME:
+        return "deterministic_identity_mismatch"
+    if record.get("llm_used") is not False:
+        return "deterministic_identity_mismatch"
+    if record.get("provider_or_backend_called") is not False:
+        return "deterministic_identity_mismatch"
+    return ""
+
+
+def full_gotra_identity_reason(
+    record: dict[str, Any],
+    *,
+    expected_ticker: str,
+    expected_decision_date: str,
+    expected_horizon_days: int,
+    expected_input_layer: str,
+) -> str:
+    if record.get("schema") != v3.STEP_SCHEMA:
+        return "full_gotra_identity_mismatch"
+    if record.get("arm") != "full_gotra":
+        return "full_gotra_identity_mismatch"
+    if record.get("input_layer") != expected_input_layer:
+        return "full_gotra_input_layer_mismatch"
+    if (
+        str(record.get("ticker") or "") != expected_ticker
+        or str(record.get("decision_date") or "") != expected_decision_date
+        or int(record.get("horizon_days") or v3.WINDOW_DAYS) != expected_horizon_days
+    ):
+        return "full_gotra_key_mismatch"
+    return ""
+
+
 def record_metric_complete(record: dict[str, Any]) -> bool:
     required = [
         "mse",
@@ -184,6 +222,9 @@ def excluded_reason_for_reference(path: Path, record: dict[str, Any]) -> str:
         return "deterministic_not_scored"
     if not record_has_provenance(path, record):
         return "deterministic_missing_provenance"
+    identity_reason = deterministic_identity_reason(record)
+    if identity_reason:
+        return identity_reason
     if record.get("future_data_violation"):
         return "deterministic_future_data_violation"
     if not record_metric_complete(record):
@@ -191,13 +232,30 @@ def excluded_reason_for_reference(path: Path, record: dict[str, Any]) -> str:
     return ""
 
 
-def excluded_reason_for_full(path: Path, record: dict[str, Any]) -> str:
+def excluded_reason_for_full(
+    path: Path,
+    record: dict[str, Any],
+    *,
+    expected_ticker: str,
+    expected_decision_date: str,
+    expected_horizon_days: int,
+    expected_input_layer: str,
+) -> str:
     if record.get("status") != "scored":
         return "full_gotra_not_scored"
     if record.get("scoring_segment") != "scored":
         return "full_gotra_not_scored_segment"
     if not record_has_provenance(path, record):
         return "full_gotra_missing_provenance"
+    identity_reason = full_gotra_identity_reason(
+        record,
+        expected_ticker=expected_ticker,
+        expected_decision_date=expected_decision_date,
+        expected_horizon_days=expected_horizon_days,
+        expected_input_layer=expected_input_layer,
+    )
+    if identity_reason:
+        return identity_reason
     if record.get("future_data_violation"):
         return "full_gotra_future_data_violation"
     if record.get("research_source_leak") or record.get("feedback_source_leak"):
@@ -218,19 +276,32 @@ def build_pairs(config: VerdictConfig) -> tuple[list[PairRecord], Counter[str]]:
     excluded: Counter[str] = Counter()
     full_records = load_full_gotra_records(config.source_run_dir)
     pairs: list[PairRecord] = []
+    seen_reference_keys: set[tuple[str, str, int]] = set()
     for ref_path, ref in load_reference_records(config.source_run_dir):
         ref_reason = excluded_reason_for_reference(ref_path, ref)
         if ref_reason:
             excluded[ref_reason] += 1
             continue
         ticker, decision_date, horizon = pair_key(ref)
+        reference_key = (ticker, decision_date, horizon)
+        if reference_key in seen_reference_keys:
+            excluded["duplicate_deterministic_reference_key"] += 1
+            continue
+        seen_reference_keys.add(reference_key)
         full_key = (ticker, decision_date, horizon, config.primary_input_layer)
         full_item = full_records.get(full_key)
         if full_item is None:
             excluded["missing_full_gotra_primary_input_layer"] += 1
             continue
         full_path, full = full_item
-        full_reason = excluded_reason_for_full(full_path, full)
+        full_reason = excluded_reason_for_full(
+            full_path,
+            full,
+            expected_ticker=ticker,
+            expected_decision_date=decision_date,
+            expected_horizon_days=horizon,
+            expected_input_layer=config.primary_input_layer,
+        )
         if full_reason:
             excluded[full_reason] += 1
             continue
@@ -400,7 +471,66 @@ def verdict_from_stats(
     return VERDICT_INCONCLUSIVE, "mse_ci_includes_zero"
 
 
+def source_audit_blocking_reasons(source_summary: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    if source_summary.get("status") not in SOURCE_STATUS_READY_VALUES:
+        reasons.append("source_status_not_clean")
+    if source_summary.get("deterministic_price_only_baseline_status") != "REFERENCE_READY":
+        reasons.append("deterministic_reference_not_ready")
+    if int(source_summary.get("future_data_violation_count") or 0) != 0:
+        reasons.append("source_future_data_violation")
+    if int(source_summary.get("research_source_leak_count") or 0) != 0:
+        reasons.append("source_research_source_leak")
+    if int(source_summary.get("feedback_source_leak_count") or 0) != 0:
+        reasons.append("source_feedback_source_leak")
+    return reasons
+
+
+def blocked_run_id_exists_summary(config: VerdictConfig, run_root: Path) -> dict[str, Any]:
+    return {
+        "schema": SUMMARY_SCHEMA,
+        "run_id": config.run_id,
+        "generated_at_utc": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "status": STATUS_BLOCKED_RUN_ID_EXISTS,
+        "verdict": VERDICT_DATA_INSUFFICIENT,
+        "verdict_reason": "output_run_id_exists",
+        "evidence_layer": "offline/internal historical deterministic verdict only",
+        "non_claims": [
+            "not OOS",
+            "not science/public proof",
+            "not trading or investment advice",
+            "not provider/backend/formal-lite",
+        ],
+        "comparison": "deterministic_price_only_baseline_vs_full_gotra",
+        "primary_full_gotra_input_layer": config.primary_input_layer,
+        "paired_count": 0,
+        "cluster_count": 0,
+        "clusters": [],
+        "min_paired_points": config.min_paired_points,
+        "min_clusters": config.min_clusters,
+        "bootstrap_reps": config.bootstrap_reps,
+        "bootstrap_seed": config.bootstrap_seed,
+        "metric_summary": metric_summary([]),
+        "paired_statistics": paired_statistics([], config),
+        "excluded_reason_counts": {"output_run_id_exists": 1},
+        "future_data_violation_count": 0,
+        "source_audit_status": "not_evaluated_output_blocked",
+        "source_audit_blocking_reasons": ["output_run_id_exists"],
+        "duplicate_deterministic_reference_key_count": 0,
+        "provider_or_backend_called": False,
+        "codex_cli_called": False,
+        "formal_lite_entered": False,
+        "artifact_write_blocked": True,
+        "blocked_output_run_dir": str(run_root),
+    }
+
+
 def run_verdict(config: VerdictConfig) -> dict[str, Any]:
+    run_root = config.output_dir / config.run_id
+    if run_root.exists():
+        summary = blocked_run_id_exists_summary(config, run_root)
+        print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+        return summary
     if not config.source_run_dir.exists():
         raise FileNotFoundError(f"source run dir not found: {config.source_run_dir}")
     source_summary_path = config.source_run_dir / "summary.json"
@@ -422,7 +552,13 @@ def run_verdict(config: VerdictConfig) -> dict[str, Any]:
     if future_violations:
         verdict = VERDICT_DATA_INSUFFICIENT
         verdict_reason = "future_data_violation_detected"
-    run_root = config.output_dir / config.run_id
+    source_audit_reasons = source_audit_blocking_reasons(source_summary)
+    if source_audit_reasons:
+        verdict = VERDICT_DATA_INSUFFICIENT
+        verdict_reason = "source_audit_blocked"
+    if excluded.get("duplicate_deterministic_reference_key", 0):
+        verdict = VERDICT_DATA_INSUFFICIENT
+        verdict_reason = "duplicate_deterministic_reference_keys"
     run_root.mkdir(parents=True, exist_ok=True)
     summary = {
         "schema": SUMMARY_SCHEMA,
@@ -458,6 +594,11 @@ def run_verdict(config: VerdictConfig) -> dict[str, Any]:
         "paired_statistics": stats,
         "excluded_reason_counts": dict(sorted(excluded.items())),
         "future_data_violation_count": future_violations,
+        "source_audit_status": "blocked" if source_audit_reasons else "passed",
+        "source_audit_blocking_reasons": source_audit_reasons,
+        "duplicate_deterministic_reference_key_count": excluded.get(
+            "duplicate_deterministic_reference_key", 0
+        ),
         "provider_or_backend_called": False,
         "codex_cli_called": False,
         "formal_lite_entered": False,
@@ -502,7 +643,9 @@ def config_from_args(args: argparse.Namespace) -> VerdictConfig:
 
 
 def main(argv: list[str] | None = None) -> int:
-    run_verdict(config_from_args(parse_args(argv)))
+    summary = run_verdict(config_from_args(parse_args(argv)))
+    if summary.get("status") == STATUS_BLOCKED_RUN_ID_EXISTS:
+        return 1
     return 0
 
 

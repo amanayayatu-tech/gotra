@@ -22,13 +22,14 @@ This source is used only as an existing local artifact. The verdict harness does
 
 Required source conditions:
 
+- source run status is a clean terminal source status such as `PROVIDER_PILOT_PASS`
 - deterministic reference status is `REFERENCE_READY`
 - `future_data_violation_count = 0`
 - `research_source_leak_count = 0`
 - `feedback_source_leak_count = 0`
 - full_gotra step artifacts and deterministic reference artifacts have stable provenance paths
 
-If these conditions fail or paired points are insufficient, the result must be `DATA_INSUFFICIENT_FOR_DETERMINISTIC_VERDICT`.
+If these source audit conditions fail, the result must be `DATA_INSUFFICIENT_FOR_DETERMINISTIC_VERDICT` with `source_audit_blocking_reasons` recorded. A source failure, non-ready deterministic reference, research leak, feedback leak, or future-data violation cannot produce `FULL_GOTRA_BETTER` or `DETERMINISTIC_BETTER`.
 
 ## Deterministic Baseline Rule
 
@@ -65,6 +66,12 @@ Excluded points include:
 - missing metrics
 - missing provenance
 - mismatched outcome
+- deterministic reference identity mismatch: artifact must be `deterministic_price_only_baseline`, use the deterministic reference schema, and report no provider/backend/LLM call
+- full_gotra identity mismatch: artifact must use the four-arm step schema, `arm=full_gotra`, the preregistered primary input layer, and the same ticker/date/horizon key
+
+Duplicate deterministic reference keys are not allowed in the primary verdict. If more than one deterministic artifact claims the same `(ticker, decision_date, horizon_days)`, the harness records `duplicate_deterministic_reference_key` and downgrades the run to `DATA_INSUFFICIENT_FOR_DETERMINISTIC_VERDICT` rather than allowing duplicate artifacts to inflate paired_count or bootstrap weight.
+
+The verdict output run id must not collide with an existing output run directory. If `output_dir / run_id` already exists, the harness returns `BLOCKED_RUN_ID_EXISTS`, does not overwrite `summary.json` or `pairs.json`, and the CLI exits non-zero.
 
 ## Metrics
 
