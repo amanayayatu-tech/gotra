@@ -419,28 +419,63 @@ def test_v3_1_research_artifact_schema_validation_rejects_missing_fields() -> No
     assert result["rejected_research_schema_count"] == 1
 
 
-def test_v3_1_strict_feedback_requires_multiple_waves_and_real_or_unverified_source() -> None:
+def test_v3_2_feedback_artifact_fixture_filters_independent_mature_feedback() -> None:
+    fixture = Path("tests/fixtures/baseline_v3_2_feedback_artifacts.json")
+    artifacts = v3.load_feedback_artifact_fixture(fixture)
+
+    early = v3.filter_external_feedback_artifacts(
+        artifacts,
+        decision_date=date(2024, 3, 1),
+        ticker="AAPL",
+        input_layer="richer_research_packet",
+    )
+    later = v3.filter_external_feedback_artifacts(
+        artifacts,
+        decision_date=date(2024, 4, 2),
+        ticker="AAPL",
+        input_layer="richer_research_packet",
+    )
+
+    assert [item["feedback_ref"] for item in early["accepted_feedback"]] == [
+        "outcome:aapl:any:2024-01-02:wave1"
+    ]
+    assert len(later["accepted_feedback"]) == 3
+    assert later["feedback_source_kind_counts"]["outcome_feedback"] == 2
+    assert later["feedback_source_kind_counts"]["realized_error_feedback"] == 1
+    assert later["rejected_feedback_future_data_count"] == 1
+    assert later["rejected_feedback_schema_count"] == 1
+    assert later["rejected_feedback_non_independent_count"] == 1
+
+
+def test_v3_2_strict_feedback_requires_true_independent_outcome_waves() -> None:
     base_feedback = [
         {
             "feedback_ref": "f1",
             "decision_date": "2023-10-02",
             "prior_decision_date": "2023-10-02",
+            "source_decision_date": "2023-10-02",
             "outcome_availability_date": "2023-11-02",
+            "availability_date": "2023-11-02",
             "source_kind": "self_feedback",
+            "feedback_source_kind": "self_feedback",
         },
         {
             "feedback_ref": "f2",
             "decision_date": "2023-11-01",
             "prior_decision_date": "2023-11-01",
+            "source_decision_date": "2023-11-01",
             "outcome_availability_date": "2023-12-01",
             "source_kind": "self_feedback",
+            "feedback_source_kind": "self_feedback",
         },
         {
             "feedback_ref": "f3",
             "decision_date": "2023-12-01",
             "prior_decision_date": "2023-12-01",
+            "source_decision_date": "2023-12-01",
             "outcome_availability_date": "2023-12-15",
             "source_kind": "self_feedback",
+            "feedback_source_kind": "self_feedback",
         },
     ]
 
@@ -450,24 +485,110 @@ def test_v3_1_strict_feedback_requires_multiple_waves_and_real_or_unverified_sou
     )
     one_wave = v3.strict_feedback_diagnostics(
         feedback=[
-            {**item, "prior_decision_date": "2023-10-02", "source_kind": "real"}
+            {
+                **item,
+                "prior_decision_date": "2023-10-02",
+                "source_decision_date": "2023-10-02",
+                "source_kind": "outcome_feedback",
+                "feedback_source_kind": "outcome_feedback",
+            }
             for item in base_feedback
         ],
         decision_date=date(2024, 1, 31),
     )
+    two_only = v3.strict_feedback_diagnostics(
+        feedback=[
+            {
+                **base_feedback[0],
+                "source_kind": "outcome_feedback",
+                "feedback_source_kind": "outcome_feedback",
+            },
+            {
+                **base_feedback[1],
+                "source_kind": "realized_error_feedback",
+                "feedback_source_kind": "realized_error_feedback",
+            },
+        ],
+        decision_date=date(2024, 1, 31),
+    )
     eligible = v3.strict_feedback_diagnostics(
-        feedback=[{**base_feedback[0], "source_kind": "real"}, *base_feedback[1:]],
+        feedback=[
+            {
+                **item,
+                "source_kind": "outcome_feedback",
+                "feedback_source_kind": "outcome_feedback",
+            }
+            for item in base_feedback
+        ],
         decision_date=date(2024, 1, 31),
     )
 
     assert self_only["strict_feedback_eligible"] is False
-    assert "no_real_or_unverified_feedback_source_kind" in self_only[
+    assert "no_outcome_derived_independent_feedback_source_kind" in self_only[
         "strict_feedback_insufficient_reason"
     ]
     assert one_wave["strict_feedback_eligible"] is False
-    assert "prior_wave_count_lt_2" in one_wave["strict_feedback_insufficient_reason"]
+    assert "true_independent_prior_wave_count_lt_2" in one_wave[
+        "strict_feedback_insufficient_reason"
+    ]
+    assert two_only["strict_feedback_eligible"] is False
+    assert "true_independent_feedback_count_lt_3" in two_only[
+        "strict_feedback_insufficient_reason"
+    ]
     assert eligible["strict_feedback_eligible"] is True
     assert eligible["true_independent_feedback_eligible"] is True
+
+
+def test_v3_2_feedback_prompt_separation_keeps_rejected_feedback_out() -> None:
+    fixture = Path("tests/fixtures/baseline_v3_2_feedback_artifacts.json")
+    result = v3.filter_external_feedback_artifacts(
+        v3.load_feedback_artifact_fixture(fixture),
+        decision_date=date(2024, 4, 2),
+        ticker="AAPL",
+        input_layer="richer_research_packet",
+    )
+    feedback_refs = {item["feedback_ref"] for item in result["accepted_feedback"]}
+    price_rows = _price_rows()
+
+    full = v3.build_prompt_payload(
+        arm="full_gotra",
+        input_layer="richer_research_packet",
+        ticker="AAPL",
+        decision_date=date(2024, 4, 2),
+        price_rows=price_rows,
+        feedback=result["accepted_feedback"],
+        provider="mock",
+        provider_model="local-deterministic",
+    )
+    real = v3.build_prompt_payload(
+        arm="ksana_real_research",
+        input_layer="richer_research_packet",
+        ticker="AAPL",
+        decision_date=date(2024, 4, 2),
+        price_rows=price_rows,
+        feedback=result["accepted_feedback"],
+        provider="mock",
+        provider_model="local-deterministic",
+    )
+    direct = v3.build_prompt_payload(
+        arm="direct_llm",
+        input_layer="richer_research_packet",
+        ticker="AAPL",
+        decision_date=date(2024, 4, 2),
+        price_rows=price_rows,
+        feedback=result["accepted_feedback"],
+        provider="mock",
+        provider_model="local-deterministic",
+    )
+
+    assert feedback_refs == {
+        "outcome:aapl:any:2024-01-02:wave1",
+        "outcome:aapl:any:2024-02-01:wave2",
+        "outcome:aapl:any:2024-03-01:wave3",
+    }
+    assert {item["feedback_ref"] for item in full["alaya_feedback_history"]} == feedback_refs
+    assert "alaya_feedback_history" not in real
+    assert "alaya_feedback_history" not in direct
 
 
 def _product_metric_step(*, evidence_refs: list[str], available_refs: list[str]) -> dict[str, object]:
@@ -658,6 +779,11 @@ def test_c4_pairing_uses_feedback_eligible_points_only() -> None:
     c4 = v3.paired_diffs(steps)["C4_real_research_minus_full_gotra_mse"]
 
     assert c4["feedback_eligible_only"] is True
+    assert c4["paired_points"] == 0
+
+    steps[3]["true_independent_feedback_eligible"] = True
+    c4 = v3.paired_diffs(steps)["C4_real_research_minus_full_gotra_mse"]
+
     assert c4["paired_points"] == 1
     assert c4["mse_delta_left_minus_right"] == 4.0
 
@@ -1036,13 +1162,97 @@ def test_v3_1_mock_run_reports_real_evidence_and_strict_feedback_diagnostics(tmp
     assert summary["self_feedback_available_points"] > 0
     assert summary["true_independent_feedback_eligible_points"] == 0
     assert summary["h2_data_status"] == "DATA_INSUFFICIENT_FOR_H2_TRUE_INDEPENDENT_FEEDBACK"
-    assert "no_real_or_unverified_feedback_source_kind" in summary[
+    assert "no_outcome_derived_independent_feedback_source_kind" in summary[
         "h2_data_insufficient_reason"
     ]
     assert richer_step["source_kind_counts"]["real"] == 1
     assert richer_step["source_kind_counts"]["unverified"] == 2
     assert richer_step["source_kind_counts"]["synthetic"] == 1
     assert richer_step["rejected_research_future_data_count"] == 1
+
+
+def test_v3_2_mock_run_reports_true_independent_feedback_substrate(tmp_path: Path) -> None:
+    for ticker in ("AAPL", "MSFT", "NVDA"):
+        _write_prices(tmp_path / "prices", ticker, days=620)
+    config = _config(
+        tmp_path,
+        run_id="baseline_v3_2_feedback_substrate_mock_impl_test",
+        tickers=("AAPL", "MSFT", "NVDA"),
+        dates=(
+            date(2024, 1, 2),
+            date(2024, 2, 1),
+            date(2024, 3, 1),
+            date(2024, 4, 2),
+            date(2024, 5, 2),
+            date(2024, 6, 3),
+        ),
+    )
+    config = replace(
+        config,
+        warm_up_dates=2,
+        research_artifacts_path=Path("tests/fixtures/baseline_v3_1_research_artifacts.json"),
+        feedback_artifacts_path=Path("tests/fixtures/baseline_v3_2_feedback_artifacts.json"),
+    )
+
+    summary = v3.run_four_arm(config)
+    run_root = tmp_path / "runs" / "baseline_v3_2_feedback_substrate_mock_impl_test"
+    early_step = json.loads(
+        (
+            run_root
+            / "full_gotra"
+            / "step_2024-03-01_aapl_richer_research_packet.json"
+        ).read_text(encoding="utf-8")
+    )
+    later_step = json.loads(
+        (
+            run_root
+            / "full_gotra"
+            / "step_2024-04-02_aapl_richer_research_packet.json"
+        ).read_text(encoding="utf-8")
+    )
+    direct_later = json.loads(
+        (
+            run_root
+            / "direct_llm"
+            / "step_2024-04-02_aapl_richer_research_packet.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert summary["status"] == "MOCK_PASS"
+    assert summary["provider_call_status"] == "no real provider HTTP call"
+    assert summary["future_data_violations"] == 0
+    assert summary["research_source_leak_count"] == 0
+    assert summary["feedback_source_leak_count"] == 0
+    assert summary["rejected_feedback_future_data_count"] > 0
+    assert summary["rejected_feedback_schema_count"] > 0
+    assert summary["rejected_feedback_non_independent_count"] > 0
+    assert summary["true_independent_feedback_eligible_points"] > 0
+    assert summary["h2_data_status"] == "STRICT_FEEDBACK_ELIGIBLE_PRESENT"
+    assert summary["feedback_source_kind_counts"]["outcome_feedback"] > 0
+    assert summary["feedback_source_kind_counts"]["realized_error_feedback"] > 0
+    assert summary["source_kind_counts"]["real"] > 0
+    assert summary["source_kind_counts"]["unverified"] > 0
+    assert early_step["true_independent_feedback_eligible"] is False
+    assert "true_independent_feedback_count_lt_3" in early_step[
+        "strict_feedback_insufficient_reason"
+    ]
+    assert later_step["true_independent_feedback_eligible"] is True
+    assert later_step["true_independent_feedback_count"] >= 3
+    assert later_step["true_independent_feedback_prior_wave_count"] >= 2
+    assert later_step["rejected_feedback_future_data_count"] > 0
+    assert {
+        item["feedback_ref"]
+        for item in later_step["alaya_feedback_history"]
+        if str(item.get("feedback_source_kind")) in {"outcome_feedback", "realized_error_feedback"}
+    } >= {
+        "outcome:aapl:any:2024-01-02:wave1",
+        "outcome:aapl:any:2024-02-01:wave2",
+        "outcome:aapl:any:2024-03-01:wave3",
+    }
+    assert not any(
+        str(item.get("kind")) == "alaya_feedback"
+        for item in direct_later.get("decision_inputs") or []
+    )
 
 
 def _price_rows(days: int = 220) -> pd.DataFrame:

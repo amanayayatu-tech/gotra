@@ -88,6 +88,7 @@ DEFAULT_GLM_BASE_URL = v2.DEFAULT_GLM_BASE_URL
 DEEPSEEK_RATE_LIMITS = v2.DEEPSEEK_RATE_LIMITS
 RUN_ID_PREFIX = "baseline_v3_four_arm_"
 RUN_ID_PREFIX_V3_1 = "baseline_v3_1_"
+RUN_ID_PREFIX_V3_2 = "baseline_v3_2_"
 WINDOW_DAYS = 30
 DEFAULT_TICKERS = v2.V1_PILOT_TICKERS
 DEFAULT_DATES = v2.V1_PILOT_DATES
@@ -143,6 +144,7 @@ class RunConfig:
     provider_max_tokens: int = 1200
     resume: bool = False
     research_artifacts_path: Path | None = None
+    feedback_artifacts_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -150,6 +152,7 @@ class ArmTask:
     point: DecisionPoint
     arm: Arm
     feedback: list[dict[str, Any]]
+    feedback_filter_diagnostics: dict[str, Any]
 
 
 @dataclass
@@ -889,6 +892,34 @@ FORBIDDEN_RESEARCH_ARTIFACT_FIELDS = {
     "window_end_price",
     "future_price",
 }
+REQUIRED_FEEDBACK_ARTIFACT_FIELDS = {
+    "ticker",
+    "feedback_ref",
+    "feedback_source_kind",
+    "availability_date",
+    "source_run_id",
+    "source_step_id",
+    "source_decision_date",
+    "source_horizon_end_date",
+    "actual_return",
+    "prior_prediction",
+}
+TRUE_INDEPENDENT_FEEDBACK_SOURCE_KINDS = {
+    "outcome_feedback",
+    "realized_error_feedback",
+}
+NON_INDEPENDENT_FEEDBACK_SOURCE_KINDS = {
+    "self_feedback",
+    "synthetic_feedback",
+}
+FORBIDDEN_FEEDBACK_ARTIFACT_FIELDS = {
+    "current_actual_return",
+    "current_step_output",
+    "future_return",
+    "outcome_after_current_decision",
+    "realized_after_current_decision",
+    "same_date_future_outcome",
+}
 
 
 def empty_research_artifact_filter_result() -> dict[str, Any]:
@@ -914,6 +945,21 @@ def load_research_artifact_fixture(path: Path) -> list[dict[str, Any]]:
         payload = payload.get("artifacts", [])
     if not isinstance(payload, list):
         raise ValueError("research artifact fixture must be a list or {'artifacts': [...]}")
+    return [dict(item) for item in payload if isinstance(item, dict)]
+
+
+def load_feedback_artifact_fixture(path: Path) -> list[dict[str, Any]]:
+    if path.suffix.lower() == ".jsonl":
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict):
+        payload = payload.get("feedback_artifacts", payload.get("artifacts", []))
+    if not isinstance(payload, list):
+        raise ValueError("feedback artifact fixture must be a list or {'feedback_artifacts': [...]}")
     return [dict(item) for item in payload if isinstance(item, dict)]
 
 
@@ -964,16 +1010,166 @@ def normalize_research_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "kind": "research_artifact",
         "source": str(artifact["source_url_or_id"]),
         "source_kind": str(artifact["source_kind"]),
+        "source_family": str(artifact.get("source_family") or ""),
         "availability_date": str(artifact["availability_date"]),
+        "captured_at": str(artifact.get("captured_at") or artifact["publish_timestamp"]),
         "summary": str(artifact["summary"]),
+        "text": str(artifact.get("text") or artifact["summary"]),
         "ticker": str(artifact["ticker"]),
         "source_name": str(artifact["source_name"]),
         "source_url_or_id": str(artifact["source_url_or_id"]),
+        "source_url": str(artifact.get("source_url") or artifact["source_url_or_id"]),
+        "source_id": str(artifact.get("source_id") or artifact["source_url_or_id"]),
         "publish_timestamp": str(artifact["publish_timestamp"]),
         "retrieval_method": str(artifact["retrieval_method"]),
         "evidence_ref": str(artifact["evidence_ref"]),
         "decision_date_scope": artifact.get("decision_date_scope"),
+        "decision_date_max": artifact.get("decision_date_max"),
+        "provenance_hash": str(artifact.get("provenance_hash") or ""),
     }
+
+
+def empty_feedback_artifact_filter_result() -> dict[str, Any]:
+    return {
+        "accepted_feedback": [],
+        "rejected_feedback_artifact_count": 0,
+        "rejected_feedback_future_data_count": 0,
+        "rejected_feedback_schema_count": 0,
+        "rejected_feedback_non_independent_count": 0,
+        "feedback_source_kind_counts": feedback_source_kind_counts_for_feedback([]),
+    }
+
+
+def feedback_artifact_filter_result(
+    *,
+    feedback_artifacts_path: Path | None,
+    decision_date: date,
+    ticker: str,
+    input_layer: InputLayer,
+) -> dict[str, Any]:
+    if not feedback_artifacts_path:
+        return empty_feedback_artifact_filter_result()
+    return filter_external_feedback_artifacts(
+        load_feedback_artifact_fixture(feedback_artifacts_path),
+        decision_date=decision_date,
+        ticker=ticker,
+        input_layer=input_layer,
+    )
+
+
+def filter_external_feedback_artifacts(
+    artifacts: list[dict[str, Any]],
+    *,
+    decision_date: date,
+    ticker: str,
+    input_layer: InputLayer,
+) -> dict[str, Any]:
+    accepted: list[dict[str, Any]] = []
+    rejected_future = 0
+    rejected_schema = 0
+    rejected_non_independent = 0
+    for artifact in artifacts:
+        artifact_ticker = str(artifact.get("ticker") or "")
+        artifact_input_layer = str(artifact.get("input_layer") or "*")
+        if artifact_ticker not in {ticker, "*"}:
+            continue
+        if artifact_input_layer not in {input_layer, "*"}:
+            continue
+        source_kind = str(artifact.get("feedback_source_kind") or artifact.get("source_kind") or "")
+        missing = REQUIRED_FEEDBACK_ARTIFACT_FIELDS - set(artifact)
+        forbidden = sorted(FORBIDDEN_FEEDBACK_ARTIFACT_FIELDS & set(artifact))
+        if missing or source_kind not in (
+            TRUE_INDEPENDENT_FEEDBACK_SOURCE_KINDS | NON_INDEPENDENT_FEEDBACK_SOURCE_KINDS
+        ):
+            rejected_schema += 1
+            continue
+        if forbidden:
+            rejected_future += 1
+            continue
+        try:
+            availability_date = parse_date(str(artifact["availability_date"]))
+            horizon_end_date = parse_date(str(artifact["source_horizon_end_date"]))
+            source_decision_date = parse_date(str(artifact["source_decision_date"]))
+        except Exception:  # noqa: BLE001 - fixture rows are untrusted inputs.
+            rejected_schema += 1
+            continue
+        if (
+            availability_date > decision_date
+            or horizon_end_date > decision_date
+            or source_decision_date >= decision_date
+        ):
+            rejected_future += 1
+            continue
+        if source_kind not in TRUE_INDEPENDENT_FEEDBACK_SOURCE_KINDS:
+            rejected_non_independent += 1
+            continue
+        try:
+            accepted.append(
+                normalize_feedback_artifact(artifact, current_decision_date=decision_date)
+            )
+        except Exception:  # noqa: BLE001 - malformed numeric/provenance fields are rejected.
+            rejected_schema += 1
+    return {
+        "accepted_feedback": accepted,
+        "rejected_feedback_artifact_count": (
+            rejected_future + rejected_schema + rejected_non_independent
+        ),
+        "rejected_feedback_future_data_count": rejected_future,
+        "rejected_feedback_schema_count": rejected_schema,
+        "rejected_feedback_non_independent_count": rejected_non_independent,
+        "feedback_source_kind_counts": feedback_source_kind_counts_for_feedback(accepted),
+    }
+
+
+def normalize_feedback_artifact(
+    artifact: dict[str, Any],
+    *,
+    current_decision_date: date,
+) -> dict[str, Any]:
+    availability_date = str(artifact["availability_date"])
+    source_kind = str(artifact["feedback_source_kind"])
+    return {
+        "feedback_ref": str(artifact["feedback_ref"]),
+        "ticker": str(artifact["ticker"]),
+        "input_layer": str(artifact.get("input_layer") or "*"),
+        "prior_decision_date": str(artifact["source_decision_date"]),
+        "decision_date": str(artifact["source_decision_date"]),
+        "source_decision_date": str(artifact["source_decision_date"]),
+        "source_horizon_end_date": str(artifact["source_horizon_end_date"]),
+        "outcome_availability_date": availability_date,
+        "availability_date": availability_date,
+        "age_days": (current_decision_date - parse_date(availability_date)).days,
+        "feedback_source_kind": source_kind,
+        "source_kind": source_kind,
+        "source_run_id": str(artifact["source_run_id"]),
+        "source_step_id": str(artifact["source_step_id"]),
+        "actual_return": float(artifact["actual_return"]),
+        "prior_prediction": float(artifact["prior_prediction"]),
+        "error": float(artifact.get("error", float(artifact["actual_return"]) - float(artifact["prior_prediction"]))),
+        "mse": float(artifact.get("mse", 0.0)),
+        "summary": str(artifact.get("summary") or ""),
+    }
+
+
+def feedback_filter_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "rejected_feedback_artifact_count": int(result.get("rejected_feedback_artifact_count") or 0),
+        "rejected_feedback_future_data_count": int(
+            result.get("rejected_feedback_future_data_count") or 0
+        ),
+        "rejected_feedback_schema_count": int(result.get("rejected_feedback_schema_count") or 0),
+        "rejected_feedback_non_independent_count": int(
+            result.get("rejected_feedback_non_independent_count") or 0
+        ),
+        "feedback_source_kind_counts": dict(
+            result.get("feedback_source_kind_counts")
+            or feedback_source_kind_counts_for_feedback([])
+        ),
+    }
+
+
+def feedback_filter_diagnostics_empty() -> dict[str, Any]:
+    return feedback_filter_diagnostics(empty_feedback_artifact_filter_result())
 
 
 def ksana_workflow_for(arm: Arm) -> dict[str, str]:
@@ -1260,6 +1456,7 @@ def build_scored_step(
     provider_base_url: str,
     provider_transport: str,
     diagnostics: dict[str, Any],
+    feedback_filter_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     actual = change_pct(float(context.start_row["adj_close"]), float(context.end_row["adj_close"]))
     error = round(actual - decision.expected_change_pct, 6)
@@ -1270,6 +1467,9 @@ def build_scored_step(
         decision_date=point.decision_date,
         arm=arm,
         scoring_segment=scoring_segment,
+    )
+    feedback_filter_diagnostics = (
+        feedback_filter_diagnostics or feedback_filter_diagnostics_empty()
     )
     available_evidence_count = 1 + len(research_artifacts) + (len(feedback) if arm == "full_gotra" else 0)
     step = {
@@ -1316,6 +1516,8 @@ def build_scored_step(
         **strict_feedback,
         "quarantine_excluded_count": 0,
         "strong_knowledge_auto_approved": False,
+        "alaya_feedback_history": feedback if arm == "full_gotra" else [],
+        **feedback_filter_diagnostics,
         "research_artifacts": research_artifacts,
         "research_artifact_count": len(research_artifacts),
         "synthetic_evidence_count": synthetic_evidence_count(research_artifacts),
@@ -1366,6 +1568,7 @@ def build_error_step(
         "input_echo_error",
         "future_data_violation",
         "research_source_leak",
+        "feedback_source_leak",
         "auth_missing",
     }
     step: dict[str, Any] = {
@@ -1404,6 +1607,8 @@ def build_error_step(
         "feedback_age_days_max": None,
         "quarantine_excluded_count": 0,
         "strong_knowledge_auto_approved": False,
+        "alaya_feedback_history": [],
+        **feedback_filter_diagnostics_empty(),
         "research_artifacts": [],
         "research_artifact_count": 0,
         "synthetic_evidence_count": 0,
@@ -1469,9 +1674,14 @@ def decision_inputs(
             {
                 "name": str(item.get("feedback_ref") or f"alaya_matured_feedback_{index}"),
                 "kind": "alaya_feedback",
-                "source": "prior_step_outcome",
-                "source_kind": str(item.get("source_kind") or "self_feedback"),
-                "availability_date": item["outcome_availability_date"],
+                "source": str(item.get("source_step_id") or item.get("source_run_id") or "prior_step_outcome"),
+                "source_kind": str(
+                    item.get("feedback_source_kind") or item.get("source_kind") or "self_feedback"
+                ),
+                "availability_date": item.get("availability_date") or item["outcome_availability_date"],
+                "source_decision_date": item.get("source_decision_date")
+                or item.get("prior_decision_date"),
+                "source_horizon_end_date": item.get("source_horizon_end_date"),
             }
         )
     return inputs
@@ -1510,6 +1720,18 @@ def research_source_leak_violations(step: dict[str, Any]) -> list[str]:
     return violations
 
 
+def feedback_source_leak_violations(step: dict[str, Any]) -> list[str]:
+    violations: list[str] = []
+    has_feedback_input = any(
+        str(item.get("kind") or "") == "alaya_feedback"
+        for item in step.get("decision_inputs") or []
+        if isinstance(item, dict)
+    )
+    if has_feedback_input and step.get("arm") != "full_gotra":
+        violations.append("non-full_gotra arm received alaya_feedback")
+    return violations
+
+
 def feedback_age_days(*, feedback: list[dict[str, Any]], decision_date: date) -> list[int]:
     ages: list[int] = []
     for item in feedback:
@@ -1532,36 +1754,53 @@ def strict_feedback_diagnostics(
             "visible_mature_feedback_count": 0,
             "feedback_prior_wave_count": 0,
             "feedback_real_unverified_count": 0,
+            "true_independent_feedback_count": 0,
+            "true_independent_feedback_prior_wave_count": 0,
+            "feedback_source_kind_counts": feedback_source_kind_counts_for_feedback([]),
+            "feedback_age_days_max_meets_horizon": False,
             "strict_feedback_eligible": False,
             "true_independent_feedback_eligible": False,
             "strict_feedback_insufficient_reason": "not_full_gotra_scored_segment",
         }
     ages = feedback_age_days(feedback=feedback, decision_date=decision_date)
+    independent_feedback = [
+        item
+        for item in feedback
+        if str(item.get("feedback_source_kind") or item.get("source_kind") or "")
+        in TRUE_INDEPENDENT_FEEDBACK_SOURCE_KINDS
+    ]
     prior_waves = {
         str(item.get("prior_decision_date") or item.get("decision_date"))
         for item in feedback
         if item.get("prior_decision_date") or item.get("decision_date")
     }
-    real_unverified_count = sum(
-        1 for item in feedback if str(item.get("source_kind") or "") in {"real", "unverified"}
-    )
+    independent_prior_waves = {
+        str(item.get("source_decision_date") or item.get("prior_decision_date") or item.get("decision_date"))
+        for item in independent_feedback
+        if item.get("source_decision_date") or item.get("prior_decision_date") or item.get("decision_date")
+    }
     count = len(feedback)
+    independent_count = len(independent_feedback)
     max_age = max(ages) if ages else None
     reasons: list[str] = []
     if count < 3:
         reasons.append("visible_mature_feedback_count_lt_3")
-    if max_age is None or max_age < WINDOW_DAYS:
-        reasons.append("feedback_age_days_max_lt_horizon_days")
-    if len(prior_waves) < 2:
-        reasons.append("prior_wave_count_lt_2")
-    if real_unverified_count < 1:
-        reasons.append("no_real_or_unverified_feedback_source_kind")
+    if independent_count < 3:
+        reasons.append("true_independent_feedback_count_lt_3")
+    if len(independent_prior_waves) < 2:
+        reasons.append("true_independent_prior_wave_count_lt_2")
+    if independent_count < 1:
+        reasons.append("no_outcome_derived_independent_feedback_source_kind")
     eligible = not reasons
     return {
         "self_feedback_available": count > 0,
         "visible_mature_feedback_count": count,
         "feedback_prior_wave_count": len(prior_waves),
-        "feedback_real_unverified_count": real_unverified_count,
+        "feedback_real_unverified_count": 0,
+        "true_independent_feedback_count": independent_count,
+        "true_independent_feedback_prior_wave_count": len(independent_prior_waves),
+        "feedback_source_kind_counts": feedback_source_kind_counts_for_feedback(feedback),
+        "feedback_age_days_max_meets_horizon": bool(max_age is not None and max_age >= WINDOW_DAYS),
         "strict_feedback_eligible": eligible,
         "true_independent_feedback_eligible": eligible,
         "strict_feedback_insufficient_reason": ",".join(reasons),
@@ -1592,6 +1831,38 @@ def source_kind_counts_for_steps(steps: list[dict[str, Any]]) -> dict[str, int]:
             continue
         for artifact in step.get("research_artifacts") or []:
             source_kind = str(artifact.get("source_kind") or "unknown")
+            counts[source_kind if source_kind in counts else "unknown"] += 1
+    return counts
+
+
+def feedback_source_kind_counts_for_feedback(feedback: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {
+        "outcome_feedback": 0,
+        "realized_error_feedback": 0,
+        "self_feedback": 0,
+        "synthetic_feedback": 0,
+        "unknown": 0,
+    }
+    for item in feedback:
+        source_kind = str(
+            item.get("feedback_source_kind") or item.get("source_kind") or "unknown"
+        )
+        counts[source_kind if source_kind in counts else "unknown"] += 1
+    return counts
+
+
+def feedback_source_kind_counts_for_steps(steps: list[dict[str, Any]]) -> dict[str, int]:
+    counts = feedback_source_kind_counts_for_feedback([])
+    for step in steps:
+        step_counts = step.get("feedback_source_kind_counts")
+        if isinstance(step_counts, dict):
+            for key, value in step_counts.items():
+                counts[str(key) if str(key) in counts else "unknown"] += int(value or 0)
+            continue
+        for item in step.get("alaya_feedback_history") or []:
+            source_kind = str(
+                item.get("feedback_source_kind") or item.get("source_kind") or "unknown"
+            )
             counts[source_kind if source_kind in counts else "unknown"] += 1
     return counts
 
@@ -1842,6 +2113,7 @@ def complete_step(
     point: DecisionPoint,
     arm: Arm,
     feedback: list[dict[str, Any]],
+    feedback_filter_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     context: PriceContext | None = None
     prompt_hash = ""
@@ -1938,6 +2210,7 @@ def complete_step(
             provider_base_url=client.provider_base_url,
             provider_transport=client.provider_transport,
             diagnostics=diagnostics,
+            feedback_filter_diagnostics=feedback_filter_diagnostics,
         )
         step.update(research_filter_diagnostics(research_filter))
         step["product_metrics"] = product_metrics_for_step(step)
@@ -1984,6 +2257,7 @@ def complete_step(
         )
     violations = future_data_violations(step)
     leak_violations = research_source_leak_violations(step)
+    feedback_leak_violations = feedback_source_leak_violations(step)
     if violations:
         step["status"] = "provider_error"
         step["error_type"] = "future_data_violation"
@@ -1993,6 +2267,11 @@ def complete_step(
         step["error_type"] = "research_source_leak"
         step["research_source_leak"] = True
         step["research_source_leak_violations"] = leak_violations
+    if feedback_leak_violations:
+        step["status"] = "provider_error"
+        step["error_type"] = "feedback_source_leak"
+        step["feedback_source_leak"] = True
+        step["feedback_source_leak_violations"] = feedback_leak_violations
     write_step(run_root, step)
     append_ledger(run_root, step)
     return step
@@ -2224,24 +2503,44 @@ def run_date_wave(
     if not points:
         return steps
     decision_date = points[0].decision_date
-    feedback_snapshot_by_key = {
-        (point.ticker, point.input_layer): matured_feedback(
+    feedback_snapshot_by_key: dict[tuple[str, InputLayer], tuple[list[dict[str, Any]], dict[str, Any]]] = {}
+    for point in points:
+        self_feedback = matured_feedback(
             feedback_by_key.get((point.ticker, point.input_layer), []),
             decision_date=decision_date,
         )
-        for point in points
-    }
-    tasks = [
-        ArmTask(
-            point=point,
-            arm=arm,
-            feedback=feedback_snapshot_by_key.get((point.ticker, point.input_layer), [])
-            if arm == "full_gotra"
-            else [],
+        external_filter = feedback_artifact_filter_result(
+            feedback_artifacts_path=config.feedback_artifacts_path,
+            decision_date=decision_date,
+            ticker=point.ticker,
+            input_layer=point.input_layer,
         )
-        for point in points
-        for arm in ARMS
-    ]
+        external_feedback = list(external_filter["accepted_feedback"])
+        diagnostics = feedback_filter_diagnostics(external_filter)
+        diagnostics["feedback_source_kind_counts"] = feedback_source_kind_counts_for_feedback(
+            [*external_feedback, *self_feedback]
+        )
+        feedback_snapshot_by_key[(point.ticker, point.input_layer)] = (
+            [*external_feedback, *self_feedback],
+            diagnostics,
+        )
+    tasks: list[ArmTask] = []
+    for point in points:
+        feedback_snapshot, feedback_diagnostics_row = feedback_snapshot_by_key.get(
+            (point.ticker, point.input_layer),
+            ([], feedback_filter_diagnostics_empty()),
+        )
+        for arm in ARMS:
+            tasks.append(
+                ArmTask(
+                    point=point,
+                    arm=arm,
+                    feedback=feedback_snapshot if arm == "full_gotra" else [],
+                    feedback_filter_diagnostics=(
+                        feedback_diagnostics_row if arm == "full_gotra" else feedback_filter_diagnostics_empty()
+                    ),
+                )
+            )
     next_task_index = 0
     futures: dict[Any, ArmTask] = {}
 
@@ -2264,6 +2563,7 @@ def run_date_wave(
                     point=task.point,
                     arm=task.arm,
                     feedback=task.feedback,
+                    feedback_filter_diagnostics=task.feedback_filter_diagnostics,
                 )
             ] = task
 
@@ -2297,6 +2597,7 @@ def run_date_wave(
                     "outcome_availability_date": step["outcome_as_of"],
                     "age_days": 0,
                     "source_kind": "self_feedback",
+                    "feedback_source_kind": "self_feedback",
                     "error": step["error"],
                     "mse": step["mse"],
                     "actual_change_pct": step["actual_change_pct"],
@@ -2331,6 +2632,7 @@ def matured_feedback(items: list[dict[str, Any]], *, decision_date: date) -> lis
         normalized["age_days"] = (decision_date - outcome_date).days
         normalized.setdefault("prior_decision_date", normalized.get("decision_date"))
         normalized.setdefault("source_kind", "self_feedback")
+        normalized.setdefault("feedback_source_kind", normalized.get("source_kind"))
         matured.append(normalized)
     return sorted(matured, key=lambda item: (str(item["decision_date"]), str(item.get("input_layer"))))
 
@@ -2360,6 +2662,8 @@ def circuit_breaker_reason(steps: list[dict[str, Any]]) -> str:
         return "future-data violation observed"
     if count_error_type(steps, "research_source_leak"):
         return "research source leak observed"
+    if count_error_type(steps, "feedback_source_leak"):
+        return "feedback source leak observed"
     if count_error_type(steps, "input_echo_error"):
         return "input echo error observed"
     if schema_error_count(steps):
@@ -2523,6 +2827,11 @@ def summarize_run(
         for step in steps
         if step.get("error_type") == "research_source_leak" or step.get("research_source_leak")
     )
+    feedback_source_leak_count = sum(
+        1
+        for step in steps
+        if step.get("error_type") == "feedback_source_leak" or step.get("feedback_source_leak")
+    )
     auth_missing_count = count_error_type(steps, "auth_missing")
     provider_http_error_count = count_error_type(steps, "provider_http_error")
     price_missing_count = count_error_type(steps, "price_missing")
@@ -2540,7 +2849,20 @@ def summarize_run(
     rejected_research_schema_count = sum(
         int(step.get("rejected_research_schema_count") or 0) for step in steps
     )
+    rejected_feedback_artifact_count = sum(
+        int(step.get("rejected_feedback_artifact_count") or 0) for step in steps
+    )
+    rejected_feedback_future_data_count = sum(
+        int(step.get("rejected_feedback_future_data_count") or 0) for step in steps
+    )
+    rejected_feedback_schema_count = sum(
+        int(step.get("rejected_feedback_schema_count") or 0) for step in steps
+    )
+    rejected_feedback_non_independent_count = sum(
+        int(step.get("rejected_feedback_non_independent_count") or 0) for step in steps
+    )
     source_kind_counts = source_kind_counts_for_steps(steps)
+    feedback_source_kind_counts = feedback_source_kind_counts_for_steps(steps)
     strict_feedback_points = strict_feedback_eligible_count(steps)
     true_independent_feedback_points = true_independent_feedback_eligible_count(steps)
     paired = paired_complete_count(steps)
@@ -2554,6 +2876,7 @@ def summarize_run(
             and future_violations == 0
             and schema_errors == 0
             and research_source_leak_count == 0
+            and feedback_source_leak_count == 0
             and price_missing_count == 0
             and len(steps) == expected_steps
             and scored_step_count == expected_steps
@@ -2573,6 +2896,7 @@ def summarize_run(
                 and future_violations == 0
                 and schema_errors == 0
                 and research_source_leak_count == 0
+                and feedback_source_leak_count == 0
                 and price_missing_count == 0
                 and schema_pass == expected_steps
             )
@@ -2587,6 +2911,7 @@ def summarize_run(
                 and future_violations == 0
                 and schema_errors == 0
                 and research_source_leak_count == 0
+                and feedback_source_leak_count == 0
                 and price_missing_count == 0
                 and paired / max(1, scored_points) >= 0.95
                 else "PROVIDER_PILOT_FAIL"
@@ -2625,6 +2950,7 @@ def summarize_run(
         "warm_up_dates": config.warm_up_dates,
         "repeat_run_index": config.repeat_run_index,
         "research_artifacts_path": str(config.research_artifacts_path or ""),
+        "feedback_artifacts_path": str(config.feedback_artifacts_path or ""),
         "expected_points": total_points,
         "expected_scored_points": scored_points,
         "expected_steps": expected_steps,
@@ -2636,9 +2962,14 @@ def summarize_run(
         "paired_coverage": paired / scored_points if scored_points else 0.0,
         "future_data_violations": future_violations,
         "research_source_leak_count": research_source_leak_count,
+        "feedback_source_leak_count": feedback_source_leak_count,
         "rejected_research_artifact_count": rejected_research_artifact_count,
         "rejected_research_future_data_count": rejected_research_future_data_count,
         "rejected_research_schema_count": rejected_research_schema_count,
+        "rejected_feedback_artifact_count": rejected_feedback_artifact_count,
+        "rejected_feedback_future_data_count": rejected_feedback_future_data_count,
+        "rejected_feedback_schema_count": rejected_feedback_schema_count,
+        "rejected_feedback_non_independent_count": rejected_feedback_non_independent_count,
         "h1_research_evidence_status": h1_research_evidence_status(source_kind_counts),
         "provider_error_count": provider_errors,
         "provider_error_rate": provider_error_rate,
@@ -2680,6 +3011,8 @@ def summarize_run(
         "feedback_path_exercised": full_gotra_feedback_available_count(steps) > 0,
         "synthetic_evidence_count": sum(int(step.get("synthetic_evidence_count") or 0) for step in steps),
         "source_kind_counts": source_kind_counts,
+        "feedback_source_kind_counts": feedback_source_kind_counts,
+        "feedback_eligibility_diagnostics": feedback_diagnostics(steps),
         "reasoning_chars_by_arm": reasoning_chars_by_arm(steps),
         "circuit_breaker_triggered": circuit_breaker.triggered,
         "trigger_reason": circuit_breaker.trigger_reason,
@@ -2935,6 +3268,7 @@ def feedback_diagnostics(steps: list[dict[str, Any]]) -> dict[str, Any]:
                 "feedback_used_count_max": None,
                 "feedback_age_days_max_min": None,
                 "feedback_age_days_max_max": None,
+                "feedback_source_kind_counts": feedback_source_kind_counts_for_feedback([]),
             },
         )
         row["points"] += 1
@@ -2943,6 +3277,11 @@ def feedback_diagnostics(steps: list[dict[str, Any]]) -> dict[str, Any]:
         row["true_independent_feedback_eligible_points"] += (
             1 if step.get("true_independent_feedback_eligible") else 0
         )
+        step_counts = step.get("feedback_source_kind_counts") or {}
+        if isinstance(step_counts, dict):
+            for key, value in step_counts.items():
+                normalized_key = str(key) if str(key) in row["feedback_source_kind_counts"] else "unknown"
+                row["feedback_source_kind_counts"][normalized_key] += int(value or 0)
         update_min_max(row, "feedback_used_count", step.get("feedback_used_count"))
         update_min_max(row, "feedback_age_days_max", step.get("feedback_age_days_max"))
     return {
@@ -2954,6 +3293,18 @@ def feedback_diagnostics(steps: list[dict[str, Any]]) -> dict[str, Any]:
         "true_independent_feedback_eligible_points": true_independent_feedback_eligible_count(steps),
         "h2_data_status": h2_data_status(true_independent_feedback_eligible_count(steps)),
         "h2_data_insufficient_reason": h2_data_insufficient_reason(steps),
+        "feedback_source_kind_counts": feedback_source_kind_counts_for_steps(steps),
+        "rejected_feedback_artifact_count": sum(
+            int(step.get("rejected_feedback_artifact_count") or 0) for step in steps
+        ),
+        "rejected_feedback_future_data_count": sum(
+            int(step.get("rejected_feedback_future_data_count") or 0) for step in steps
+        ),
+        "feedback_source_leak_count": sum(
+            1
+            for step in steps
+            if step.get("error_type") == "feedback_source_leak" or step.get("feedback_source_leak")
+        ),
         "by_scored_date_input_layer": list(by_date_layer.values()),
     }
 
@@ -3071,7 +3422,7 @@ def feedback_eligible_paired_keys(steps: list[dict[str, Any]]) -> set[tuple[str,
         if step.get("arm") == "full_gotra"
         and step.get("status") == "scored"
         and step.get("scoring_segment") == "scored"
-        and int(step.get("feedback_used_count") or 0) > 0
+        and bool(step.get("true_independent_feedback_eligible"))
     }
 
 
@@ -3307,6 +3658,8 @@ def blocked_run_id_exists_summary(*, config: RunConfig, run_root: Path) -> dict[
         "stop_reason": "run_root exists and contains artifacts; pass --resume only for exact manifest match",
         "existing_artifact_count": count_files(run_root),
         "scheduler_policy": config.scheduler_policy,
+        "research_artifacts_path": str(config.research_artifacts_path or ""),
+        "feedback_artifacts_path": str(config.feedback_artifacts_path or ""),
         "timeout_policy": timeout_policy_manifest(config),
         "circuit_breaker_triggered": False,
         "trigger_reason": "",
@@ -3357,6 +3710,7 @@ def manifest_identity(config: RunConfig) -> dict[str, Any]:
         "timeout_policy": timeout_policy_manifest(config),
         "provider_limits": provider_limit_metadata(config),
         "research_artifacts_path": str(config.research_artifacts_path or ""),
+        "feedback_artifacts_path": str(config.feedback_artifacts_path or ""),
     }
 
 
@@ -3393,6 +3747,7 @@ def write_manifest(run_root: Path, config: RunConfig) -> None:
         "max_provider_concurrency": config.max_provider_concurrency,
         "scheduler_policy": config.scheduler_policy,
         "research_artifacts_path": str(config.research_artifacts_path or ""),
+        "feedback_artifacts_path": str(config.feedback_artifacts_path or ""),
         "timeout_policy": timeout_policy_manifest(config),
         "timeout_retries": config.timeout_retries,
         "timeout_retry_backoff_seconds": config.timeout_retry_backoff_seconds,
@@ -3438,8 +3793,11 @@ def append_ledger(run_root: Path, step: dict[str, Any]) -> None:
 
 
 def validate_run_id(run_id: str) -> None:
-    if not run_id.startswith((RUN_ID_PREFIX, RUN_ID_PREFIX_V3_1)):
-        raise ValueError(f"run_id must start with {RUN_ID_PREFIX!r} or {RUN_ID_PREFIX_V3_1!r}")
+    if not run_id.startswith((RUN_ID_PREFIX, RUN_ID_PREFIX_V3_1, RUN_ID_PREFIX_V3_2)):
+        raise ValueError(
+            f"run_id must start with {RUN_ID_PREFIX!r}, {RUN_ID_PREFIX_V3_1!r}, "
+            f"or {RUN_ID_PREFIX_V3_2!r}"
+        )
     if "/" in run_id or ".." in run_id:
         raise ValueError("run_id must be a single path segment")
 
@@ -3570,6 +3928,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Local JSON/JSONL/CSV research artifact fixture; no network retrieval is performed.",
     )
+    parser.add_argument(
+        "--feedback-artifacts-path",
+        type=Path,
+        default=None,
+        help="Local JSON/JSONL feedback artifact fixture; no network retrieval is performed.",
+    )
     parser.add_argument("--env-file", default="")
     parser.add_argument("--resume", action="store_true")
     return parser
@@ -3659,6 +4023,7 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         scheduler_policy="per_date_feedback_snapshot_interleaved_point_layer_arm_v3",
         resume=bool(args.resume),
         research_artifacts_path=args.research_artifacts_path,
+        feedback_artifacts_path=args.feedback_artifacts_path,
     )
 
 
