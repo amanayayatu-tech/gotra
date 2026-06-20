@@ -32,6 +32,8 @@ LLM_MODEL=gpt-5.5
 CODEX_PROVIDER_REASONING_EFFORT=xhigh
 CODEX_PROVIDER_SANDBOX=read-only
 CODEX_PROVIDER_CLEAN=1
+CODEX_RESPONSES_BASE_URL=
+CODEX_AUTH_JSON=
 AUTO_JUDGE=true
 ```
 
@@ -134,7 +136,12 @@ uv run python -m gotra.backtest.walk_forward \
 只支持 prompt-level temperature guidance，不暴露可靠 `temperature/top_p/seed` sampling
 控制。
 
-任何 `codex_cli` full/monthly provider run 都属于高成本动作，启动前必须取得明确批准。
+`codex_responses` 可作为 Phase BT 的受控决策 provider 路径，但不提供 `seed`，因此
+复现性口径只能是 replay direction consistency，不是逐位相同输出。使用前必须用独立
+cache namespace 做 replay 预检，并用 `compare_runs` 按锁定阈值量化方向一致率。
+
+任何 `codex_cli` 或 `codex_responses` full/monthly provider run 都属于高成本动作，
+启动前必须取得明确批准。
 
 ## 目标
 
@@ -242,7 +249,8 @@ class DaemonRunConfig:
 - 在作出状态判断前验证真实本地状态：branch、dirty tree、submodule state、当前
   artifact、相关 run JSON。
 - 除非 runbook 明确要求跟踪，generated artifact 不进 git。
-- LLM 调用必须留在批准的 provider interface 与 Codex CLI 路径之后。
+- LLM 调用必须留在批准的 provider interface 之后：默认 Codex CLI 路径；Phase BT
+  可使用已登记的 `codex_responses` 受控接口。
 - BT 输入可用性必须可审计：`availability_date <= T`，或价格行切片到
   `date <= decision_date`。
 - 判断 BT run 健康时读取/生成 `system_health.json`、`summary.json`、
@@ -255,7 +263,8 @@ class DaemonRunConfig:
 
 ### Ask First
 
-- 启动 full/monthly `codex_cli` provider BT run，或任何可能消耗大量 token 的动作。
+- 启动 full/monthly `codex_cli` / `codex_responses` provider BT run，或任何可能消耗
+  大量 token 的动作。
 - 修改 preregistered BT hypothesis、threshold、window、universe，或 `95%` baseline
   replay direction-agreement gate。
 - 新增依赖、修改 `uv.lock`、修改 CI。
@@ -271,6 +280,12 @@ class DaemonRunConfig:
   BT run directory、generated report、patch、tarball、pyc 文件。
 - 绝不在 gotra business code 中直接 import OpenAI/Anthropic SDK，或调用 direct vendor
   endpoint。
+- 受控例外：`gotra.backtest.codex_responses_client` 可在 Phase BT 决策 provider 路径中
+  调用 Codex OAuth Responses backend。该例外仅限 BT provider，不得用于其他业务路径；
+  使用 `CODEX_RESPONSES_BASE_URL` 配置 endpoint，复用 Codex OAuth auth 文件或
+  `CODEX_AUTH_JSON` 覆盖路径，不引入 API key 计费路径；不得 import `openai` /
+  `anthropic` SDK，不放开 `api.openai.com` / `api.anthropic.com` 或其他 vendor endpoint；
+  backend 不提供可靠 `seed`，复现性口径是方向一致率达到锁定阈值，不是逐位相同输出。
 - 受控例外：`gotra.backtest.kimi_client` / `gotra.backtest.kimi_probe` 可在诊断性
   Kimi-K2.6 复现性探针中调用 `https://api.sophnet.com/v1/chat/completions`。该例外
   仅限 `SOPHNET_API_KEY` 环境变量、`temperature=0`、真实 BT prompt 的探针用途；不得
@@ -290,6 +305,10 @@ BT 有两类必须分开的 verdict：
   budget/pause 状态清晰、event actor 存在、本地 deterministic tests/canaries 通过。
 - Scientific hypotheses：`data/backtest/PREREGISTERED.md` 中的 H1/H2/H3，包括正式 gate
   要求 baseline replay direction agreement 达到或超过 `95%`。
+
+`codex_responses` 的资格口径是 replay direction agreement 达到锁定阈值。由于没有
+可依赖的 `seed`，不得声称逐位可复现，也不得把 provider connectivity、CI 或 sampled
+plumbing evidence 升格为 full monthly/provider 科学验收。
 
 具体 run id、replay count、当前 pass/fail 状态不在本 spec 中维护。作出状态判断前，
 读取当前 run artifact、`README.md` 和 BT repair/status 文档。
