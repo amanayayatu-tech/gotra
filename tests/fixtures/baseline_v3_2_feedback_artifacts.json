@@ -1,0 +1,89 @@
+{
+  "feedback_artifacts": [
+    {
+      "ticker": "*",
+      "input_layer": "*",
+      "feedback_ref": "outcome:aapl:any:2024-01-02:wave1",
+      "feedback_source_kind": "outcome_feedback",
+      "availability_date": "2024-02-02",
+      "source_run_id": "fixture_prior_run_v3_2",
+      "source_step_id": "fixture_prior_run_v3_2/full_gotra/2024-01-02/wave1",
+      "source_decision_date": "2024-01-02",
+      "source_horizon_end_date": "2024-02-01",
+      "actual_return": 1.2,
+      "prior_prediction": 0.8,
+      "summary": "Outcome-derived prior wave feedback available before later decisions."
+    },
+    {
+      "ticker": "*",
+      "input_layer": "*",
+      "feedback_ref": "outcome:aapl:any:2024-02-01:wave2",
+      "feedback_source_kind": "realized_error_feedback",
+      "availability_date": "2024-03-04",
+      "source_run_id": "fixture_prior_run_v3_2",
+      "source_step_id": "fixture_prior_run_v3_2/full_gotra/2024-02-01/wave2",
+      "source_decision_date": "2024-02-01",
+      "source_horizon_end_date": "2024-03-02",
+      "actual_return": -0.4,
+      "prior_prediction": 0.6,
+      "summary": "Realized-error prior wave feedback from a second mature wave."
+    },
+    {
+      "ticker": "*",
+      "input_layer": "*",
+      "feedback_ref": "outcome:aapl:any:2024-03-01:wave3",
+      "feedback_source_kind": "outcome_feedback",
+      "availability_date": "2024-04-01",
+      "source_run_id": "fixture_prior_run_v3_2",
+      "source_step_id": "fixture_prior_run_v3_2/full_gotra/2024-03-01/wave3",
+      "source_decision_date": "2024-03-01",
+      "source_horizon_end_date": "2024-03-31",
+      "actual_return": 2.1,
+      "prior_prediction": 1.4,
+      "summary": "Third mature outcome feedback makes later H2 points strictly eligible."
+    },
+    {
+      "ticker": "*",
+      "input_layer": "*",
+      "feedback_ref": "self:any:2024-01-02:not-independent",
+      "feedback_source_kind": "self_feedback",
+      "availability_date": "2024-02-02",
+      "source_run_id": "fixture_prior_run_v3_2",
+      "source_step_id": "fixture_prior_run_v3_2/full_gotra/2024-01-02/self",
+      "source_decision_date": "2024-01-02",
+      "source_horizon_end_date": "2024-02-01",
+      "actual_return": 0.5,
+      "prior_prediction": 0.2,
+      "summary": "Self-feedback fixture row must not count as true independent feedback."
+    },
+    {
+      "ticker": "*",
+      "input_layer": "*",
+      "feedback_ref": "future:any:2024-06-03:leak",
+      "feedback_source_kind": "outcome_feedback",
+      "availability_date": "2024-07-15",
+      "source_run_id": "fixture_prior_run_v3_2",
+      "source_step_id": "fixture_prior_run_v3_2/full_gotra/2024-06-03/future",
+      "source_decision_date": "2024-06-03",
+      "source_horizon_end_date": "2024-07-03",
+      "actual_return": 9.9,
+      "prior_prediction": 0.1,
+      "summary": "Future feedback artifact must be rejected by availability and horizon gates."
+    },
+    {
+      "ticker": "*",
+      "input_layer": "*",
+      "feedback_ref": "malformed:any:missing-prior-prediction",
+      "feedback_source_kind": "outcome_feedback",
+      "availability_date": "2024-02-02",
+      "source_run_id": "fixture_prior_run_v3_2",
+      "source_step_id": "fixture_prior_run_v3_2/full_gotra/malformed",
+      "source_decision_date": "2024-01-02",
+      "source_horizon_end_date": "2024-02-01",
+      "actual_return": 1.0,
+      "summary": "Malformed row must be rejected because prior_prediction is missing."
+    },
+    null,
+    []
+  ]
+}
