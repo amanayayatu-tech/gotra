@@ -140,6 +140,27 @@ def test_cache_key_contains_input_layer_and_definition_version() -> None:
     assert "price_only_packet" in price_key
     assert "richer_research_packet" in rich_key
     assert "max_tokens=1600" in rich_key
+    assert "temperature=omitted" in rich_key
+
+
+def test_cache_key_includes_provider_temperature_contract() -> None:
+    base_args = {
+        "arm": "direct_llm",
+        "input_layer": "richer_research_packet",
+        "provider": "kimi",
+        "provider_model": "Kimi-K2.6",
+        "provider_base_url": "https://api.sophnet.com/v1/chat/completions",
+        "provider_max_tokens": 2000,
+        "prompt_hash": "abc123",
+    }
+    omitted_key = v3.cache_key_for(**base_args)
+    temperature_key = v3.cache_key_for(**base_args, provider_temperature=1.0)
+    old_incompatible_key = v3.cache_key_for(**base_args, provider_temperature=0.0)
+
+    assert omitted_key != temperature_key
+    assert old_incompatible_key != temperature_key
+    assert "temperature=1" in temperature_key
+    assert "temperature=0" in old_incompatible_key
 
 
 def test_strict_decision_json_rejects_unknown_keys_without_invention() -> None:
@@ -997,6 +1018,44 @@ def test_glm_provider_max_tokens_is_sent_in_request_body(monkeypatch) -> None:
     assert client.provider_max_tokens_applied is True
 
 
+def test_kimi_k26_sophnet_request_uses_temperature_one(monkeypatch) -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        requests.append(body)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(_decision_payload())}}]},
+        )
+
+    monkeypatch.setenv("SOPHNET_API_KEY", "sophnet-secret")
+    client = v3.KimiDecisionClient(
+        model="Kimi-K2.6",
+        request_timeout_seconds=1,
+        provider_base_url="https://api.sophnet.com/v1/chat/completions",
+        provider_max_tokens=77,
+        transport=httpx.MockTransport(handler),
+    )
+    decision = client.complete(
+        v3.build_prompt_payload(
+            arm="direct_llm",
+            input_layer="price_only_packet",
+            ticker="AAPL",
+            decision_date=date(2024, 1, 2),
+            price_rows=_price_rows(),
+            feedback=[],
+            provider="kimi",
+            provider_model="Kimi-K2.6",
+        )
+    )
+
+    assert decision.schema == v3.DECISION_SCHEMA
+    assert decision.provider_temperature == 1.0
+    assert requests[0]["temperature"] == 1.0
+    assert requests[0]["max_tokens"] == 77
+
+
 def test_kimi_retryable_timeout_recovers_with_attempt_metadata() -> None:
     client = v3.KimiDecisionClient(
         model="Kimi-K2.6",
@@ -1034,6 +1093,52 @@ def test_kimi_retryable_timeout_recovers_with_attempt_metadata() -> None:
     assert decision.provider_attempts == 2
     assert decision.provider_retry_count == 1
     assert decision.last_retryable_error_type == "TimeoutException"
+    assert decision.provider_temperature == 1.0
+
+
+def test_provider_temperature_metadata_is_auditable_without_breaking_non_kimi(
+    tmp_path: Path,
+) -> None:
+    _write_prices(tmp_path / "prices", "AAPL", days=520)
+    config = replace(
+        _config(
+            tmp_path,
+            run_id="baseline_v3_2_kimi_temperature_metadata_mock_test",
+            dates=(date(2024, 1, 2), date(2024, 2, 1)),
+        ),
+        provider="kimi",
+        provider_model="Kimi-K2.6",
+        provider_base_url="https://api.sophnet.com/v1/chat/completions",
+    )
+
+    summary = v3.run_four_arm(config)
+    run_root = tmp_path / "runs" / "baseline_v3_2_kimi_temperature_metadata_mock_test"
+    manifest = json.loads((run_root / "manifest.json").read_text(encoding="utf-8"))
+    step = json.loads(
+        (
+            run_root
+            / "direct_llm"
+            / "step_2024-02-01_aapl_richer_research_packet.json"
+        ).read_text(encoding="utf-8")
+    )
+    glm_metadata = v3.provider_temperature_metadata(
+        replace(config, provider="glm_sophnet", provider_model="GLM-5.2")
+    )
+
+    assert summary["status"] == "MOCK_PASS"
+    assert summary["provider_temperature"] == 1.0
+    assert summary["provider_temperature_applied"] is False
+    assert manifest["provider_temperature"] == 1.0
+    assert manifest["provider_temperature_applied"] is False
+    assert step["provider_temperature"] == 1.0
+    assert step["provider_temperature_applied"] is False
+    assert "temperature=1" in step["cache_key"]
+    assert summary["request_diagnostics_by_arm"]["direct_llm"]["provider_temperature"] == {
+        "min": 1.0,
+        "max": 1.0,
+    }
+    assert glm_metadata["provider_temperature"] is None
+    assert glm_metadata["provider_temperature_applied"] is False
 
 
 def test_kimi_schema_and_input_echo_errors_are_not_retried() -> None:

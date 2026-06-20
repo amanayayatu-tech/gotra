@@ -192,6 +192,7 @@ class ProviderDecision:
     provider_attempts: int = 0
     provider_retry_count: int = 0
     provider_error_class: str = ""
+    provider_temperature: float | None = None
     provider_temperature_fallback: bool = False
     last_retryable_error_type: str = ""
     normalization_applied: bool = False
@@ -290,6 +291,7 @@ class KimiDecisionClient:
         request_timeout_seconds: float,
         provider_base_url: str,
         provider_max_tokens: int,
+        provider_temperature: float | None = None,
         timeout_retries: int = 1,
         timeout_retry_backoff_seconds: float = 30,
         transport: httpx.BaseTransport | None = None,
@@ -297,10 +299,15 @@ class KimiDecisionClient:
         self.provider_model = model
         self.provider_base_url = provider_base_url
         self.provider_max_tokens = provider_max_tokens
+        self.provider_temperature = (
+            kimi_provider_temperature(model) if provider_temperature is None else float(provider_temperature)
+        )
         self.timeout_retries = max(0, int(timeout_retries))
         self.timeout_retry_backoff_seconds = max(0.0, float(timeout_retry_backoff_seconds))
         self.provider_max_tokens_applied = True
         self.provider_max_tokens_reason = "passed to KimiCompletionClient.complete"
+        self.provider_temperature_applied = True
+        self.provider_temperature_reason = "Kimi/SophNet K2.6 requires explicit temperature=1"
         self.last_raw_content = ""
         self.request_timeout_seconds = request_timeout_seconds
         self.client = KimiCompletionClient(
@@ -327,7 +334,7 @@ class KimiDecisionClient:
                     user_prompt=prompt,
                     max_tokens=self.provider_max_tokens,
                     timeout_seconds=int(request_timeout_seconds or self.request_timeout_seconds),
-                    temperature=0.0,
+                    temperature=self.provider_temperature,
                 )
                 break
             except RuntimeError as exc:
@@ -359,7 +366,11 @@ class KimiDecisionClient:
             attempts=attempts,
             retry_count=retry_count,
         )
-        return replace(decision, last_retryable_error_type=last_retryable_error_type)
+        return replace(
+            decision,
+            provider_temperature=self.provider_temperature,
+            last_retryable_error_type=last_retryable_error_type,
+        )
 
 
 def kimi_runtime_error_class(message: str) -> str:
@@ -699,6 +710,7 @@ def cache_key_for(
     provider_model: str,
     provider_base_url: str,
     provider_max_tokens: int,
+    provider_temperature: float | None = None,
     prompt_hash: str,
     definition_version: str = DEFINITION_VERSION,
 ) -> str:
@@ -710,11 +722,28 @@ def cache_key_for(
             provider_model,
             provider_base_url,
             f"max_tokens={int(provider_max_tokens)}",
+            f"temperature={provider_temperature_identity(provider_temperature)}",
             arm,
             input_layer,
             prompt_hash,
         ]
     )
+
+
+def kimi_provider_temperature(_model: str) -> float:
+    return 1.0
+
+
+def provider_temperature_for(provider: str, provider_model: str) -> float | None:
+    if provider == "kimi":
+        return kimi_provider_temperature(provider_model)
+    return None
+
+
+def provider_temperature_identity(provider_temperature: float | None) -> str:
+    if provider_temperature is None:
+        return "omitted"
+    return f"{float(provider_temperature):g}"
 
 
 def build_prompt_payload(
@@ -2126,6 +2155,27 @@ def provider_max_tokens_metadata(config: RunConfig) -> dict[str, Any]:
     }
 
 
+def provider_temperature_metadata(config: RunConfig) -> dict[str, Any]:
+    temperature = provider_temperature_for(config.provider, config.provider_model)
+    if temperature is None:
+        return {
+            "provider_temperature": None,
+            "provider_temperature_applied": False,
+            "provider_temperature_reason": f"unsupported provider: {config.provider}",
+        }
+    if config.mode == "mock":
+        return {
+            "provider_temperature": temperature,
+            "provider_temperature_applied": False,
+            "provider_temperature_reason": "local mock does not call provider temperature API",
+        }
+    return {
+        "provider_temperature": temperature,
+        "provider_temperature_applied": True,
+        "provider_temperature_reason": "Kimi/SophNet K2.6 requires explicit temperature=1",
+    }
+
+
 def default_request_diagnostics(
     *,
     timeout_seconds: float,
@@ -2138,6 +2188,9 @@ def default_request_diagnostics(
     diagnostics["provider_max_tokens"] = 0
     diagnostics["provider_max_tokens_applied"] = False
     diagnostics["provider_max_tokens_reason"] = ""
+    diagnostics["provider_temperature"] = None
+    diagnostics["provider_temperature_applied"] = False
+    diagnostics["provider_temperature_reason"] = ""
     return diagnostics
 
 
@@ -2156,6 +2209,7 @@ def prompt_request_diagnostics(*, prompt: str, config: RunConfig, arm: Arm) -> d
     diagnostics["prompt_bytes"] = prompt_bytes
     diagnostics["provider_max_tokens"] = config.provider_max_tokens
     diagnostics.update(provider_max_tokens_metadata(config))
+    diagnostics.update(provider_temperature_metadata(config))
     return diagnostics
 
 
@@ -2257,6 +2311,7 @@ def complete_step(
             provider_model=client.provider_model,
             provider_base_url=client.provider_base_url,
             provider_max_tokens=config.provider_max_tokens,
+            provider_temperature=provider_temperature_for(client.provider, client.provider_model),
             prompt_hash=prompt_hash,
         )
         cached = cache.get(cache_key)
@@ -2287,6 +2342,9 @@ def complete_step(
             diagnostics["provider_attempts"] = decision.provider_attempts
             diagnostics["provider_retry_count"] = decision.provider_retry_count
             diagnostics["provider_error_class"] = decision.provider_error_class
+            if decision.provider_temperature is not None:
+                diagnostics["provider_temperature"] = decision.provider_temperature
+                diagnostics["provider_temperature_applied"] = True
             diagnostics["provider_temperature_fallback"] = decision.provider_temperature_fallback
             diagnostics["last_retryable_error_type"] = decision.last_retryable_error_type
             diagnostics["normalization_applied"] = decision.normalization_applied
@@ -2496,6 +2554,7 @@ def run_four_arm(config: RunConfig) -> dict[str, Any]:
             request_timeout_seconds=config.max_request_timeout_seconds,
             provider_base_url=config.provider_base_url,
             provider_max_tokens=config.provider_max_tokens,
+            provider_temperature=provider_temperature_for(config.provider, config.provider_model),
             timeout_retries=config.timeout_retries,
             timeout_retry_backoff_seconds=config.timeout_retry_backoff_seconds,
         )
@@ -3030,6 +3089,7 @@ def summarize_run(
             )
     provider_limits = provider_limit_metadata(config)
     provider_tokens = provider_max_tokens_metadata(config)
+    provider_temperature = provider_temperature_metadata(config)
     paired_diff_summary = paired_diffs(steps)
     statistical_test_summary = statistical_tests(steps)
     return {
@@ -3048,6 +3108,7 @@ def summarize_run(
         "provider_base_url": config.provider_base_url,
         "provider_max_tokens": config.provider_max_tokens,
         **provider_tokens,
+        **provider_temperature,
         "provider_call_status": provider_call_status(
             mode=config.mode,
             provider_preflight_error=provider_preflight_error,
@@ -3274,6 +3335,7 @@ def request_diagnostics_by_arm(steps: list[dict[str, Any]]) -> dict[str, Any]:
             "request_timeout_seconds": min_max_value(arm_steps, "request_timeout_seconds"),
             "provider_attempts": min_max_value(arm_steps, "provider_attempts"),
             "provider_retry_count": min_max_value(arm_steps, "provider_retry_count"),
+            "provider_temperature": min_max_value(arm_steps, "provider_temperature"),
             "provider_temperature_fallback_count": sum(
                 1 for step in arm_steps if step.get("provider_temperature_fallback")
             ),
@@ -3764,6 +3826,7 @@ def run_root_has_artifacts(run_root: Path) -> bool:
 def blocked_run_id_exists_summary(*, config: RunConfig, run_root: Path) -> dict[str, Any]:
     provider_limits = provider_limit_metadata(config)
     provider_tokens = provider_max_tokens_metadata(config)
+    provider_temperature = provider_temperature_metadata(config)
     return {
         "schema": SUMMARY_SCHEMA,
         "definition_version": DEFINITION_VERSION,
@@ -3777,6 +3840,7 @@ def blocked_run_id_exists_summary(*, config: RunConfig, run_root: Path) -> dict[
         "provider_base_url": config.provider_base_url,
         "provider_max_tokens": config.provider_max_tokens,
         **provider_tokens,
+        **provider_temperature,
         "provider_call_status": "no new provider HTTP call",
         "provider_limits": provider_limits,
         **provider_limits,
@@ -3827,6 +3891,7 @@ def manifest_identity(config: RunConfig) -> dict[str, Any]:
         "target_provider_model": config.provider_model,
         "provider_base_url": config.provider_base_url,
         "provider_max_tokens": config.provider_max_tokens,
+        "provider_temperature": provider_temperature_for(config.provider, config.provider_model),
         "tickers": list(config.tickers),
         "dates": [item.isoformat() for item in config.dates],
         "input_layers": list(config.input_layers),
@@ -3843,6 +3908,7 @@ def manifest_identity(config: RunConfig) -> dict[str, Any]:
 def write_manifest(run_root: Path, config: RunConfig) -> None:
     provider_limits = provider_limit_metadata(config)
     provider_tokens = provider_max_tokens_metadata(config)
+    provider_temperature = provider_temperature_metadata(config)
     manifest = {
         "schema": MANIFEST_SCHEMA,
         "definition_version": DEFINITION_VERSION,
@@ -3857,6 +3923,7 @@ def write_manifest(run_root: Path, config: RunConfig) -> None:
         "provider_base_url": config.provider_base_url,
         "provider_max_tokens": config.provider_max_tokens,
         **provider_tokens,
+        **provider_temperature,
         "provider_call_status": "no real provider HTTP call" if config.mode == "mock" else "pending",
         "provider_limits": provider_limits,
         **provider_limits,
