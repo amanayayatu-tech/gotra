@@ -1,4 +1,4 @@
-# GOTRA v3.6AK Live Stack Merge-Readiness Snapshot Prereg
+# GOTRA v3.6AK Post-Merge Stack Closeout Prereg
 
 Date: 2026-06-21 Asia/Shanghai
 
@@ -6,10 +6,10 @@ Date: 2026-06-21 Asia/Shanghai
 
 Evidence layer: `engineering/local stack audit only`.
 
-This stage records a current live stack refresh and merge-readiness snapshot for
-open PRs #36-#51. It reads fixture or live GitHub metadata, reuses the v3.6AH
-live stack refresh logic, and writes local summaries under `/tmp` or a
-caller-supplied output root.
+This stage records a closeout snapshot for PRs #36-#51 after those engineering
+PRs were merged to `main` by external Judge/user workflow. It replaces the
+earlier open-stack merge-readiness wording so #52 does not add stale evidence
+to `main`.
 
 This stage does not merge PRs, does not modify `main`, does not call providers,
 does not call Codex CLI, does not run formal-lite, and does not execute the next
@@ -19,76 +19,38 @@ No OOS/science/public/trading claim is made. No trading/investment advice is
 made. The historical direct arm remains
 `direct_llm_parametric_memory_control`; it is not a clean no-future baseline.
 
-## Stack Contract
+## Closeout Contract
 
-The snapshot must inspect the current #36-#51 open stack:
+The snapshot must inspect PRs #36-#51 and distinguish two safe terminal
+engineering states:
 
-- base/head topology
-- CI status
-- `mergeStateStatus`
-- active P1/P2 review threads
-- claim boundary
-- forbidden artifact boundary
-- provider/backend, Codex CLI, and formal-lite boundary flags
-- 30D data-maturity boundary
+- `STACK_READY_FOR_USER_MERGE_REVIEW`: all requested PRs are still open,
+  non-draft, clean, and ready for later human merge review.
+- `STACK_MERGED_TO_MAIN`: all requested PRs are already merged, each has a
+  recorded head SHA and merge commit, and the top merge commit is recorded as
+  the `main` after-stack evidence.
 
-Open/unmerged PRs are expected and are not blockers by themselves. A clean
-snapshot may report `STACK_READY_FOR_USER_MERGE_REVIEW`, which means only that
-the engineering stack is ready for user review of a future manual merge order.
-It is not a merge action and not merge authorization.
+When the stack is already merged, the summary must not keep wording that implies
+pending open PRs are still waiting for user merge review. It must instead
+record post-merge closeout evidence and keep #52 as the pending repair PR until
+that PR is separately reviewed and merged.
 
-## Status Contract
+## Required Checks
 
-Allowed top-level statuses include:
+The summary must include or preserve:
 
-- `STACK_READY_FOR_USER_MERGE_REVIEW`
-- `STACK_BLOCKED_CI`
-- `STACK_BLOCKED_REVIEW`
-- `STACK_BLOCKED_TOPOLOGY`
-- `STACK_BLOCKED_CONFLICT`
-- `STACK_BLOCKED_ARTIFACT`
-- `STACK_BLOCKED_CLAIM_BOUNDARY`
-- `STACK_BLOCKED_MATURITY_GATE`
-- `STACK_BLOCKED_DIRECT_LLM_BOUNDARY`
-- `STACK_BLOCKED_CI_PREFLIGHT`
-- `STACK_BLOCKED_PROVIDER_BOUNDARY`
-- `STACK_SNAPSHOT_INCOMPLETE`
-
-If a real blocker appears, the summary must include `blocker_reasons` and enough
-PR/base/head/path/thread detail from the underlying live refresh to route a
-repair goal.
-
-## Required Summary Fields
-
-The summary must include:
-
-- `schema`
-- `snapshot_run_id`
-- `source_mode`
-- `repo`
-- `pr_range`
-- `pr_numbers`
-- `expected_stack_order`
-- `base_chain`
-- `head_shas`
-- `top_pr_number`
-- `top_head_sha`
-- `ci_all_success`
-- `merge_state_all_clean`
-- `unresolved_review_thread_count`
-- `active_p1_p2_count`
-- `stack_topology_status`
+- PR numbers and head SHAs for #36-#51
+- merge commit for each merged PR
+- `main_after_merge_commit`
+- `stack_merge_readiness_status`
+- `stack_closeout_status`
+- `merged_pr_count`
+- `merge_commit_count`
 - `artifact_boundary_status`
 - `claim_boundary_status`
-- `maturity_gate_status`
-- `direct_llm_boundary_status`
 - `provider_boundary_status`
-- `ci_boundary_preflight_status`
-- `ci_adoption_status`
-- `stack_merge_readiness_status`
-- `ready_for_user_merge_review`
 - `actual_30d_readiness_status=DATA_NOT_MATURED`
-- `auto_merge_executed=false`
+- `auto_merge_executed_by_worker=false`
 - `provider_or_backend_called=false`
 - `codex_cli_new_call=false`
 - `formal_lite_entered=false`
@@ -96,14 +58,16 @@ The summary must include:
 - `next_30d_check_after=2026-07-21T00:00:00Z`
 - `evidence_layer=engineering/local stack audit only`
 
+If a real blocker appears, the summary must include `blocker_reasons` and enough
+PR/base/head/path/thread detail to route a repair goal.
+
 ## Non-Claims
 
-This snapshot can say the stack is clean for user merge-review preparation if
-the live evidence supports that. The boundary statements are:
+The boundary statements are:
 
-- the 30D path is not ready
-- v3.7 is not allowed
-- no verdict is executed
+- not an auto-merge by this worker
+- not merge authorization for #52
+- not a 30D forward-live verdict
 - not science proof
 - not public proof
 - not trading advice

@@ -30,6 +30,7 @@ SCRIPT_VERSION = "v3.6ak-20260621"
 EVIDENCE_LAYER = "engineering/local stack audit only"
 
 STATUS_READY = "STACK_READY_FOR_USER_MERGE_REVIEW"
+STATUS_MERGED_TO_MAIN = "STACK_MERGED_TO_MAIN"
 STATUS_BLOCKED_CI = "STACK_BLOCKED_CI"
 STATUS_BLOCKED_REVIEW = "STACK_BLOCKED_REVIEW"
 STATUS_BLOCKED_TOPOLOGY = "STACK_BLOCKED_TOPOLOGY"
@@ -135,9 +136,65 @@ def provider_boundary_status(underlying: dict[str, Any]) -> str:
     return "blocked"
 
 
+def merge_commit_oid(pr: dict[str, Any]) -> str:
+    raw = pr.get("mergeCommit", pr.get("merge_commit", ""))
+    if isinstance(raw, dict):
+        return str(raw.get("oid") or raw.get("sha") or "")
+    return str(raw or "")
+
+
+def merged_at(pr: dict[str, Any]) -> str:
+    return str(pr.get("mergedAt") or pr.get("merged_at") or "")
+
+
+def source_pr_records(underlying: dict[str, Any]) -> list[dict[str, Any]]:
+    try:
+        source_snapshot = live_refresh.load_source_snapshot(underlying)
+        return live_refresh.pr_records(source_snapshot)
+    except (TypeError, ValueError, OSError, json.JSONDecodeError):
+        return []
+
+
+def merged_pr_records(underlying: dict[str, Any]) -> list[dict[str, Any]]:
+    prs = source_pr_records(underlying)
+    expected = [int(number) for number in underlying.get("pr_numbers", [])]
+    if not prs or not expected:
+        return []
+    by_number = {int(pr.get("number") or 0): pr for pr in prs}
+    merged: list[dict[str, Any]] = []
+    for number in expected:
+        pr = by_number.get(number)
+        if not pr:
+            return []
+        if str(pr.get("state") or "").upper() != "MERGED":
+            return []
+        if not merge_commit_oid(pr):
+            return []
+        merged.append(pr)
+    return merged
+
+
+def merged_stack_evidence(underlying: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "number": int(pr.get("number") or 0),
+            "title": str(pr.get("title") or ""),
+            "base": str(pr.get("baseRefName") or pr.get("base") or ""),
+            "head": str(pr.get("headRefName") or pr.get("head") or ""),
+            "head_sha": str(pr.get("headRefOid") or pr.get("head_sha") or ""),
+            "state": str(pr.get("state") or ""),
+            "merged_at": merged_at(pr),
+            "merge_commit": merge_commit_oid(pr),
+        }
+        for pr in merged_pr_records(underlying)
+    ]
+
+
 def stack_status_from_underlying(underlying: dict[str, Any]) -> str:
     if provider_boundary_status(underlying) != "clean":
         return STATUS_BLOCKED_PROVIDER_BOUNDARY
+    if merged_pr_records(underlying):
+        return STATUS_MERGED_TO_MAIN
     return UNDERLYING_STATUS_MAP.get(
         str(underlying.get("live_stack_refresh_status") or ""),
         STATUS_INCOMPLETE,
@@ -178,8 +235,15 @@ def base_summary(config: SnapshotConfig, *, run_root: Path) -> dict[str, Any]:
         "ci_adoption_status": "unknown",
         "underlying_live_stack_refresh_status": "unknown",
         "stack_merge_readiness_status": STATUS_INCOMPLETE,
+        "stack_closeout_status": "unknown",
+        "merged_pr_count": 0,
+        "merge_commit_count": 0,
+        "merged_prs": [],
+        "main_after_merge_commit": "",
+        "stack_already_merged_to_main": False,
         "ready_for_user_merge_review": False,
         "auto_merge_executed": False,
+        "auto_merge_executed_by_worker": False,
         "provider_or_backend_called": False,
         "codex_cli_new_call": False,
         "formal_lite_entered": False,
@@ -213,7 +277,11 @@ def build_summary(
     underlying: dict[str, Any],
 ) -> dict[str, Any]:
     status = stack_status_from_underlying(underlying)
+    merged_evidence = merged_stack_evidence(underlying)
     top_pr_number = int(underlying.get("top_pr_number") or 0)
+    main_after_merge_commit = ""
+    if merged_evidence:
+        main_after_merge_commit = str(merged_evidence[-1].get("merge_commit") or "")
     summary = base_summary(config, run_root=run_root)
     summary.update(
         {
@@ -241,19 +309,32 @@ def build_summary(
             "ci_adoption_status": underlying.get("ci_adoption_status", "unknown"),
             "underlying_live_stack_refresh_status": underlying.get("live_stack_refresh_status", ""),
             "stack_merge_readiness_status": status,
+            "stack_closeout_status": "merged_to_main" if status == STATUS_MERGED_TO_MAIN else "not_merged",
+            "merged_pr_count": len(merged_evidence),
+            "merge_commit_count": sum(1 for pr in merged_evidence if pr.get("merge_commit")),
+            "merged_prs": merged_evidence,
+            "main_after_merge_commit": main_after_merge_commit,
+            "stack_already_merged_to_main": status == STATUS_MERGED_TO_MAIN,
             "ready_for_user_merge_review": status == STATUS_READY,
             "provider_or_backend_called": bool(underlying.get("provider_or_backend_called", False)),
             "codex_cli_new_call": bool(underlying.get("codex_cli_new_call", False)),
             "formal_lite_entered": bool(underlying.get("formal_lite_entered", False)),
             "underlying_summary_path": underlying.get("summary_path", "")
             or str(Path(str(underlying.get("refresh_run_root", ""))) / "summary.json"),
-            "blocker_reasons": list(underlying.get("blocker_reasons", [])),
+            "blocker_reasons": []
+            if status == STATUS_MERGED_TO_MAIN
+            else list(underlying.get("blocker_reasons", [])),
             "warnings": list(underlying.get("warnings", [])),
         }
     )
     underlying_path = Path(str(summary["underlying_summary_path"]))
     if underlying_path.exists():
         summary["underlying_summary_sha256"] = sha256_file(underlying_path)
+    if status == STATUS_MERGED_TO_MAIN:
+        summary["stack_topology_status"] = "merged_to_main"
+        summary["maturity_gate_status"] = config.actual_30d_readiness_status
+        summary["ci_boundary_preflight_status"] = "post_merge_not_applicable"
+        summary["ci_adoption_status"] = "post_merge_not_applicable"
     return summary
 
 
@@ -290,11 +371,12 @@ def review_bundle_markdown(summary: dict[str, Any]) -> str:
         "# GOTRA v3.6AK Live Stack Merge-Readiness Snapshot",
         "",
         f"- Status: `{summary['stack_merge_readiness_status']}`",
+        f"- Closeout status: `{summary['stack_closeout_status']}`",
         (
             "- Ready for user merge review: "
             f"`{str(summary['ready_for_user_merge_review']).lower()}`"
         ),
-        "- Auto merge executed: `false`",
+        "- Auto merge executed by worker: `false`",
         f"- v3.7 allowed: `{str(summary['v3_7_allowed']).lower()}`",
         f"- Actual 30D readiness: `{summary['actual_30d_readiness_status']}`",
         f"- Evidence layer: `{summary['evidence_layer']}`",
@@ -313,12 +395,24 @@ def review_bundle_markdown(summary: dict[str, Any]) -> str:
         f"- Provider boundary: `{summary['provider_boundary_status']}`",
         f"- CI boundary preflight: `{summary['ci_boundary_preflight_status']}`",
         f"- CI adoption: `{summary['ci_adoption_status']}`",
+        f"- Merged PR count: `{summary['merged_pr_count']}`",
+        f"- Merge commit count: `{summary['merge_commit_count']}`",
+        f"- Main after merge commit: `{summary['main_after_merge_commit']}`",
         f"- Next 30D check after: `{summary['next_30d_check_after']}`",
         "",
         "## Expected Stack Order",
         "",
     ]
     lines.extend(f"- {entry}" for entry in summary.get("expected_stack_order", []))
+    if summary.get("merged_prs"):
+        lines.extend(["", "## Merged PR Evidence", ""])
+        lines.extend(
+            (
+                f"- #{pr['number']} `{pr['head']}` @ `{pr['head_sha']}` -> "
+                f"`{pr['merge_commit']}`"
+            )
+            for pr in summary["merged_prs"]
+        )
     if summary.get("blocker_reasons"):
         lines.extend(["", "## Blocking Reasons", ""])
         lines.extend(f"- `{reason}`" for reason in summary["blocker_reasons"])
@@ -326,8 +420,8 @@ def review_bundle_markdown(summary: dict[str, Any]) -> str:
         [
             "",
             "This snapshot is engineering/local stack audit evidence only. It is not",
-            "merge authorization, not auto-merge, not a 30D verdict, and not an",
-            "OOS/science/public/trading claim.",
+            "merge authorization, not a worker-executed auto-merge, not a 30D",
+            "verdict, and not an OOS/science/public/trading claim.",
             "",
         ]
     )
@@ -358,6 +452,7 @@ def write_outputs(*, run_root: Path, summary: dict[str, Any]) -> None:
         "codex_cli_new_call": False,
         "formal_lite_entered": False,
         "auto_merge_executed": False,
+        "auto_merge_executed_by_worker": False,
         "v3_7_allowed": False,
     }
     manifest_path.write_text(
@@ -411,7 +506,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 - CLI should fail closed.
         print(f"live stack merge-readiness snapshot failed: {exc}", file=sys.stderr)
         return 2
-    return 0 if summary.get("stack_merge_readiness_status") == STATUS_READY else 1
+    return 0 if summary.get("stack_merge_readiness_status") in {STATUS_READY, STATUS_MERGED_TO_MAIN} else 1
 
 
 if __name__ == "__main__":

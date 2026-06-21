@@ -39,6 +39,31 @@ def test_active_p2_blocks_user_merge_review(tmp_path: Path) -> None:
     assert summary["active_p1_p2_count"] == 1
 
 
+def test_merged_stack_36_to_51_is_closeout_not_merge_review(tmp_path: Path) -> None:
+    path = _write_snapshot(tmp_path, _merged_snapshot(), suffix="merged")
+
+    summary = snapshot.run_snapshot(_config(tmp_path, path, suffix="merged"))
+
+    assert summary["stack_merge_readiness_status"] == snapshot.STATUS_MERGED_TO_MAIN
+    assert summary["stack_closeout_status"] == "merged_to_main"
+    assert summary["stack_topology_status"] == "merged_to_main"
+    assert summary["maturity_gate_status"] == snapshot.ACTUAL_30D_READINESS_STATUS
+    assert summary["ci_boundary_preflight_status"] == "post_merge_not_applicable"
+    assert summary["ci_adoption_status"] == "post_merge_not_applicable"
+    assert summary["stack_already_merged_to_main"] is True
+    assert summary["ready_for_user_merge_review"] is False
+    assert summary["auto_merge_executed"] is False
+    assert summary["auto_merge_executed_by_worker"] is False
+    assert summary["merged_pr_count"] == 16
+    assert summary["merge_commit_count"] == 16
+    assert summary["main_after_merge_commit"] == "merge-51"
+    assert summary["merged_prs"][0]["number"] == 36
+    assert summary["merged_prs"][-1]["number"] == 51
+    assert summary["blocker_reasons"] == []
+    assert summary["actual_30d_readiness_status"] == snapshot.ACTUAL_30D_READINESS_STATUS
+    assert summary["v3_7_allowed"] is False
+
+
 def test_forbidden_artifact_path_blocks_snapshot(tmp_path: Path) -> None:
     payload = _clean_snapshot()
     payload["pull_requests"][0]["files"] = {"nodes": [{"path": "data/backtest/runs/raw.json"}]}
@@ -134,3 +159,15 @@ def _clean_snapshot() -> dict[str, object]:
             for number, title, base, head in branches
         ],
     }
+
+
+def _merged_snapshot() -> dict[str, object]:
+    payload = json.loads(json.dumps(_clean_snapshot()))
+    for pr in payload["pull_requests"]:
+        number = int(pr["number"])
+        pr["baseRefName"] = "main"
+        pr["state"] = "MERGED"
+        pr["mergeStateStatus"] = ""
+        pr["mergedAt"] = f"2026-06-21T12:{number - 6:02d}:00Z"
+        pr["mergeCommit"] = {"oid": f"merge-{number}"}
+    return payload
