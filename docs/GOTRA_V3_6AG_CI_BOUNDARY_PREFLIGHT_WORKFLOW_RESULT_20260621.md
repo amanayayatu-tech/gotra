@@ -33,7 +33,7 @@ Workflow changed: `.github/workflows/ci.yml`.
 
 The workflow now includes a pull-request-only step named
 `GOTRA changed-file boundary preflight`. The step fetches GitHub-provided base
-and head SHAs, then runs:
+and head SHAs after a full-history checkout, then runs:
 
 ```bash
 uv run python scripts/baseline_v3_6ag_ci_changed_files_preflight.py \
@@ -51,20 +51,20 @@ Command:
 
 ```bash
 uv run python scripts/baseline_v3_6ag_ci_changed_files_preflight.py \
-  --ci-adoption-run-id baseline_v3_6ag_ci_changed_files_preflight_20260621T101945Z \
-  --repo-root /tmp/gotra_v3_6ag_self_ci_sim_20260621T101945Z/repo \
-  --base-sha 22f779c43403e9394ef7c099a0bc0c99575ae7d9 \
+  --ci-adoption-run-id baseline_v3_6ag_ci_changed_files_preflight_pr48_final_20260621T110203Z \
+  --repo-root /Users/peachy/Documents/gotra \
+  --base-sha origin/codex/gotra-v3-6af-ci-stack-boundary-preflight-20260621 \
   --head-sha HEAD \
-  --output-root /tmp/gotra_v3_6ag_self_ci_sim_20260621T101945Z/runs
+  --output-root /tmp/gotra_v3_6ag_pr48_final_boundary_check_20260621T110203Z/runs
 ```
 
 Output, not committed:
 
-`/tmp/gotra_v3_6ag_self_ci_sim_20260621T101945Z/runs/baseline_v3_6ag_ci_changed_files_preflight_20260621T101945Z/summary.json`
+`/tmp/gotra_v3_6ag_pr48_final_boundary_check_20260621T110203Z/runs/baseline_v3_6ag_ci_changed_files_preflight_pr48_final_20260621T110203Z/summary.json`
 
 Summary sha256:
 
-`10bdfa95932e74b6e36dc7164491a0deace0d6f5a6037e281fcf679236fe6342`
+`a21254022af39cdf91964eb21443f9a42e7df03c116fdad3ebcd12baa51dd6e4`
 
 Result:
 
@@ -75,13 +75,9 @@ Result:
 - Skipped gitlink count: `0`
 - Skipped non-file count: `0`
 - Manifest path:
-  `/tmp/gotra_v3_6ag_self_ci_sim_20260621T101945Z/runs/baseline_v3_6ag_ci_changed_files_preflight_20260621T101945Z/changed_files_manifest.json`
-- Manifest sha256:
-  `f64d301bcd0e3fbe1664db4b04c11b0592906092e87d5103fca5a7d4b1c261e0`
+  `/tmp/gotra_v3_6ag_pr48_final_boundary_check_20260621T110203Z/runs/baseline_v3_6ag_ci_changed_files_preflight_pr48_final_20260621T110203Z/changed_files_manifest.json`
 - Preflight summary path:
-  `/tmp/gotra_v3_6ag_self_ci_sim_20260621T101945Z/runs/baseline_v3_6ag_ci_changed_files_preflight_20260621T101945Z/preflight_runs/baseline_v3_6af_ci_stack_boundary_preflight_v3_6ag_20260621T101945Z/summary.json`
-- Preflight summary sha256:
-  `3087f7da091f2d59c04e3bdcee9d62da9ababfbc70e27bf7bdc089879ac16442`
+  `/tmp/gotra_v3_6ag_pr48_final_boundary_check_20260621T110203Z/runs/baseline_v3_6ag_ci_changed_files_preflight_pr48_final_20260621T110203Z/preflight_runs/baseline_v3_6af_ci_stack_boundary_preflight_v3_6ag_pr48_final_20260621T110203Z/summary.json`
 - Preflight status: `CI_STACK_BOUNDARY_PREFLIGHT_CLEAN`
 - Artifact boundary status: `clean`
 - Claim boundary status: `clean`
@@ -112,21 +108,37 @@ Result:
 
 - py_compile: pass
 - Ruff: pass
-- Focused v3.6AB/v3.6AG tests: `33 passed`
-- Focused v3.6AG tests: `12 passed`
-- v3.6AF/v3.6AG regression tests: `27 passed`
-- v3.6AE/v3.6AF/v3.6AG regression tests: `42 passed`
+- Focused v3.6AB/v3.6AG tests: `39 passed`
+- v3.6AE/v3.6AF/v3.6AG plus scanner regression tests: `69 passed`
 - v3.6AA/v3.6AB/v3.6AE/v3.6AF/v3.6AG regression tests:
-  `77 passed`
-- Full test suite: `541 passed`
+  covered by the focused and full-suite runs above
+- Full test suite: `547 passed`
+
+## Review Hardening
+
+This repair covers the active PR #48 P2 review items:
+
+- changed-file detection now diffs from the PR merge base to `head`, avoiding
+  base-tip-only files and false deletions when the PR branch is behind base
+- symlink entries with git mode `120000` are skipped before any target content
+  can be followed or scanned
+- direct-arm technical field names are field-scoped; a same-line unlabelled
+  direct-arm claim is still blocked unless it uses
+  `direct_llm_parametric_memory_control`
+- tracked `.env.example` placeholder templates are allowed as paths, while real
+  `.env*` paths and secret-like values remain blocked
 
 ## Covered Behavior
 
 - clean changed-file fixture -> `CI_PREFLIGHT_WIRED` with v3.6AF clean status
 - helper scans only changed tracked files, not historical docs
+- helper uses merge-base-to-head PR delta, not base-tip-to-head diff
 - deleted changed files are skipped
 - gitlink changed files are skipped
-- directory/non-file changed entries are skipped
+- symlink, directory, and non-file changed entries are skipped
+- `.env.example` placeholder templates are allowed
+- `.env.example` with secret-like values is blocked
+- real `.env` files remain blocked
 - changed forbidden artifact path -> blocked non-zero
 - changed OOS/public/science/trading overclaim -> blocked
 - changed v3.7 / 30D verdict wording -> maturity gate blocked

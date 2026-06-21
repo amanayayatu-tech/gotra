@@ -30,11 +30,14 @@ failures.
 
 The v3.6AG helper must:
 
-- compute changed tracked files from `base..head`
+- compute changed tracked files from the PR merge base to `head`, not from
+  `base` tip to `head`
 - skip deleted files
-- skip gitlinks, directories, and non-regular files
+- skip gitlinks, symlinks, directories, and non-regular files
 - avoid scanning historical tracked docs that are not changed
 - avoid reading forbidden artifact contents
+- allow tracked `.env.example` placeholder templates while still blocking real
+  `.env*` files and secret-like values
 - scan documentation/workflow text for claim boundaries while keeping Python
   tests and scripts as path-boundary entries, so negative test fixtures do not
   become release claims

@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,13 @@ STATUS_BLOCKED_UNSAFE = "BLOCKED_CI_CONFIG_UNSAFE"
 
 EVIDENCE_LAYER = "engineering_ci_boundary_preflight_adoption"
 TEXT_SCAN_SUFFIXES = {".md", ".markdown", ".rst", ".txt", ".yaml", ".yml"}
+SYMLINK_MODE = "120000"
+GITLINK_MODE = "160000"
+ENV_EXAMPLE_PATH = ".env.example"
+SECRET_LIKE_PATTERNS = (
+    ("openai_key", r"sk-[A-Za-z0-9_-]{20,}"),
+    ("generic_secret_assignment", r"(?i)\b(api[_-]?key|secret|token|password)\s*=\s*['\"]?[A-Za-z0-9_./+=-]{16,}"),
+)
 
 
 @dataclass(frozen=True)
@@ -99,7 +107,11 @@ def resolve_ref(config: AdoptionConfig, *, sha: str, ref: str, fallback: str) ->
 def changed_files(config: AdoptionConfig) -> list[ChangedFile]:
     base = resolve_ref(config, sha=config.base_sha, ref=config.base_ref, fallback="HEAD~1")
     head = resolve_ref(config, sha=config.head_sha, ref=config.head_ref, fallback="HEAD")
-    output = git_output(config.repo_root, ["diff", "--name-status", "--no-renames", "-z", base, head, "--"])
+    merge_base = git_output(config.repo_root, ["merge-base", base, head]).strip()
+    output = git_output(
+        config.repo_root,
+        ["diff", "--name-status", "--no-renames", "-z", merge_base, head, "--"],
+    )
     tokens = [token for token in output.split("\0") if token]
     files: list[ChangedFile] = []
     index = 0
@@ -120,11 +132,21 @@ def git_mode(repo_root: Path, path: str) -> str:
     return output.split(" ", 1)[0]
 
 
+def is_env_example(relative_path: str) -> bool:
+    return relative_path.replace("\\", "/") == ENV_EXAMPLE_PATH
+
+
+def has_secret_like_value(text: str) -> bool:
+    return any(re.search(pattern, text) for _, pattern in SECRET_LIKE_PATTERNS)
+
+
 def safe_read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
 def should_scan_text(relative_path: str) -> bool:
+    if is_env_example(relative_path):
+        return True
     path = Path(relative_path)
     if path.parts and path.parts[0] == "tests":
         return False
@@ -133,36 +155,45 @@ def should_scan_text(relative_path: str) -> bool:
     return False
 
 
-def manifest_entries(config: AdoptionConfig, changes: list[ChangedFile]) -> tuple[list[dict[str, Any]], dict[str, int]]:
+def manifest_entries(config: AdoptionConfig, changes: list[ChangedFile]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     entries: list[dict[str, Any]] = []
-    counts = {
+    counts: dict[str, Any] = {
         "skipped_deleted_count": 0,
         "skipped_gitlink_count": 0,
         "skipped_non_file_count": 0,
+        "local_blocker_reasons": [],
     }
     for change in changes:
         if change.status.startswith("D"):
             counts["skipped_deleted_count"] += 1
             continue
         mode = git_mode(config.repo_root, change.path)
-        if mode == "160000":
+        if mode == GITLINK_MODE:
             counts["skipped_gitlink_count"] += 1
             continue
-        full_path = config.repo_root / change.path
-        if not full_path.is_file():
+        if mode == SYMLINK_MODE:
             counts["skipped_non_file_count"] += 1
             continue
-        if claim_scan.forbidden_path(change.path):
+        full_path = config.repo_root / change.path
+        if not full_path.is_file() or full_path.is_symlink():
+            counts["skipped_non_file_count"] += 1
+            continue
+        if claim_scan.forbidden_path(change.path) and not is_env_example(change.path):
             entries.append({"path": change.path, "status": change.status})
             continue
         if not should_scan_text(change.path):
             entries.append({"path": change.path, "status": change.status})
             continue
+        text = safe_read_text(full_path)
+        if is_env_example(change.path) and has_secret_like_value(text):
+            counts["local_blocker_reasons"].append(
+                f"artifact_boundary:{change.path}:secret_like_value",
+            )
         entries.append(
             {
                 "path": change.path,
                 "status": change.status,
-                "text": safe_read_text(full_path),
+                "text": text,
             }
         )
     return entries, counts
@@ -306,6 +337,12 @@ def run_adoption(config: AdoptionConfig) -> dict[str, Any]:
         )
 
     preflight_summary_path = Path(str(preflight_summary.get("preflight_run_root", ""))) / "summary.json"
+    local_blocker_reasons = list(counts.get("local_blocker_reasons", []))
+    preflight_status = preflight_summary.get("preflight_status", preflight.STATUS_FAIL)
+    artifact_boundary_status = preflight_summary.get("artifact_boundary_status", "clean")
+    if local_blocker_reasons:
+        preflight_status = preflight.STATUS_BLOCKED_ARTIFACT
+        artifact_boundary_status = "blocked"
     summary = base_summary(config, run_root=run_root)
     summary.update(
         {
@@ -320,12 +357,13 @@ def run_adoption(config: AdoptionConfig) -> dict[str, Any]:
             "preflight_summary_sha256": sha256_file(preflight_summary_path)
             if preflight_summary_path.exists()
             else "",
-            "preflight_status": preflight_summary.get("preflight_status", preflight.STATUS_FAIL),
-            "artifact_boundary_status": preflight_summary.get("artifact_boundary_status", "clean"),
+            "preflight_status": preflight_status,
+            "artifact_boundary_status": artifact_boundary_status,
             "claim_boundary_status": preflight_summary.get("claim_boundary_status", "clean"),
             "maturity_gate_status": preflight_summary.get("maturity_gate_status", "clean"),
             "direct_llm_boundary_status": preflight_summary.get("direct_llm_boundary_status", "clean"),
-            "blocker_reasons": list(preflight_summary.get("blocker_reasons", [])),
+            "blocker_reasons": list(preflight_summary.get("blocker_reasons", []))
+            + local_blocker_reasons,
         }
     )
     write_outputs(run_root=run_root, summary=summary)

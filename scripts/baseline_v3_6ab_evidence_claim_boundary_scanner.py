@@ -34,6 +34,7 @@ DIRECT_LLM_TECHNICAL_FIELDS = (
     "direct_llm_interpretation",
     "direct_llm_mislabel_count",
 )
+ALLOWED_ENV_TEMPLATE_PATHS = {".env.example"}
 
 FORBIDDEN_PATH_PATTERNS = (
     r"(^|/)data/backtest/runs/",
@@ -172,6 +173,8 @@ def normalize_scan_path(path: Path | str) -> str:
 
 def forbidden_path(path: str) -> bool:
     normalized = normalize_scan_path(path)
+    if normalized in ALLOWED_ENV_TEMPLATE_PATHS:
+        return False
     return any(re.search(pattern, normalized) for pattern in FORBIDDEN_PATH_PATTERNS)
 
 
@@ -289,21 +292,36 @@ def direct_llm_clean_baseline_is_negated(line: str) -> bool:
 
 
 def direct_llm_clean_baseline_is_guard_description(line: str) -> bool:
-    return bool(
-        re.search(
-            r"\bdirect_llm(?:_parametric_memory_control)?\b"
-            r".{0,80}\b(blocks?|blocked|blocking|rejects?|rejected|rejecting|"
-            r"prevents?|prevented|preventing|guards?\s+against)\b"
-            r".{0,80}\bclean\s+no[- ]future\s+baseline\b",
-            line,
+    for clause in re.split(r"[.;\n]", line):
+        if not re.search(r"\bdirect_llm(?:_parametric_memory_control)?\b", clause, re.IGNORECASE):
+            continue
+        verb = re.search(
+            r"\b(blocks?|blocked|blocking|rejects?|rejected|rejecting|"
+            r"prevents?|prevented|preventing|guards?\s+against)\b",
+            clause,
             re.IGNORECASE,
         )
-    )
+        if not verb:
+            continue
+        tail = clause[verb.end() :]
+        if re.search(r"\band\s+(?:it\s+)?is\s+(?:a\s+)?clean\s+no[- ]future\s+baseline\b", tail, re.IGNORECASE):
+            continue
+        if re.search(
+            r"\b(?:clean\s+no[- ]future\s+baseline|"
+            r"direct_llm(?:_parametric_memory_control)?\s+(?:as|being|is)\s+(?:a\s+)?clean\s+no[- ]future\s+baseline)\b"
+            r"(?:\s+(?:wording|claim|phrase|misuse|statement|classification|interpretation|label(?:ing)?|assertion))?",
+            tail,
+            re.IGNORECASE,
+        ):
+            return True
+    return False
 
 
-def direct_llm_line_is_technical_field(line: str) -> bool:
-    lowered = line.lower()
-    return any(field in lowered for field in DIRECT_LLM_TECHNICAL_FIELDS)
+def line_without_direct_llm_technical_fields(line: str) -> str:
+    remaining = line
+    for field in DIRECT_LLM_TECHNICAL_FIELDS:
+        remaining = re.sub(rf"`?\b{re.escape(field)}\b`?", "", remaining, flags=re.IGNORECASE)
+    return remaining
 
 
 def line_allows_boundary(line: str) -> bool:
@@ -344,6 +362,7 @@ def scan_line(
     line_number: int,
     result: dict[str, list[dict[str, Any]]],
 ) -> None:
+    direct_llm_line = line_without_direct_llm_technical_fields(line)
     for rule_id, pattern in OVERCLAIM_PATTERNS:
         for match in pattern.finditer(line):
             if is_negated(line, match.start()):
@@ -357,9 +376,8 @@ def scan_line(
                 )
             )
     if (
-        "direct_llm" in line
-        and DIRECT_LLM_INTERPRETATION not in line
-        and not direct_llm_line_is_technical_field(line)
+        "direct_llm" in direct_llm_line
+        and DIRECT_LLM_INTERPRETATION not in direct_llm_line
     ):
         result["direct_llm"].append(
             make_blocked_item(
@@ -370,9 +388,9 @@ def scan_line(
             )
         )
     if (
-        re.search(r"direct_llm.{0,80}clean\s+no[- ]future\s+baseline", line, re.IGNORECASE)
-        and not direct_llm_clean_baseline_is_negated(line)
-        and not direct_llm_clean_baseline_is_guard_description(line)
+        re.search(r"direct_llm.{0,80}clean\s+no[- ]future\s+baseline", direct_llm_line, re.IGNORECASE)
+        and not direct_llm_clean_baseline_is_negated(direct_llm_line)
+        and not direct_llm_clean_baseline_is_guard_description(direct_llm_line)
     ):
         result["direct_llm"].append(
             make_blocked_item(

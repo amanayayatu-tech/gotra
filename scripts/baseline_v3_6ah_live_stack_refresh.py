@@ -34,6 +34,7 @@ STATUS_READY = "LIVE_STACK_REFRESH_READY"
 STATUS_BLOCKED_CI = "BLOCKED_CI"
 STATUS_BLOCKED_REVIEW = "BLOCKED_REVIEW"
 STATUS_BLOCKED_TOPOLOGY = "BLOCKED_TOPOLOGY"
+STATUS_BLOCKED_CONFLICT = "BLOCKED_CONFLICT"
 STATUS_BLOCKED_ARTIFACT = "BLOCKED_ARTIFACT"
 STATUS_BLOCKED_CLAIM_BOUNDARY = "BLOCKED_CLAIM_BOUNDARY"
 STATUS_BLOCKED_MATURITY_GATE = "BLOCKED_MATURITY_GATE"
@@ -49,6 +50,17 @@ DIRECT_LLM_INTERPRETATION = live_snapshot.DIRECT_LLM_INTERPRETATION
 
 CI_PREFLIGHT_CLEAN_STATUSES = {ci_preflight.STATUS_CLEAN}
 CI_ADOPTION_CLEAN_STATUSES = {ci_adoption.STATUS_WIRED}
+MATURITY_CLAIM_RULE_IDS = {
+    "v3_7_allowed_true",
+    "v3_7_verdict_allowed",
+    "v3_7_plain_allowed",
+    "thirty_day_forward_live_verdict",
+    "short_horizon_as_30d_verdict",
+}
+DIRECT_LLM_CLAIM_RULE_IDS = {
+    "direct_llm_without_parametric_memory_control",
+    "direct_llm_clean_no_future_baseline",
+}
 
 
 @dataclass(frozen=True)
@@ -205,19 +217,28 @@ def status_from_snapshot(
     if snapshot_status == live_snapshot.STATUS_BLOCKED_ARTIFACT:
         return STATUS_BLOCKED_ARTIFACT
     if snapshot_status == live_snapshot.STATUS_BLOCKED_CONFLICT:
-        return STATUS_BLOCKED_TOPOLOGY
+        return STATUS_BLOCKED_CONFLICT
     if snapshot_status == live_snapshot.STATUS_INCOMPLETE:
         return STATUS_INCOMPLETE
     if any(is_maturity_reason(reason) for reason in snapshot_reasons):
         return STATUS_BLOCKED_MATURITY_GATE
-    if any("direct_llm" in reason for reason in snapshot_reasons):
+    if any(is_direct_llm_reason(reason) for reason in snapshot_reasons):
         return STATUS_BLOCKED_DIRECT_LLM
     if snapshot_status == live_snapshot.STATUS_BLOCKED_CLAIM_BOUNDARY:
         return STATUS_BLOCKED_CLAIM_BOUNDARY
     return STATUS_INCOMPLETE
 
 
+def claim_boundary_rule_id(reason: str) -> str:
+    if not reason.startswith("claim_boundary:"):
+        return ""
+    return reason.rsplit(":", 1)[-1]
+
+
 def is_maturity_reason(reason: str) -> bool:
+    rule_id = claim_boundary_rule_id(reason)
+    if rule_id:
+        return rule_id in MATURITY_CLAIM_RULE_IDS
     lowered = reason.lower()
     return any(
         token in lowered
@@ -225,17 +246,24 @@ def is_maturity_reason(reason: str) -> bool:
     )
 
 
+def is_direct_llm_reason(reason: str) -> bool:
+    rule_id = claim_boundary_rule_id(reason)
+    if rule_id:
+        return rule_id in DIRECT_LLM_CLAIM_RULE_IDS
+    return "direct_llm" in reason.lower()
+
+
 def split_boundary_status(summary: dict[str, Any], blocker_reasons: list[str]) -> tuple[str, str, str]:
     claim_status = str(summary.get("claim_boundary_status") or "clean")
     maturity_status = "blocked" if any(is_maturity_reason(reason) for reason in blocker_reasons) else "clean"
-    direct_status = "blocked" if any("direct_llm" in reason for reason in blocker_reasons) else "clean"
+    direct_status = "blocked" if any(is_direct_llm_reason(reason) for reason in blocker_reasons) else "clean"
     if maturity_status == "blocked" or direct_status == "blocked":
         claim_only = [
             reason
             for reason in blocker_reasons
             if reason.startswith("claim_boundary:")
             and not is_maturity_reason(reason)
-            and "direct_llm" not in reason
+            and not is_direct_llm_reason(reason)
         ]
         claim_status = "blocked" if claim_only else "clean"
     return claim_status, maturity_status, direct_status

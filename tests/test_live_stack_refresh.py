@@ -93,6 +93,18 @@ def test_topology_base_chain_break_blocks_refresh(tmp_path: Path) -> None:
     assert any("root_base_mismatch" in reason for reason in summary["blocker_reasons"])
 
 
+def test_dirty_merge_state_blocks_as_conflict_not_topology(tmp_path: Path) -> None:
+    payload = _clean_snapshot()
+    payload["pull_requests"][3]["mergeStateStatus"] = "DIRTY"
+    path = _write_snapshot(tmp_path, payload)
+
+    summary = refresh.run_refresh(_config(tmp_path, path))
+
+    assert summary["live_stack_refresh_status"] == refresh.STATUS_BLOCKED_CONFLICT
+    assert summary["stack_topology_status"] == "clean"
+    assert summary["ready_for_human_merge_review"] is False
+
+
 def test_forbidden_changed_path_blocks_refresh(tmp_path: Path) -> None:
     payload = _clean_snapshot()
     payload["pull_requests"][0]["files"] = {
@@ -137,6 +149,68 @@ def test_unmarked_direct_llm_clean_baseline_blocks_direct_boundary(tmp_path: Pat
 
     assert summary["live_stack_refresh_status"] == refresh.STATUS_BLOCKED_DIRECT_LLM
     assert summary["direct_llm_boundary_status"] == "blocked"
+
+
+def test_claim_path_direct_llm_substring_does_not_change_rule_classification() -> None:
+    reasons = ["claim_boundary:docs/direct_llm_notes.md:1:oos_science_public_trading_claim"]
+
+    claim_status, maturity_status, direct_status = refresh.split_boundary_status(
+        {"claim_boundary_status": "blocked"},
+        reasons,
+    )
+
+    assert refresh.status_from_snapshot(
+        snapshot_status=refresh.live_snapshot.STATUS_BLOCKED_CLAIM_BOUNDARY,
+        snapshot_reasons=reasons,
+        ci_preflight_reasons=[],
+    ) == refresh.STATUS_BLOCKED_CLAIM_BOUNDARY
+    assert claim_status == "blocked"
+    assert maturity_status == "clean"
+    assert direct_status == "clean"
+
+
+def test_claim_path_maturity_substring_does_not_change_rule_classification() -> None:
+    reasons = ["claim_boundary:docs/v3_7_notes.md:1:oos_science_public_trading_claim"]
+
+    claim_status, maturity_status, direct_status = refresh.split_boundary_status(
+        {"claim_boundary_status": "blocked"},
+        reasons,
+    )
+
+    assert refresh.status_from_snapshot(
+        snapshot_status=refresh.live_snapshot.STATUS_BLOCKED_CLAIM_BOUNDARY,
+        snapshot_reasons=reasons,
+        ci_preflight_reasons=[],
+    ) == refresh.STATUS_BLOCKED_CLAIM_BOUNDARY
+    assert claim_status == "blocked"
+    assert maturity_status == "clean"
+    assert direct_status == "clean"
+
+
+def test_claim_rule_ids_drive_maturity_and_direct_classification() -> None:
+    maturity_reasons = ["claim_boundary:docs/notes.md:1:v3_7_plain_allowed"]
+    direct_reasons = ["claim_boundary:docs/notes.md:1:direct_llm_clean_no_future_baseline"]
+
+    assert refresh.status_from_snapshot(
+        snapshot_status=refresh.live_snapshot.STATUS_BLOCKED_CLAIM_BOUNDARY,
+        snapshot_reasons=maturity_reasons,
+        ci_preflight_reasons=[],
+    ) == refresh.STATUS_BLOCKED_MATURITY_GATE
+    assert refresh.split_boundary_status({"claim_boundary_status": "blocked"}, maturity_reasons) == (
+        "clean",
+        "blocked",
+        "clean",
+    )
+    assert refresh.status_from_snapshot(
+        snapshot_status=refresh.live_snapshot.STATUS_BLOCKED_CLAIM_BOUNDARY,
+        snapshot_reasons=direct_reasons,
+        ci_preflight_reasons=[],
+    ) == refresh.STATUS_BLOCKED_DIRECT_LLM
+    assert refresh.split_boundary_status({"claim_boundary_status": "blocked"}, direct_reasons) == (
+        "clean",
+        "clean",
+        "blocked",
+    )
 
 
 def test_ci_preflight_or_adoption_blocked_fixture_blocks_refresh(tmp_path: Path) -> None:

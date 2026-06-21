@@ -145,6 +145,27 @@ def test_direct_llm_guard_description_is_allowed(tmp_path: Path) -> None:
     assert summary["direct_llm_mislabel_count"] == 0
 
 
+def test_direct_llm_guard_description_must_target_clean_baseline_claim(tmp_path: Path) -> None:
+    manifest = _write_manifest(
+        tmp_path,
+        [
+            {
+                "path": "docs/guard_bad.md",
+                "text": (
+                    "direct_llm_parametric_memory_control blocks unrelated checks "
+                    "and is a clean no-future baseline."
+                ),
+            }
+        ],
+    )
+
+    summary = scanner.run_scan(_config(tmp_path, manifest))
+
+    assert summary["overall_status"] == scanner.STATUS_BLOCKED_DIRECT_LLM
+    assert summary["direct_llm_mislabel_count"] >= 1
+    assert any(item["rule_id"] == "direct_llm_clean_no_future_baseline" for item in summary["blocked_items"])
+
+
 def test_direct_llm_parametric_memory_control_is_allowed(tmp_path: Path) -> None:
     manifest = _write_manifest(
         tmp_path,
@@ -167,6 +188,18 @@ def test_direct_llm_boundary_status_field_is_allowed(tmp_path: Path) -> None:
 
     assert summary["overall_status"] == scanner.STATUS_CLEAN
     assert summary["direct_llm_mislabel_count"] == 0
+
+
+def test_direct_llm_technical_field_does_not_exempt_same_line_claim(tmp_path: Path) -> None:
+    manifest = _write_manifest(
+        tmp_path,
+        [{"path": "docs/fields_bad.md", "text": "direct_llm_boundary_status: direct_llm verdict accepted"}],
+    )
+
+    summary = scanner.run_scan(_config(tmp_path, manifest))
+
+    assert summary["overall_status"] == scanner.STATUS_BLOCKED_DIRECT_LLM
+    assert summary["direct_llm_mislabel_count"] >= 1
 
 
 def test_short_horizon_canary_as_30d_verdict_blocks_maturity_gate(tmp_path: Path) -> None:
