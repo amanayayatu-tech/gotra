@@ -31,22 +31,22 @@ Command:
 
 ```bash
 uv run python scripts/baseline_v3_6ac_stack_merge_readiness_packet.py \
-  --packet-run-id baseline_v3_6ac_stack_merge_readiness_packet_fixture_20260621T073346Z \
-  --snapshot /tmp/gotra_v3_6ac_stack_merge_readiness_packet_20260621T073346Z/stack_merge_snapshot.json \
-  --output-dir /tmp/gotra_v3_6ac_stack_merge_readiness_packet_20260621T073346Z/runs
+  --packet-run-id baseline_v3_6ac_stack_merge_readiness_packet_reviewfix_20260621T074736Z \
+  --snapshot /tmp/gotra_v3_6ac_stack_merge_readiness_packet_reviewfix_20260621T074736Z/stack_merge_snapshot.json \
+  --output-dir /tmp/gotra_v3_6ac_stack_merge_readiness_packet_reviewfix_20260621T074736Z/runs
 ```
 
 Output, not committed:
 
-`/tmp/gotra_v3_6ac_stack_merge_readiness_packet_20260621T073346Z/runs/baseline_v3_6ac_stack_merge_readiness_packet_fixture_20260621T073346Z/summary.json`
+`/tmp/gotra_v3_6ac_stack_merge_readiness_packet_reviewfix_20260621T074736Z/runs/baseline_v3_6ac_stack_merge_readiness_packet_reviewfix_20260621T074736Z/summary.json`
 
 Human packet output, not committed:
 
-`/tmp/gotra_v3_6ac_stack_merge_readiness_packet_20260621T073346Z/runs/baseline_v3_6ac_stack_merge_readiness_packet_fixture_20260621T073346Z/packet.md`
+`/tmp/gotra_v3_6ac_stack_merge_readiness_packet_reviewfix_20260621T074736Z/runs/baseline_v3_6ac_stack_merge_readiness_packet_reviewfix_20260621T074736Z/packet.md`
 
 Summary sha256:
 
-`5da389fecfe73008ddd32e3046d3579d95b85ca22ff89743c4baaa8533d5932b`
+`83e6ccf30763b178e9055310d05e7806c18858d29a8910ea977b8ca42f93c634`
 
 Result:
 
@@ -90,9 +90,9 @@ Result:
 
 - py_compile: pass
 - Ruff: pass
-- Focused tests: `11 passed`
-- v3.6AA/v3.6AB/v3.6AC regression tests: `45 passed`
-- Full test suite: `465 passed`
+- Focused tests: `15 passed`
+- v3.6AA/v3.6AB/v3.6AC regression tests: `49 passed`
+- Full test suite: `469 passed`
 - `git diff --check`: pass
 
 Covered behavior:
@@ -102,9 +102,13 @@ Covered behavior:
 - CI pending/failure -> `BLOCKED_CI`
 - active P2 -> `BLOCKED_REVIEW`
 - topology break -> `BLOCKED_TOPOLOGY`
+- draft PR -> `BLOCKED_TOPOLOGY`
 - forbidden artifact path -> `BLOCKED_ARTIFACT`
 - claim-boundary overclaim -> `BLOCKED_CLAIM_BOUNDARY`
 - conflict fixture -> `BLOCKED_CONFLICT`
+- dirty `mergeStateStatus` -> `BLOCKED_CONFLICT`
+- local merge-tree delete/modify output -> conflict detected
+- GitHub GraphQL `statusCheckRollup.contexts.nodes` -> flattened CI success
 - unknown conflict -> `UNKNOWN_REQUIRES_HUMAN` and not ready
 - 30D `DATA_NOT_MATURED` is a boundary note, not a human engineering merge blocker
 - no provider, no new Codex CLI call, no formal-lite

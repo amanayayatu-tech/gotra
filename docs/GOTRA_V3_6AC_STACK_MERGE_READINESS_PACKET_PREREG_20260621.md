@@ -46,6 +46,14 @@ The packet blocks human merge-readiness when any of these are present:
 Open/unmerged PRs are expected in this stacked workflow and are not blockers by
 themselves.
 
+Draft PRs are not merge-ready and block as `BLOCKED_TOPOLOGY`. Non-`CLEAN`
+`mergeStateStatus` values are treated as conflict blockers even when no separate
+`conflict_status` field is present. GitHub GraphQL check-rollup connections
+under `statusCheckRollup.contexts.nodes` are normalized before CI evaluation.
+Local `git merge-tree` dry-run output is considered conflicting if it contains
+standard conflict markers, `changed in both`, or delete/modify signals such as
+`removed in local` / `removed in remote`.
+
 ## Summary Contract
 
 The summary includes at least:

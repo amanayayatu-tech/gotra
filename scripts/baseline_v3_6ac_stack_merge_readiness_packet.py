@@ -93,6 +93,39 @@ def status_from_failures(clean_label: str, failures: list[str]) -> str:
     return clean_label if not failures else "blocked"
 
 
+def flattened_status_checks(raw: Any) -> list[dict[str, Any]]:
+    if isinstance(raw, list):
+        return [entry for entry in raw if isinstance(entry, dict)]
+    if not isinstance(raw, dict):
+        return []
+    contexts = raw.get("contexts", raw.get("nodes", []))
+    if isinstance(contexts, dict):
+        contexts = contexts.get("nodes", [])
+    if not isinstance(contexts, list):
+        return []
+    return [entry for entry in contexts if isinstance(entry, dict)]
+
+
+def normalize_pr_for_packet(pr: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(pr)
+    normalized["statusCheckRollup"] = flattened_status_checks(
+        pr.get("statusCheckRollup", pr.get("checks", []))
+    )
+    return normalized
+
+
+def normalize_prs_for_packet(prs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [normalize_pr_for_packet(pr) for pr in prs]
+
+
+def check_draft_prs(prs: list[dict[str, Any]]) -> list[str]:
+    return [
+        f"stack_topology:draft_pr:pr_{stack_audit.pr_number(pr)}"
+        for pr in prs
+        if bool(pr.get("isDraft", pr.get("is_draft", False)))
+    ]
+
+
 def claim_boundary_scan(snapshot: dict[str, Any], prs: list[dict[str, Any]]) -> tuple[str, list[str], int]:
     docs = stack_audit.evidence_documents(snapshot, prs)
     sources = [
@@ -123,7 +156,9 @@ def snapshot_conflict_status(snapshot: dict[str, Any], prs: list[dict[str, Any]]
         or snapshot.get("conflict_status")
         or ""
     ).upper()
-    reasons: list[str] = []
+    reasons = merge_state_conflict_reasons(prs)
+    if reasons:
+        return CONFLICT_BLOCKED, reasons
     if raw_status:
         if raw_status in {"CLEAN", "NO_CONFLICT", "PASS"}:
             return CONFLICT_CLEAN, []
@@ -143,6 +178,32 @@ def snapshot_conflict_status(snapshot: dict[str, Any], prs: list[dict[str, Any]]
     if reasons:
         return CONFLICT_BLOCKED, reasons
     return CONFLICT_CLEAN, []
+
+
+def merge_state_conflict_reasons(prs: list[dict[str, Any]]) -> list[str]:
+    reasons: list[str] = []
+    for pr in prs:
+        status = str(pr.get("mergeStateStatus") or pr.get("merge_state_status") or "").upper()
+        if status and status != "CLEAN":
+            reasons.append(
+                "conflict_dry_run:"
+                f"pr_{stack_audit.pr_number(pr)}:merge_state_status:{status.lower()}"
+            )
+    return reasons
+
+
+def merge_tree_output_has_conflict(output: str) -> bool:
+    lowered = output.lower()
+    conflict_markers = (
+        "<<<<<<<",
+        "changed in both",
+        "removed in local",
+        "removed in remote",
+        "deleted in local",
+        "deleted in remote",
+        "added in both",
+    )
+    return any(marker in lowered for marker in conflict_markers)
 
 
 def local_conflict_dry_run(config: PacketConfig) -> tuple[str, list[str]]:
@@ -167,7 +228,7 @@ def local_conflict_dry_run(config: PacketConfig) -> tuple[str, list[str]]:
         except subprocess.CalledProcessError as exc:
             reasons.append(f"conflict_dry_run:unknown:{previous}->{current}:{exc.returncode}")
             continue
-        if "<<<<<<<" in tree.stdout or "changed in both" in tree.stdout.lower():
+        if merge_tree_output_has_conflict(tree.stdout):
             reasons.append(f"conflict_dry_run:conflict:{previous}->{current}")
     if any(reason.startswith("conflict_dry_run:conflict") for reason in reasons):
         return CONFLICT_BLOCKED, reasons
@@ -297,11 +358,15 @@ def build_packet(config: PacketConfig) -> dict[str, Any]:
 
     snapshot = load_snapshot(config.snapshot)
     snapshot_sha = sha256_file(config.snapshot)
-    prs = stack_audit.pr_list(snapshot)
+    prs = normalize_prs_for_packet(stack_audit.pr_list(snapshot))
     topology_status, topology_failures = stack_audit.check_stack_topology(
         prs,
         expected_root_base=config.expected_root_base,
     )
+    draft_failures = check_draft_prs(prs)
+    if draft_failures:
+        topology_status = "blocked"
+        topology_failures.extend(draft_failures)
     ci_success_count, ci_failures = stack_audit.check_ci(prs)
     active_p1_p2, nonblocking_reviews, review_failures = stack_audit.check_reviews(prs)
     paths = stack_audit.changed_paths(snapshot, prs)

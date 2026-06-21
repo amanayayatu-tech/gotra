@@ -47,6 +47,29 @@ def test_ci_pending_blocks_packet(tmp_path: Path) -> None:
     assert summary["ready_for_human_merge"] is False
 
 
+def test_graphql_status_check_rollup_contexts_nodes_are_flattened(tmp_path: Path) -> None:
+    payload = _clean_snapshot()
+    for pr in payload["pull_requests"]:
+        pr["statusCheckRollup"] = {
+            "contexts": {
+                "nodes": [
+                    {
+                        "name": "Python checks",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                    }
+                ]
+            }
+        }
+    snapshot = _write_snapshot(tmp_path, payload)
+
+    summary = packet.build_packet(_config(tmp_path, snapshot))
+
+    assert summary["human_merge_readiness_status"] == packet.STATUS_READY
+    assert summary["ci_status"] == "clean"
+    assert summary["ci_success_count"] == 8
+
+
 def test_active_p2_blocks_packet(tmp_path: Path) -> None:
     payload = _clean_snapshot()
     payload["pull_requests"][4]["reviewThreads"] = [
@@ -73,6 +96,18 @@ def test_topology_break_blocks_packet(tmp_path: Path) -> None:
 
     assert summary["human_merge_readiness_status"] == packet.STATUS_BLOCKED_TOPOLOGY
     assert any("root_base_mismatch" in reason for reason in summary["blocking_reasons"])
+
+
+def test_draft_pr_blocks_packet(tmp_path: Path) -> None:
+    payload = _clean_snapshot()
+    payload["pull_requests"][1]["isDraft"] = True
+    snapshot = _write_snapshot(tmp_path, payload)
+
+    summary = packet.build_packet(_config(tmp_path, snapshot))
+
+    assert summary["human_merge_readiness_status"] == packet.STATUS_BLOCKED_TOPOLOGY
+    assert any("draft_pr" in reason for reason in summary["blocking_reasons"])
+    assert summary["ready_for_human_merge"] is False
 
 
 def test_forbidden_artifact_path_blocks_packet(tmp_path: Path) -> None:
@@ -108,6 +143,25 @@ def test_conflict_fixture_blocks_packet(tmp_path: Path) -> None:
 
     assert summary["human_merge_readiness_status"] == packet.STATUS_BLOCKED_CONFLICT
     assert summary["conflict_dry_run_status"] == packet.CONFLICT_BLOCKED
+
+
+def test_dirty_merge_state_status_blocks_as_conflict(tmp_path: Path) -> None:
+    payload = _clean_snapshot()
+    payload["pull_requests"][2]["mergeStateStatus"] = "DIRTY"
+    snapshot = _write_snapshot(tmp_path, payload)
+
+    summary = packet.build_packet(_config(tmp_path, snapshot))
+
+    assert summary["human_merge_readiness_status"] == packet.STATUS_BLOCKED_CONFLICT
+    assert summary["conflict_dry_run_status"] == packet.CONFLICT_BLOCKED
+    assert any("merge_state_status:dirty" in reason for reason in summary["blocking_reasons"])
+
+
+def test_merge_tree_delete_modify_output_is_conflict() -> None:
+    output = "removed in local\\n  their-version.txt\\n"
+
+    assert packet.merge_tree_output_has_conflict(output) is True
+    assert packet.merge_tree_output_has_conflict("merged cleanly") is False
 
 
 def test_unknown_conflict_requires_human_and_is_not_ready(tmp_path: Path) -> None:
