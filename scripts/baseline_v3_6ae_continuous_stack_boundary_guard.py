@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import sys
 from typing import Any
@@ -76,7 +78,7 @@ def sanitized_source(source: claim_scan.ScanSource) -> claim_scan.ScanSource:
     lines: list[str] = []
     for line in source.text.splitlines():
         if live_snapshot.safe_false_v3_7_line(line.lower()):
-            lines.append("v3_7_allowed=false")
+            lines.append(neutralize_safe_v3_7_fragments(line))
         else:
             lines.append(line)
     return claim_scan.ScanSource(
@@ -84,6 +86,31 @@ def sanitized_source(source: claim_scan.ScanSource) -> claim_scan.ScanSource:
         text="\n".join(lines),
         origin=source.origin,
     )
+
+
+def neutralize_safe_v3_7_fragments(line: str) -> str:
+    replacements = (
+        (
+            r"['\"]?\bv3[_ .-]?7[_ .-]?allowed['\"]?\s*[:=]\s*[`'\"]?(?:false|no)\b[`'\"]?",
+            "v3_7_allowed=false",
+        ),
+        (
+            r"\bv(?:3[._-]?7|37)\b.{0,40}\ballowed\s*:\s*[`'\"]?(?:false|no)\b[`'\"]?",
+            "v3_7_allowed=false",
+        ),
+        (
+            r"\bv(?:3[._-]?7|37)\b.{0,40}\b(?:not\s+allowed|disallowed|forbidden|blocked)\b",
+            "v3_7_allowed=false",
+        ),
+        (
+            r"\b(do(?:es)?\s+not|not)\s+(execute|authorize).{0,40}\bv(?:3[._-]?7|37)\b",
+            "v3_7_allowed=false",
+        ),
+    )
+    sanitized = line
+    for pattern, replacement in replacements:
+        sanitized = re.sub(pattern, replacement, sanitized, flags=re.IGNORECASE)
+    return sanitized
 
 
 def text_scan(config: GuardConfig) -> dict[str, Any]:
@@ -144,6 +171,22 @@ def snapshot_scan(config: GuardConfig) -> dict[str, Any]:
             "conflict_failures": [],
             "snapshot_sha256": "",
         }
+    snapshot_path = claim_scan.normalize_scan_path(config.snapshot)
+    if claim_scan.forbidden_path(snapshot_path):
+        return {
+            "checked_pr_count": 0,
+            "paths": [snapshot_path],
+            "artifact_failures": [f"artifact_boundary:forbidden_snapshot_path:{snapshot_path}"],
+            "claim_failures": [],
+            "maturity_failures": [],
+            "direct_llm_failures": [],
+            "incomplete_failures": [],
+            "ci_failures": [],
+            "review_failures": [],
+            "topology_failures": [],
+            "conflict_failures": [],
+            "snapshot_sha256": "",
+        }
     snapshot = stack_audit.load_snapshot(config.snapshot)
     prs = live_snapshot.normalize_prs_for_snapshot(stack_audit.pr_list(snapshot))
     expected_numbers = live_snapshot.parse_pr_range(config.pr_range)
@@ -166,9 +209,19 @@ def snapshot_scan(config: GuardConfig) -> dict[str, Any]:
     _ = topology_status
     _, ci_failures = stack_audit.check_ci(prs)
     _, _, review_failures = stack_audit.check_reviews(prs)
-    paths = stack_audit.changed_paths(snapshot, prs)
-    _, artifact_failures = stack_audit.check_artifact_boundary(paths)
-    claim_status, claim_failures, _ = live_snapshot.claim_boundary_scan(snapshot, prs)
+    evidence_paths = evidence_document_paths(snapshot, prs)
+    evidence_artifact_failures = [
+        f"artifact_boundary:forbidden_evidence_document_path:{path}"
+        for path in evidence_paths
+        if claim_scan.forbidden_path(path)
+    ]
+    claim_snapshot, claim_prs = snapshot_without_forbidden_evidence_documents(snapshot, prs)
+    changed_paths = stack_audit.changed_paths(snapshot, prs)
+    paths = changed_paths + evidence_paths
+    _, artifact_failures = stack_audit.check_artifact_boundary(changed_paths)
+    artifact_failures.extend(evidence_artifact_failures)
+    claim_status, claim_failures, _ = live_snapshot.claim_boundary_scan(claim_snapshot, claim_prs)
+    _ = claim_status
     conflict_status, conflict_failures = merge_packet.snapshot_conflict_status(snapshot, prs)
     if conflict_status != merge_packet.CONFLICT_CLEAN and not conflict_failures:
         conflict_failures = [f"conflict:{conflict_status}"]
@@ -184,6 +237,8 @@ def snapshot_scan(config: GuardConfig) -> dict[str, Any]:
         for reason in claim_failures
         if "v3_7" in reason
         or "30d" in reason.lower()
+        or "thirty_day" in reason.lower()
+        or "thirty-day" in reason.lower()
         or "maturity" in reason.lower()
         or "short_horizon" in reason
     ]
@@ -206,6 +261,45 @@ def snapshot_scan(config: GuardConfig) -> dict[str, Any]:
         "conflict_failures": conflict_failures,
         "snapshot_sha256": sha256_file(config.snapshot),
     }
+
+
+def evidence_document_paths(snapshot: dict[str, Any], prs: list[dict[str, Any]]) -> list[str]:
+    paths: list[str] = []
+    raw_docs = snapshot.get("evidence_documents", snapshot.get("documents", []))
+    if isinstance(raw_docs, list):
+        paths.extend(doc.get("path", "") for doc in map(stack_audit.document_entry, raw_docs))
+    for pr in prs:
+        raw = pr.get("evidence_documents", [])
+        if isinstance(raw, list):
+            paths.extend(doc.get("path", "") for doc in map(stack_audit.document_entry, raw))
+    return sorted({path for path in paths if path})
+
+
+def snapshot_without_forbidden_evidence_documents(
+    snapshot: dict[str, Any],
+    prs: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    filtered_snapshot = deepcopy(snapshot)
+    for key in ("evidence_documents", "documents"):
+        raw = filtered_snapshot.get(key)
+        if isinstance(raw, list):
+            filtered_snapshot[key] = [
+                entry
+                for entry in raw
+                if not claim_scan.forbidden_path(stack_audit.document_entry(entry).get("path", ""))
+            ]
+    filtered_prs = []
+    for pr in prs:
+        filtered = deepcopy(pr)
+        raw = filtered.get("evidence_documents", [])
+        if isinstance(raw, list):
+            filtered["evidence_documents"] = [
+                entry
+                for entry in raw
+                if not claim_scan.forbidden_path(stack_audit.document_entry(entry).get("path", ""))
+            ]
+        filtered_prs.append(filtered)
+    return filtered_snapshot, filtered_prs
 
 
 def choose_status(

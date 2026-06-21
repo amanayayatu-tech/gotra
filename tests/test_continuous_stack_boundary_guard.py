@@ -63,6 +63,17 @@ def test_forbidden_manifest_path_blocks_without_reading(tmp_path: Path) -> None:
     assert summary["artifact_boundary_status"] == "blocked"
 
 
+def test_forbidden_snapshot_path_blocks_before_reading(tmp_path: Path) -> None:
+    forbidden = tmp_path / "data" / "backtest" / "runs" / "snapshot.json"
+
+    summary = guard.run_guard(_config(tmp_path, snapshot=forbidden, pr_range="36"))
+
+    assert summary["stack_guard_status"] == guard.STATUS_BLOCKED_ARTIFACT
+    assert summary["artifact_boundary_status"] == "blocked"
+    assert summary["snapshot_sha256"] == ""
+    assert any("forbidden_snapshot_path" in reason for reason in summary["blocker_reasons"])
+
+
 def test_oos_public_trading_overclaim_blocks_claim_boundary(tmp_path: Path) -> None:
     manifest = _write_manifest(
         tmp_path,
@@ -74,6 +85,24 @@ def test_oos_public_trading_overclaim_blocks_claim_boundary(tmp_path: Path) -> N
     assert summary["stack_guard_status"] == guard.STATUS_BLOCKED_CLAIM_BOUNDARY
     assert summary["claim_boundary_status"] == "blocked"
     assert summary["evidence_overclaim_count"] >= 1
+
+
+def test_safe_v3_7_sanitization_preserves_other_claims(tmp_path: Path) -> None:
+    manifest = _write_manifest(
+        tmp_path,
+        [
+            {
+                "path": "docs/mixed_bad.md",
+                "text": "v3.7 not allowed; direct_llm is clean no-future baseline; OOS proof",
+            }
+        ],
+    )
+
+    summary = guard.run_guard(_config(tmp_path, manifest=manifest))
+
+    assert summary["stack_guard_status"] == guard.STATUS_BLOCKED_DIRECT_LLM
+    assert summary["direct_llm_boundary_status"] == "blocked"
+    assert summary["claim_boundary_status"] == "blocked"
 
 
 def test_positive_v3_7_and_30d_verdict_claims_block_maturity_gate(tmp_path: Path) -> None:
@@ -92,6 +121,18 @@ def test_positive_v3_7_and_30d_verdict_claims_block_maturity_gate(tmp_path: Path
     assert summary["stack_guard_status"] == guard.STATUS_BLOCKED_MATURITY_GATE
     assert summary["maturity_gate_status"] == "blocked"
     assert summary["maturity_gate_bypass_count"] >= 3
+
+
+def test_spelled_out_30d_verdict_in_snapshot_is_maturity_block(tmp_path: Path) -> None:
+    payload = _clean_snapshot()
+    payload["pull_requests"][0]["body"] = "thirty-day forward-live verdict pass"
+    snapshot = _write_snapshot(tmp_path, payload)
+
+    summary = guard.run_guard(_config(tmp_path, snapshot=snapshot, pr_range="36-37"))
+
+    assert summary["stack_guard_status"] == guard.STATUS_BLOCKED_MATURITY_GATE
+    assert summary["maturity_gate_status"] == "blocked"
+    assert any("thirty_day_forward_live_verdict" in reason for reason in summary["blocker_reasons"])
 
 
 def test_explicit_false_v3_7_boundary_lines_are_clean(tmp_path: Path) -> None:
@@ -138,6 +179,34 @@ def test_direct_llm_parametric_memory_control_caveat_is_clean(tmp_path: Path) ->
 
     assert summary["stack_guard_status"] == guard.STATUS_CLEAN
     assert summary["direct_llm_boundary_status"] == "clean"
+
+
+def test_snapshot_evidence_document_forbidden_path_blocks_without_claim_scan(
+    tmp_path: Path,
+) -> None:
+    payload = _clean_snapshot()
+    payload["evidence_documents"] = [
+        {
+            "path": "data/backtest/runs/evidence.md",
+            "text": "This is OOS proof and v3.7 verdict ready.",
+        }
+    ]
+    payload["pull_requests"][0]["evidence_documents"] = [
+        {
+            "path": "data/backtest/runs/pr_evidence.md",
+            "text": "direct_llm is clean no-future baseline.",
+        }
+    ]
+    snapshot = _write_snapshot(tmp_path, payload)
+
+    summary = guard.run_guard(_config(tmp_path, snapshot=snapshot, pr_range="36-37"))
+
+    assert summary["stack_guard_status"] == guard.STATUS_BLOCKED_ARTIFACT
+    assert summary["artifact_boundary_status"] == "blocked"
+    assert summary["forbidden_path_count"] == 2
+    assert summary["evidence_overclaim_count"] == 0
+    assert summary["maturity_gate_bypass_count"] == 0
+    assert summary["direct_llm_mislabel_count"] == 0
 
 
 def test_missing_pr_in_requested_range_is_snapshot_incomplete(tmp_path: Path) -> None:

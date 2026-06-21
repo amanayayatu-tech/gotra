@@ -30,6 +30,8 @@ The command supports CI-local inputs without a GitHub token:
 Forbidden artifact paths must be blocked before reading file contents:
 `data/backtest/runs/**`, `data/paper_trading/**`, raw outputs, transcripts,
 `.env*`, SQLite/DB, bundle/tar/zip, and Stage8/Stage9 artifacts.
+This pre-read artifact guard applies to `--file`, `--manifest`, `--snapshot`,
+and evidence-document paths embedded in a stack snapshot.
 
 ## Checks
 
@@ -46,7 +48,13 @@ The guard must block:
   provided
 
 Explicit negative boundary statements such as `v3_7_allowed=false`,
-`v3.7 allowed: false`, and `v3.7 not allowed` must remain clean.
+`v3.7 allowed: false`, and `v3.7 not allowed` must remain clean, but only the
+safe v3.7 phrase may be neutralized. Other claims on the same line, such as
+direct-LLM clean-baseline wording or OOS proof claims, must still be scanned
+and blocked.
+
+Spelled-out 30D verdict claims, including `thirty-day forward-live verdict
+pass`, are maturity-gate blockers.
 
 ## Summary Contract
 
