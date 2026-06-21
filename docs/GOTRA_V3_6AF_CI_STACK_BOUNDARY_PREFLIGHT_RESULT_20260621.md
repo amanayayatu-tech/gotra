@@ -31,27 +31,27 @@ Command:
 
 ```bash
 uv run python scripts/baseline_v3_6af_ci_stack_boundary_preflight.py \
-  --preflight-run-id baseline_v3_6af_ci_stack_boundary_preflight_20260621T093544Z \
-  --repo-root /tmp/gotra_v3_6af_ci_stack_boundary_preflight_20260621T093544Z/repo \
+  --preflight-run-id baseline_v3_6af_ci_stack_boundary_preflight_reviewfix_20260621T094751Z \
+  --repo-root /tmp/gotra_v3_6af_ci_stack_boundary_preflight_reviewfix_20260621T094751Z/repo \
   --pathspec . \
-  --output-root /tmp/gotra_v3_6af_ci_stack_boundary_preflight_20260621T093544Z/runs
+  --output-root /tmp/gotra_v3_6af_ci_stack_boundary_preflight_reviewfix_20260621T094751Z/runs
 ```
 
 Output, not committed:
 
-`/tmp/gotra_v3_6af_ci_stack_boundary_preflight_20260621T093544Z/runs/baseline_v3_6af_ci_stack_boundary_preflight_20260621T093544Z/summary.json`
+`/tmp/gotra_v3_6af_ci_stack_boundary_preflight_reviewfix_20260621T094751Z/runs/baseline_v3_6af_ci_stack_boundary_preflight_reviewfix_20260621T094751Z/summary.json`
 
 Summary sha256:
 
-`442b01db4d5f19671f05f69a19db6f0afbb44a389ee5a7976c2c122f5c982308`
+`cc8b8b0632850dfc061363d72674e627a2bd4c7118f05cee79a225ac4d725690`
 
 Result:
 
 - Preflight status: `CI_STACK_BOUNDARY_PREFLIGHT_CLEAN`
 - Guard summary path:
-  `/tmp/gotra_v3_6af_ci_stack_boundary_preflight_20260621T093544Z/runs/baseline_v3_6af_ci_stack_boundary_preflight_20260621T093544Z/guard_runs/baseline_v3_6ae_continuous_stack_boundary_guard_v3_6af_20260621T093544Z/summary.json`
+  `/tmp/gotra_v3_6af_ci_stack_boundary_preflight_reviewfix_20260621T094751Z/runs/baseline_v3_6af_ci_stack_boundary_preflight_reviewfix_20260621T094751Z/guard_runs/baseline_v3_6ae_continuous_stack_boundary_guard_v3_6af_reviewfix_20260621T094751Z/summary.json`
 - Guard summary sha256:
-  `d7004c666c4f56b7e218ee1032b7dcb9faedaf68fde515ae3b734f301a951ea9`
+  `e8b0c88874a34bbcde332e883b85c26d73c30287677970d1c0f1e1cc84047ed3`
 - Scanned tracked file count: `1`
 - Skipped untracked count: `1`
 - Artifact boundary status: `clean`
@@ -67,7 +67,17 @@ Result:
 
 ## Validation
 
-Commands planned:
+Review hardening added after PR review:
+
+- script-path invocation works from repo root without `PYTHONPATH=.`
+- duplicate output run ids return a blocked summary without overwriting the
+  existing run directory
+- default invocation scans no broad historical tracked pathspecs; callers must
+  pass explicit scoped `--pathspec` values or manifest/snapshot inputs
+- tracked gitlinks, directories, and non-regular files are filtered before
+  invoking the v3.6AE guard
+
+Commands run:
 
 ```bash
 uv run python -m py_compile scripts/baseline_v3_6af_ci_stack_boundary_preflight.py scripts/baseline_v3_6ae_continuous_stack_boundary_guard.py
@@ -82,15 +92,19 @@ Result:
 
 - py_compile: pass
 - Ruff: pass
-- Focused v3.6AF tests: `11 passed`
-- v3.6AE/v3.6AF regression tests: `26 passed`
-- v3.6AA/v3.6AB/v3.6AE/v3.6AF regression tests: `60 passed`
-- Full test suite: `524 passed`
+- Focused v3.6AF tests: `15 passed`
+- v3.6AE/v3.6AF regression tests: `30 passed`
+- v3.6AA/v3.6AB/v3.6AE/v3.6AF regression tests: `64 passed`
+- Full test suite: `528 passed`
 
 ## Covered Behavior
 
 - tracked-only clean fixture -> `CI_STACK_BOUNDARY_PREFLIGHT_CLEAN`
+- script-path CLI invocation -> `CI_STACK_BOUNDARY_PREFLIGHT_CLEAN`
+- default no-pathspec invocation scans zero broad historical files
 - untracked forbidden artifact under `tracked-only` is skipped and not read
+- duplicate run id does not overwrite existing summary artifacts
+- gitlink/submodule paths are skipped before invoking v3.6AE
 - tracked forbidden artifact path -> `BLOCKED_ARTIFACT`
 - forbidden manifest path is blocked before read
 - forbidden manifest entry -> `BLOCKED_ARTIFACT`

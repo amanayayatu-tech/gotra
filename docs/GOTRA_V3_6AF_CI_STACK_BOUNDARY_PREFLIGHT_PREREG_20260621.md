@@ -32,13 +32,24 @@ failures.
 The v3.6AF command must reuse the v3.6AE guard rather than reimplementing
 claim/artifact scanning. The wrapper is responsible for:
 
-- collecting git tracked files only, by default from `docs/`, `scripts/`,
-  `tests/`, and `.github/`
+- collecting git tracked files only from explicitly supplied `--pathspec`
+  values; with no `--pathspec`, the wrapper scans no broad historical file tree
+  and only processes optional manifest/snapshot inputs
 - counting skipped untracked files without reading them
+- filtering gitlinks, directories, and non-regular files before passing paths to
+  the v3.6AE guard
 - passing tracked files, optional manifest, and optional snapshot into v3.6AE
 - applying pre-read artifact guards to manifest and snapshot paths
 - mapping v3.6AE terminal statuses to v3.6AF preflight statuses
 - writing a machine-readable summary under `/tmp` or an explicit output root
+
+The script-path CLI form
+`python scripts/baseline_v3_6af_ci_stack_boundary_preflight.py` must work from
+the repo root without requiring callers to set `PYTHONPATH=.`.
+
+Duplicate output run ids must fail closed without overwriting existing
+`summary.json` or `manifest.json` artifacts unless `--allow-overwrite` is
+explicitly supplied.
 
 Forbidden artifact paths include `data/backtest/runs/**`,
 `data/paper_trading/**`, raw outputs, transcripts, `.env*`, SQLite/DB,
@@ -85,9 +96,9 @@ Clean status exits `0`; blocked/fail terminal statuses exit non-zero.
 
 This stage adds the wrapper and tests, but does not modify the existing GitHub
 Actions workflow. The existing workflow already runs full repo Ruff and pytest.
-Direct workflow wiring can be added later after the team chooses the exact
-tracked-file pathspecs that should be enforced in CI without false positives
-from historical research docs.
+Direct workflow wiring can be added later after the team chooses explicit
+changed-file or scoped pathspecs to enforce in CI without false positives from
+historical research docs.
 
 ## Non-Claims
 

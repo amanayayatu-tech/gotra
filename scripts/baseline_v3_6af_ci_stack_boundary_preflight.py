@@ -16,8 +16,12 @@ import sys
 from contextlib import redirect_stdout
 from typing import Any
 
-from scripts import baseline_v3_6ab_evidence_claim_boundary_scanner as claim_scan
-from scripts import baseline_v3_6ae_continuous_stack_boundary_guard as guard
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts import baseline_v3_6ab_evidence_claim_boundary_scanner as claim_scan  # noqa: E402
+from scripts import baseline_v3_6ae_continuous_stack_boundary_guard as guard  # noqa: E402
 
 
 SUMMARY_SCHEMA = "gotra.baseline_v3_6af.ci_stack_boundary_preflight_summary.v1"
@@ -33,7 +37,7 @@ STATUS_BLOCKED_DIRECT_LLM = "BLOCKED_DIRECT_LLM_BOUNDARY"
 STATUS_INCOMPLETE = "SNAPSHOT_INCOMPLETE"
 STATUS_FAIL = "PREFLIGHT_FAIL"
 
-DEFAULT_PATHSPECS = ("docs/", "scripts/", "tests/", ".github/")
+DEFAULT_PATHSPECS: tuple[str, ...] = ()
 DIRECT_LLM_INTERPRETATION = guard.DIRECT_LLM_INTERPRETATION
 
 
@@ -105,15 +109,41 @@ def git_lines(repo_root: Path, args: list[str]) -> list[str]:
     return [line for line in result.stdout.splitlines() if line]
 
 
+def git_output(repo_root: Path, args: list[str]) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout
+
+
 def tracked_paths(config: PreflightConfig) -> list[Path]:
     if not config.tracked_only:
         raise ValueError("v3.6AF currently supports tracked-only scans only")
-    args = ["ls-files", "--", *config.pathspecs]
-    return [config.repo_root / line for line in git_lines(config.repo_root, args)]
+    if not config.pathspecs:
+        return []
+    output = git_output(config.repo_root, ["ls-files", "--stage", "-z", "--", *config.pathspecs])
+    paths: list[Path] = []
+    for entry in output.split("\0"):
+        if not entry:
+            continue
+        metadata, path_text = entry.split("\t", 1)
+        mode = metadata.split(" ", 1)[0]
+        if mode == "160000":
+            continue
+        path = config.repo_root / path_text
+        if not path.is_file():
+            continue
+        paths.append(path)
+    return paths
 
 
 def skipped_untracked_count(config: PreflightConfig) -> int:
     if not config.tracked_only:
+        return 0
+    if not config.pathspecs:
         return 0
     args = ["ls-files", "--others", "--exclude-standard", "--", *config.pathspecs]
     return len(git_lines(config.repo_root, args))
@@ -234,16 +264,24 @@ def fail_summary(
     return summary
 
 
+def duplicate_run_id_summary(config: PreflightConfig, *, run_root: Path) -> dict[str, Any]:
+    summary = base_summary(config, run_root=run_root)
+    summary.update(
+        {
+            "preflight_status": STATUS_FAIL,
+            "ready_for_human_merge_review": False,
+            "blocker_reasons": ["output_run_id_exists"],
+        }
+    )
+    print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+    return summary
+
+
 def run_preflight(config: PreflightConfig) -> dict[str, Any]:
     validate_run_id(config.preflight_run_id)
     run_root = config.output_root / config.preflight_run_id
     if run_root.exists() and any(run_root.iterdir()) and not config.allow_overwrite:
-        return fail_summary(
-            config,
-            run_root=run_root,
-            blocker_reasons=["output_run_id_exists"],
-            status=STATUS_FAIL,
-        )
+        return duplicate_run_id_summary(config, run_root=run_root)
     if run_root.exists() and config.allow_overwrite:
         shutil.rmtree(run_root)
 

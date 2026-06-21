@@ -29,6 +29,49 @@ def test_tracked_only_clean_fixture_is_clean(tmp_path: Path) -> None:
     assert summary["formal_lite_entered"] is False
 
 
+def test_script_path_invocation_succeeds_without_pythonpath(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    _track(repo, "docs/good.md", "engineering/local only; v3_7_allowed=false.")
+    run_id = "baseline_v3_6af_ci_stack_boundary_preflight_script_path"
+
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "python",
+            "scripts/baseline_v3_6af_ci_stack_boundary_preflight.py",
+            "--preflight-run-id",
+            run_id,
+            "--repo-root",
+            str(repo),
+            "--pathspec",
+            "docs/",
+            "--output-root",
+            str(tmp_path / "script_path_runs"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    summary_path = tmp_path / "script_path_runs" / run_id / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["preflight_status"] == preflight.STATUS_CLEAN
+
+
+def test_default_invocation_does_not_scan_historical_docs_pathspecs(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    _track(repo, "docs/STAGE8_historical.md", "This tracked historical doc path is intentionally ignored by default.")
+
+    summary = preflight.run_preflight(_config(tmp_path, repo, pathspecs=()))
+
+    assert summary["preflight_status"] == preflight.STATUS_CLEAN
+    assert summary["scanned_tracked_file_count"] == 0
+    assert summary["pathspecs"] == []
+
+
 def test_untracked_forbidden_file_is_skipped_in_tracked_only_mode(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path)
     _track(repo, "docs/good.md", "engineering/local only; v3.7 allowed: false.")
@@ -70,6 +113,31 @@ def test_forbidden_manifest_path_blocks_before_reading(tmp_path: Path) -> None:
     assert any("forbidden_manifest_path" in reason for reason in summary["blocker_reasons"])
 
 
+def test_duplicate_run_id_preserves_existing_summary(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    _track(repo, "docs/good.md", "engineering/local only; v3_7_allowed=false.")
+    run_id = "baseline_v3_6af_ci_stack_boundary_preflight_duplicate"
+    output_root = tmp_path / "runs"
+    run_root = output_root / run_id
+    run_root.mkdir(parents=True)
+    sentinel = '{"sentinel": true}\n'
+    (run_root / "summary.json").write_text(sentinel, encoding="utf-8")
+
+    summary = preflight.run_preflight(
+        preflight.PreflightConfig(
+            preflight_run_id=run_id,
+            output_root=output_root,
+            repo_root=repo,
+            pathspecs=("docs/",),
+            allow_overwrite=False,
+        ),
+    )
+
+    assert summary["preflight_status"] == preflight.STATUS_FAIL
+    assert summary["blocker_reasons"] == ["output_run_id_exists"]
+    assert (run_root / "summary.json").read_text(encoding="utf-8") == sentinel
+
+
 def test_manifest_forbidden_entry_blocks_artifact(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path)
     manifest = _write_manifest(
@@ -81,6 +149,28 @@ def test_manifest_forbidden_entry_blocks_artifact(tmp_path: Path) -> None:
 
     assert summary["preflight_status"] == preflight.STATUS_BLOCKED_ARTIFACT
     assert summary["artifact_boundary_status"] == "blocked"
+
+
+def test_gitlink_paths_are_skipped_when_collecting_tracked_paths(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    _track(repo, "docs/good.md", "engineering/local only; v3_7_allowed=false.")
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000,0123456789012345678901234567890123456789,engine/ksana",
+        ],
+        check=True,
+    )
+
+    summary = preflight.run_preflight(_config(tmp_path, repo, pathspecs=(".",)))
+
+    assert summary["preflight_status"] == preflight.STATUS_CLEAN
+    assert summary["scanned_tracked_file_count"] == 1
 
 
 def test_tracked_oos_evidence_blocks_claim_boundary(tmp_path: Path) -> None:
