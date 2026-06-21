@@ -85,6 +85,53 @@ def test_manifest_records_verifiable_summary_digest(tmp_path: Path) -> None:
     assert summary["summary_digest_target"] == "manifest.summary_sha256"
 
 
+def test_repo_root_is_not_forwarded_without_stack_heads(tmp_path: Path, monkeypatch) -> None:
+    captured = {}
+
+    def fake_run_refresh(config):
+        captured["repo_root"] = config.repo_root
+        captured["stack_heads"] = config.stack_heads
+        return {}
+
+    monkeypatch.setattr(snapshot.live_refresh, "run_refresh", fake_run_refresh)
+
+    snapshot.run_underlying_refresh(
+        snapshot.SnapshotConfig(
+            snapshot_run_id=f"{snapshot.RUN_ID_PREFIX}repo_root_without_heads",
+            output_dir=tmp_path / "runs",
+            repo_root=tmp_path,
+        ),
+        run_root=tmp_path / "run_root",
+    )
+
+    assert captured["repo_root"] is None
+    assert captured["stack_heads"] == ()
+
+
+def test_repo_root_and_stack_heads_are_forwarded_together(tmp_path: Path, monkeypatch) -> None:
+    captured = {}
+
+    def fake_run_refresh(config):
+        captured["repo_root"] = config.repo_root
+        captured["stack_heads"] = config.stack_heads
+        return {}
+
+    monkeypatch.setattr(snapshot.live_refresh, "run_refresh", fake_run_refresh)
+
+    snapshot.run_underlying_refresh(
+        snapshot.SnapshotConfig(
+            snapshot_run_id=f"{snapshot.RUN_ID_PREFIX}repo_root_with_heads",
+            output_dir=tmp_path / "runs",
+            repo_root=tmp_path,
+            stack_heads=("branch-a", "branch-b"),
+        ),
+        run_root=tmp_path / "run_root",
+    )
+
+    assert captured["repo_root"] == tmp_path
+    assert captured["stack_heads"] == ("branch-a", "branch-b")
+
+
 def _config(tmp_path: Path, path: Path, *, suffix: str = "unit") -> snapshot.SnapshotConfig:
     return snapshot.SnapshotConfig(
         snapshot_run_id=f"{snapshot.RUN_ID_PREFIX}{suffix}",

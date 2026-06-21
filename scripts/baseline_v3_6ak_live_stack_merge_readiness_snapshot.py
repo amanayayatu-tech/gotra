@@ -74,6 +74,7 @@ class SnapshotConfig:
     pr_range: str = "36-51"
     expected_root_base: str = "main"
     repo_root: Path | None = None
+    stack_heads: tuple[str, ...] = ()
     next_30d_check_after: str = NEXT_30D_CHECK_AFTER
     next_short_horizon_check_after: str = NEXT_SHORT_HORIZON_CHECK_AFTER
     actual_30d_readiness_status: str = ACTUAL_30D_READINESS_STATUS
@@ -109,6 +110,7 @@ def underlying_run_id(snapshot_run_id: str) -> str:
 
 
 def run_underlying_refresh(config: SnapshotConfig, *, run_root: Path) -> dict[str, Any]:
+    repo_root = config.repo_root if config.stack_heads else None
     refresh_config = live_refresh.RefreshConfig(
         refresh_run_id=underlying_run_id(config.snapshot_run_id),
         output_dir=run_root / "underlying_v3_6ah_runs",
@@ -117,7 +119,8 @@ def run_underlying_refresh(config: SnapshotConfig, *, run_root: Path) -> dict[st
         repo=config.repo,
         pr_range=config.pr_range,
         expected_root_base=config.expected_root_base,
-        repo_root=config.repo_root,
+        repo_root=repo_root,
+        stack_heads=config.stack_heads,
         next_30d_check_after=config.next_30d_check_after,
         next_short_horizon_check_after=config.next_short_horizon_check_after,
         allow_overwrite=config.allow_overwrite,
@@ -476,6 +479,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--expected-root-base", default="main")
     parser.add_argument("--repo-root", type=Path)
+    parser.add_argument("--stack-head", dest="stack_heads", action="append", default=[])
     parser.add_argument("--next-30d-check-after", default=NEXT_30D_CHECK_AFTER)
     parser.add_argument("--next-short-horizon-check-after", default=NEXT_SHORT_HORIZON_CHECK_AFTER)
     parser.add_argument("--actual-30d-readiness-status", default=ACTUAL_30D_READINESS_STATUS)
@@ -493,6 +497,7 @@ def config_from_args(args: argparse.Namespace) -> SnapshotConfig:
         pr_range=str(args.pr_range),
         expected_root_base=str(args.expected_root_base),
         repo_root=args.repo_root,
+        stack_heads=tuple(str(head) for head in (args.stack_heads or ())),
         next_30d_check_after=str(args.next_30d_check_after),
         next_short_horizon_check_after=str(args.next_short_horizon_check_after),
         actual_30d_readiness_status=str(args.actual_30d_readiness_status),

@@ -49,6 +49,8 @@ The summary must include or preserve:
 - `artifact_boundary_status`
 - `claim_boundary_status`
 - `provider_boundary_status`
+- optional `--repo-root` local merge-tree context only when paired with
+  explicit `--stack-head` values
 - `actual_30d_readiness_status=DATA_NOT_MATURED`
 - `auto_merge_executed_by_worker=false`
 - `provider_or_backend_called=false`

@@ -85,32 +85,32 @@ Command:
 
 ```bash
 uv run python scripts/baseline_v3_6ak_live_stack_merge_readiness_snapshot.py \
-  --snapshot-run-id baseline_v3_6ak_live_stack_merge_readiness_snapshot_post_merge_closeout_final_20260621T130120Z \
+  --snapshot-run-id baseline_v3_6ak_live_stack_merge_readiness_snapshot_post_merge_closeout_final2_20260621T131700Z \
   --use-gh \
   --repo amanayayatu-tech/gotra \
   --pr-range 36-51 \
-  --output-dir /tmp/gotra_v3_6ak_post_merge_closeout_final_20260621T130120Z/runs
+  --output-dir /tmp/gotra_v3_6ak_post_merge_closeout_final2_20260621T131700Z/runs
 ```
 
 Summary path:
 
-`/tmp/gotra_v3_6ak_post_merge_closeout_final_20260621T130120Z/runs/baseline_v3_6ak_live_stack_merge_readiness_snapshot_post_merge_closeout_final_20260621T130120Z/summary.json`
+`/tmp/gotra_v3_6ak_post_merge_closeout_final2_20260621T131700Z/runs/baseline_v3_6ak_live_stack_merge_readiness_snapshot_post_merge_closeout_final2_20260621T131700Z/summary.json`
 
 Summary sha256:
 
-`f3dfe82c2ea2c66bffd34fb394bd91da58aec3e0951efe2b2c568cf86404f388`
+`2cd69b661d3d8e77fbed6bf650cd01f41c746ca0557aad090fab430b35928cae`
 
 Manifest path:
 
-`/tmp/gotra_v3_6ak_post_merge_closeout_final_20260621T130120Z/runs/baseline_v3_6ak_live_stack_merge_readiness_snapshot_post_merge_closeout_final_20260621T130120Z/manifest.json`
+`/tmp/gotra_v3_6ak_post_merge_closeout_final2_20260621T131700Z/runs/baseline_v3_6ak_live_stack_merge_readiness_snapshot_post_merge_closeout_final2_20260621T131700Z/manifest.json`
 
 Manifest sha256:
 
-`5c108483c3877d225b841a8e4e892ff06245feae0b2d5647e6b60c7a3c4407cc`
+`b07f4edd6dc1f5de1326289ab70c266768565a0f21b21a895779ec290679e11d`
 
 Review bundle path:
 
-`/tmp/gotra_v3_6ak_post_merge_closeout_final_20260621T130120Z/runs/baseline_v3_6ak_live_stack_merge_readiness_snapshot_post_merge_closeout_final_20260621T130120Z/review_bundle.md`
+`/tmp/gotra_v3_6ak_post_merge_closeout_final2_20260621T131700Z/runs/baseline_v3_6ak_live_stack_merge_readiness_snapshot_post_merge_closeout_final2_20260621T131700Z/review_bundle.md`
 
 Review bundle sha256:
 
@@ -157,7 +157,7 @@ Final repair validation result:
 
 - py_compile: pass
 - Ruff: pass
-- v3.6AK focused tests: `5 passed`
+- v3.6AK focused tests: `7 passed`
 - v3.6AD/v3.6AH/v3.6AK focused tests: `49 passed`
 - v3.6AK docs claim-boundary scan:
   `CLAIM_BOUNDARY_CLEAN` with 0 blocked items and 1 non-blocking ambiguous
