@@ -26,7 +26,10 @@ Non-claim boundary:
 - Base branch: `origin/main`
 - Base head before branch: `6eb5f47f815ea9dc2aa360046a6da26f4f3eb0cd`
 - Branch: `codex/gotra-v3-7-readiness-refresh-harness-prep-20260621`
-- PR: pending at initial local validation time
+- PR: https://github.com/amanayayatu-tech/gotra/pull/53
+- GitHub CI: two `Python checks` passed during PR validation.
+- `origin/main` after PR creation: unchanged at
+  `6eb5f47f815ea9dc2aa360046a6da26f4f3eb0cd`
 
 ## Actual 30D Readiness Refresh
 
@@ -152,7 +155,7 @@ Results:
   - warnings: `2` ambiguous readiness wording warnings, no blocker
 - Full test suite: `607 passed`
 - `git diff --check`: pass
-- PR and GitHub CI status are pending at this checkpoint.
+- GitHub CI: two `Python checks` passed during PR #53 validation.
 
 ## Artifact Boundary
 
