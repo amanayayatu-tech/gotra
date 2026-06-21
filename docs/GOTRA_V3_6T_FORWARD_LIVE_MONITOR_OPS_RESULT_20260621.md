@@ -38,6 +38,17 @@ recording each input summary path and sha256.
 The command never calls provider APIs, Codex CLI, formal-lite, or v3.7 verdict
 logic.
 
+Review hardening added after PR #37 self-audit:
+
+- `DATA_NOT_MATURED` keeps wait/recheck semantics even when an optional
+  readiness summary is stale/ready.
+- `RESOLVER_PATH_ELIGIBLE` without
+  `READY_FOR_FORWARD_LIVE_VERDICT` is a readiness-chain blocker and returns
+  `FIX_BLOCKER`, not `RECHECK_NOW_ALLOWED`.
+- CLI exit semantics now return non-zero for hard-blocked latest monitor
+  statuses such as `BLOCKED_DATA`, `BLOCKED_SOURCE_FUTURE_DATA`, and
+  `MONITOR_FAIL`.
+
 ## Summary Schema
 
 Key summary fields:
@@ -143,7 +154,8 @@ Results:
 
 - py_compile: pass
 - Ruff: pass
-- Focused v3.6T tests: `7 passed`
+- Focused v3.6T tests: `10 passed`
+- Review hardening focused tests: included in focused v3.6T tests
 - v3.5/v3.6 forward-live regression set: `75 passed`
 - Full test suite: `373 passed`
 - `git diff --check`: pass

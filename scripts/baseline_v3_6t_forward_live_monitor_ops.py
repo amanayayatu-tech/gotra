@@ -166,19 +166,29 @@ def recommendation_for(
     status = str(payload.get("status") or "")
     if readiness_ready_for_current_monitor(payload):
         return RECOMMEND_PLAN_V3_7_ONLY_IF_READY
-    if str(payload.get("readiness_status") or "") == readiness_v36.STATUS_READY:
-        return RECOMMEND_FIX_BLOCKER
     if status in BLOCKED_STATUSES:
         return RECOMMEND_FIX_BLOCKER
     if status == monitor_v36s.STATUS_DATA_NOT_MATURED:
         if next_check_due(payload, as_of_timestamp_utc=as_of_timestamp_utc):
             return RECOMMEND_RECHECK_NOW_ALLOWED
         return RECOMMEND_WAIT_UNTIL_NEXT_CHECK
+    if str(payload.get("readiness_status") or "") == readiness_v36.STATUS_READY:
+        return RECOMMEND_FIX_BLOCKER
     if status == monitor_v36s.STATUS_DATA_INSUFFICIENT:
         return RECOMMEND_FIX_BLOCKER
     if status == monitor_v36s.STATUS_RESOLVER_PATH_ELIGIBLE:
-        return RECOMMEND_RECHECK_NOW_ALLOWED
+        return RECOMMEND_FIX_BLOCKER
     return RECOMMEND_FIX_BLOCKER
+
+
+def summary_is_hard_blocked(summary: dict[str, Any]) -> bool:
+    status = str(summary.get("status") or "")
+    latest_status = str(summary.get("latest_status") or "")
+    return (
+        status == STATUS_BLOCKED_RUN_ID_EXISTS
+        or status in BLOCKED_STATUSES
+        or latest_status in BLOCKED_STATUSES
+    )
 
 
 def ledger_entry_for(entry: MonitorEntry) -> dict[str, Any]:
@@ -397,7 +407,7 @@ def config_from_args(args: argparse.Namespace) -> OpsConfig:
 
 def main(argv: list[str] | None = None) -> int:
     summary = run_ops(config_from_args(parse_args(argv)))
-    return 1 if str(summary.get("status")) == STATUS_BLOCKED_RUN_ID_EXISTS else 0
+    return 1 if summary_is_hard_blocked(summary) else 0
 
 
 if __name__ == "__main__":

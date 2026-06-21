@@ -81,11 +81,16 @@ The v3.6T summary includes:
 
 - No monitor summaries: `DATA_INSUFFICIENT` and `FIX_BLOCKER`.
 - Latest `DATA_NOT_MATURED` before `next_check_after`:
-  `WAIT_UNTIL_NEXT_CHECK`.
+  `WAIT_UNTIL_NEXT_CHECK`, even if an optional readiness summary is already
+  stale/ready. Immature horizons take precedence over readiness repair.
 - Latest `DATA_NOT_MATURED` at or after `next_check_after`:
   `RECHECK_NOW_ALLOWED`.
 - Latest `BLOCKED_DATA`, `BLOCKED_SOURCE_FUTURE_DATA`, invalid provenance, or
-  monitor failure: `FIX_BLOCKER`.
+  monitor failure: `FIX_BLOCKER`; the CLI exits non-zero for these hard-blocked
+  latest monitor statuses.
+- Latest `RESOLVER_PATH_ELIGIBLE` without
+  `READY_FOR_FORWARD_LIVE_VERDICT`: `FIX_BLOCKER`, because the readiness chain
+  is missing or incomplete and a maturity recheck alone is not enough.
 - `READY_FOR_FORWARD_LIVE_VERDICT` from a monitor summary is not enough by
   itself. v3.6T only allows v3.7 planning when the latest v3.6S summary also
   has current monitor eligibility:
