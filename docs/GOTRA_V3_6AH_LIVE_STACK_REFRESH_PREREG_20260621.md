@@ -99,8 +99,8 @@ This stage keeps merge conflicts separate from topology failures: dirty
 `BLOCKED_CONFLICT`, not as `BLOCKED_TOPOLOGY`. Claim-boundary substatus
 classification must use the scanner rule id from
 `claim_boundary:<path>:<line>:<rule_id>` instead of arbitrary path text, so
-paths such as `docs/direct_llm_notes.md` or `docs/v3_7_notes.md` cannot change
-the reported blocker class. The underlying direct-arm scanner may allow guard
+path names containing direct-arm or maturity tokens cannot change the reported
+blocker class. The underlying direct-arm scanner may allow guard
 descriptions only when the clause explicitly rejects or blocks clean
 no-future-baseline wording; unrelated guard verbs do not exempt affirmative
 baseline claims.

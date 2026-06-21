@@ -134,8 +134,8 @@ Result:
 - Review hardening now preserves live snapshot conflict blockers as
   `BLOCKED_CONFLICT` instead of relabeling them as topology failures.
 - Claim-boundary substatus classification now parses the scanner rule id from
-  `claim_boundary:<path>:<line>:<rule_id>`, so path text containing
-  `direct_llm`, `30d`, or `v3_7` cannot misclassify an ordinary overclaim.
+  `claim_boundary:<path>:<line>:<rule_id>`, so path text containing direct-arm
+  or maturity tokens cannot misclassify an ordinary overclaim.
 - Direct-arm guard-description exemptions now apply only to clauses that
   explicitly reject/block clean no-future-baseline wording; unrelated guard
   verbs do not hide affirmative baseline claims.
