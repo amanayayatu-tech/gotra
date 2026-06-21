@@ -85,12 +85,8 @@ def capture_paths_from_roots(input_roots: tuple[Path, ...]) -> list[Path]:
     for root in input_roots:
         if root.is_file() and root.suffix.lower() == ".json":
             candidates = [root]
-        elif (root / "captures").exists():
-            candidates = list((root / "captures").glob("**/*.json"))
-        elif root.name == "captures":
-            candidates = list(root.glob("**/*.json"))
         elif root.is_dir():
-            candidates = list(root.glob("**/captures/**/*.json"))
+            candidates = list(root.glob("**/*.json"))
         else:
             candidates = []
         for path in candidates:
@@ -139,15 +135,18 @@ def price_availability_for_capture(
             price_dir=config.price_dir,
             as_of_timestamp_utc=config.as_of_timestamp_utc,
         )
-    except (FileNotFoundError, LookupError, ValueError) as exc:
+    except Exception as exc:  # noqa: BLE001 - malformed local price caches are data blockers.
         return False, "missing_decision_price:" + v3.redact_error(str(exc))
-    selected = resolver_v35b.outcome_price_in_window(
-        ticker=ticker,
-        horizon_end_date=horizon_end,
-        as_of_timestamp_utc=config.as_of_timestamp_utc,
-        price_dir=config.price_dir,
-        outcome_window_days=config.outcome_window_days,
-    )
+    try:
+        selected = resolver_v35b.outcome_price_in_window(
+            ticker=ticker,
+            horizon_end_date=horizon_end,
+            as_of_timestamp_utc=config.as_of_timestamp_utc,
+            price_dir=config.price_dir,
+            outcome_window_days=config.outcome_window_days,
+        )
+    except Exception as exc:  # noqa: BLE001 - malformed local price caches are data blockers.
+        return False, "missing_outcome_price:" + v3.redact_error(str(exc))
     if selected is None:
         return False, "missing_outcome_price"
     if decision_date > horizon_end:
@@ -230,19 +229,51 @@ def monitor_status(
         return STATUS_DATA_INSUFFICIENT
     if source_future_data_violation_count:
         return STATUS_BLOCKED_SOURCE_FUTURE_DATA
+    if blocked_data_count:
+        return STATUS_BLOCKED_DATA
     if matured_candidate_count == 0:
         return STATUS_DATA_NOT_MATURED
-    if matured_price_available_count == 0 and blocked_data_count:
-        return STATUS_BLOCKED_DATA
     if matured_price_available_count > 0:
         return STATUS_RESOLVER_PATH_ELIGIBLE
     return STATUS_FAIL
+
+
+def normalize_path_for_match(path: Path) -> str:
+    return str(path.expanduser().resolve(strict=False))
+
+
+def readiness_roots_match_current(
+    readiness_summary: dict[str, Any] | None,
+    input_roots: tuple[Path, ...],
+) -> bool:
+    if not readiness_summary:
+        return False
+    summary_roots = readiness_summary.get("input_roots")
+    if not isinstance(summary_roots, list) or not summary_roots:
+        return False
+    expected = {normalize_path_for_match(path) for path in input_roots}
+    observed = {normalize_path_for_match(Path(str(path))) for path in summary_roots}
+    return observed == expected
+
+
+def next_stage_planning_allowed(
+    *,
+    status: str,
+    readiness_status: str,
+    readiness_root_match: bool,
+) -> bool:
+    return (
+        status == STATUS_RESOLVER_PATH_ELIGIBLE
+        and readiness_status == readiness_v36.STATUS_READY
+        and readiness_root_match
+    )
 
 
 def blocker_reasons_for(
     *,
     status: str,
     readiness_status: str,
+    readiness_root_match: bool,
     source_future_data_violation_count: int,
     blocked_data_count: int,
 ) -> list[str]:
@@ -257,6 +288,10 @@ def blocker_reasons_for(
         reasons.append("source_future_data_contamination_detected")
     if readiness_status != readiness_v36.STATUS_READY:
         reasons.append("readiness_not_ready")
+    elif status != STATUS_RESOLVER_PATH_ELIGIBLE:
+        reasons.append("current_monitor_not_resolver_path_eligible")
+    elif not readiness_root_match:
+        reasons.append("readiness_summary_root_mismatch")
     return sorted(set(reasons))
 
 
@@ -394,7 +429,15 @@ def run_monitor(config: MonitorConfig) -> dict[str, Any]:
         matured_price_available_count=matured_price_available,
         blocked_data_count=blocked_data,
     )
-    next_stage_allowed = readiness_status == readiness_v36.STATUS_READY
+    readiness_root_match = readiness_roots_match_current(
+        readiness_summary,
+        config.input_roots,
+    )
+    next_stage_allowed = next_stage_planning_allowed(
+        status=status,
+        readiness_status=readiness_status,
+        readiness_root_match=readiness_root_match,
+    )
     summary = base_summary(config=config, output_root=output_root)
     summary.update(
         {
@@ -413,16 +456,18 @@ def run_monitor(config: MonitorConfig) -> dict[str, Any]:
             "readiness_status": readiness_status,
             "readiness_summary_path": str(config.readiness_summary_path or ""),
             "readiness_summary_schema": str((readiness_summary or {}).get("schema") or ""),
+            "readiness_summary_root_match": readiness_root_match,
             "next_check_after": next_check_after_for(immature_horizons),
             "blocker_reasons": blocker_reasons_for(
                 status=status,
                 readiness_status=readiness_status,
+                readiness_root_match=readiness_root_match,
                 source_future_data_violation_count=source_future,
                 blocked_data_count=blocked_data,
             ),
             "data_blockers": data_blockers[:20],
             "future_data_blockers": future_blockers[:20],
-            "resolver_path_eligible": matured_price_available > 0 and source_future == 0,
+            "resolver_path_eligible": status == STATUS_RESOLVER_PATH_ELIGIBLE,
             "next_stage_planning_allowed": next_stage_allowed,
             "v3_7_verdict_allowed": False,
             "v3_7_verdict_executed": False,
@@ -500,6 +545,7 @@ def main(argv: list[str] | None = None) -> int:
     hard_blocked = {
         STATUS_BLOCKED_RUN_ID_EXISTS,
         STATUS_BLOCKED_SOURCE_FUTURE_DATA,
+        STATUS_BLOCKED_DATA,
         STATUS_FAIL,
     }
     return 1 if str(summary.get("status")) in hard_blocked else 0

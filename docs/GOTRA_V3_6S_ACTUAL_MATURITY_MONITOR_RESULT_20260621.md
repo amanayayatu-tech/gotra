@@ -33,6 +33,19 @@ checks matured price availability using the existing v3.5B daily-close
 availability rule, surfaces source future-data contamination, and optionally
 reads a v3.6 readiness summary. It never executes v3.7 verdict logic.
 
+Review hardening added after PR #36 self-audit:
+
+- Artifact-directory roots now scan their own `**/*.json` contents, so
+  `.../captures/full_gotra/...` style inputs are accepted.
+- Missing or invalid `horizon_end_date` is `BLOCKED_DATA`, not
+  `DATA_NOT_MATURED`.
+- Empty, malformed, or unreadable price caches are `BLOCKED_DATA` blockers.
+- Any matured capture with missing price data forces `BLOCKED_DATA`; partial
+  price availability does not advertise resolver eligibility.
+- External `READY_FOR_FORWARD_LIVE_VERDICT` summaries cannot allow planning
+  unless the current monitor result is resolver-path eligible and the readiness
+  summary roots match the current input roots.
+
 ## Actual Maturity Recheck
 
 Command:
@@ -40,18 +53,19 @@ Command:
 ```bash
 uv run python scripts/baseline_v3_6s_actual_maturity_monitor.py \
   --input-root data/backtest/runs \
-  --monitor-run-id baseline_v3_6s_actual_maturity_monitor_actual_20260621T030035Z \
-  --output-dir /tmp/gotra_v3_6s_actual_maturity_20260621T030035Z/runs \
+  --monitor-run-id baseline_v3_6s_actual_maturity_monitor_reviewfix_20260621T031553Z \
+  --output-dir /tmp/gotra_v3_6s_actual_maturity_reviewfix_20260621T031553Z/runs \
   --price-dir data/backtest/prices
 ```
 
 Output:
 
-- Run id: `baseline_v3_6s_actual_maturity_monitor_actual_20260621T030035Z`
-- Summary path: `/tmp/gotra_v3_6s_actual_maturity_20260621T030035Z/runs/baseline_v3_6s_actual_maturity_monitor_actual_20260621T030035Z/summary.json`
-- Summary sha256: `2754d4dd5a21c49e8b34128e9787c05d003a9054b1860643d4d475fb63b5a3dd`
+- Run id: `baseline_v3_6s_actual_maturity_monitor_reviewfix_20260621T031553Z`
+- Summary path: `/tmp/gotra_v3_6s_actual_maturity_reviewfix_20260621T031553Z/runs/baseline_v3_6s_actual_maturity_monitor_reviewfix_20260621T031553Z/summary.json`
+- Summary sha256: `fbcd080243fdce43c89d2909014cd13ed1cd7c82b9b96894e6448d9650836c6b`
 - Status: `DATA_NOT_MATURED`
 - Readiness status: `NOT_RUN`
+- Readiness summary root match: `false`
 - Next check after: `2026-07-21T00:00:00Z`
 
 Key counts:
@@ -84,13 +98,17 @@ Commands run:
 uv run python -m py_compile scripts/baseline_v3_6s_actual_maturity_monitor.py scripts/baseline_v3_6_forward_live_verdict_readiness_gate.py
 uv run ruff check --no-cache scripts/baseline_v3_6s_actual_maturity_monitor.py tests/test_forward_live_maturity_monitor.py
 uv run pytest -q tests/test_forward_live_maturity_monitor.py
+uv run pytest -q tests/test_forward_live_maturity_monitor.py tests/test_forward_live_capture.py tests/test_forward_live_outcome_resolver.py tests/test_forward_live_outcome_scheduler.py tests/test_forward_live_operating_loop.py tests/test_forward_live_matured_outcome_scorer.py tests/test_forward_live_verdict_readiness_gate.py
+uv run pytest -q
 ```
 
 Results:
 
 - py_compile: pass
 - Ruff: pass
-- Focused v3.6S tests: `6 passed`
+- Focused v3.6S tests: `12 passed`
+- v3.5/v3.6 regression set: `88 passed`
+- Full test suite: `366 passed`
 
 ## Artifact Boundary
 

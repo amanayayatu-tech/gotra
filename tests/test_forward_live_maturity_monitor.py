@@ -57,6 +57,73 @@ def test_monitor_reports_data_not_matured_for_all_immature_captures(
     assert "capture_horizons_not_matured" in summary["blocker_reasons"]
 
 
+def test_monitor_accepts_capture_artifact_directory_as_input_root(
+    tmp_path: Path,
+) -> None:
+    capture_dir = _write_capture_run(
+        tmp_path,
+        [_capture("AAPL", "2026-06-20", "2026-07-20", "2026-06-19")],
+    )
+    artifact_dir = capture_dir / "captures" / "full_gotra"
+    _write_prices(tmp_path / "prices", "AAPL", [("2026-06-19", 100.0)])
+    config = _monitor_config(
+        tmp_path,
+        input_root=artifact_dir,
+        run_id="baseline_v3_6s_actual_maturity_monitor_artifact_dir",
+        as_of="2026-07-19T00:00:00Z",
+    )
+
+    summary = monitor.run_monitor(config)
+
+    assert summary["status"] == monitor.STATUS_DATA_NOT_MATURED
+    assert summary["capture_artifact_count"] == 1
+    assert summary["checked_capture_run_count"] == 1
+
+
+def test_monitor_blocks_invalid_horizon_instead_of_reporting_not_matured(
+    tmp_path: Path,
+) -> None:
+    capture = _capture("AAPL", "2026-06-20", "2026-07-20", "2026-06-19")
+    capture.pop("horizon_end_date")
+    capture_dir = _write_capture_run(tmp_path, [capture])
+    config = _monitor_config(
+        tmp_path,
+        input_root=capture_dir,
+        run_id="baseline_v3_6s_actual_maturity_monitor_invalid_horizon",
+        as_of="2026-07-19T00:00:00Z",
+    )
+
+    summary = monitor.run_monitor(config)
+
+    assert summary["status"] == monitor.STATUS_BLOCKED_DATA
+    assert summary["blocked_data_count"] == 1
+    assert summary["not_matured_count"] == 0
+    assert "matured_candidates_missing_usable_price_data" in summary["blocker_reasons"]
+
+
+def test_monitor_cli_returns_nonzero_for_blocked_data(tmp_path: Path) -> None:
+    capture = _capture("AAPL", "2026-06-20", "2026-07-20", "2026-06-19")
+    capture.pop("horizon_end_date")
+    capture_dir = _write_capture_run(tmp_path, [capture])
+
+    code = monitor.main(
+        [
+            "--input-root",
+            str(capture_dir),
+            "--monitor-run-id",
+            "baseline_v3_6s_actual_maturity_monitor_cli_invalid_horizon",
+            "--as-of-timestamp-utc",
+            "2026-07-19T00:00:00Z",
+            "--price-dir",
+            str(tmp_path / "prices"),
+            "--output-dir",
+            str(tmp_path / "runs"),
+        ]
+    )
+
+    assert code == 1
+
+
 def test_monitor_reports_blocked_data_when_matured_price_is_missing(
     tmp_path: Path,
 ) -> None:
@@ -77,6 +144,58 @@ def test_monitor_reports_blocked_data_when_matured_price_is_missing(
     assert summary["status"] == monitor.STATUS_BLOCKED_DATA
     assert summary["matured_candidate_count"] == 1
     assert summary["matured_price_available_count"] == 0
+    assert summary["blocked_data_count"] == 1
+    assert summary["resolver_path_eligible"] is False
+
+
+def test_monitor_treats_malformed_price_cache_as_blocked_data(tmp_path: Path) -> None:
+    capture_dir = _write_capture_run(
+        tmp_path,
+        [_capture("AAPL", "2026-06-20", "2026-07-20", "2026-06-19")],
+    )
+    price_dir = tmp_path / "prices"
+    price_dir.mkdir()
+    (price_dir / "AAPL.csv").write_text("", encoding="utf-8")
+    config = _monitor_config(
+        tmp_path,
+        input_root=capture_dir,
+        run_id="baseline_v3_6s_actual_maturity_monitor_malformed_price",
+        as_of="2026-07-21T00:00:00Z",
+    )
+
+    summary = monitor.run_monitor(config)
+
+    assert summary["status"] == monitor.STATUS_BLOCKED_DATA
+    assert summary["blocked_data_count"] == 1
+    assert summary["data_blockers"][0]["reason"].startswith("missing_decision_price:")
+
+
+def test_monitor_blocks_when_any_matured_price_is_missing(tmp_path: Path) -> None:
+    capture_dir = _write_capture_run(
+        tmp_path,
+        [
+            _capture("AAPL", "2026-06-20", "2026-07-20", "2026-06-19"),
+            _capture("MSFT", "2026-06-20", "2026-07-20", "2026-06-19"),
+        ],
+    )
+    _write_prices(
+        tmp_path / "prices",
+        "AAPL",
+        [("2026-06-19", 100.0), ("2026-07-20", 110.0)],
+    )
+    _write_prices(tmp_path / "prices", "MSFT", [("2026-06-19", 200.0)])
+    config = _monitor_config(
+        tmp_path,
+        input_root=capture_dir,
+        run_id="baseline_v3_6s_actual_maturity_monitor_mixed_price_blocked",
+        as_of="2026-07-21T00:00:00Z",
+    )
+
+    summary = monitor.run_monitor(config)
+
+    assert summary["status"] == monitor.STATUS_BLOCKED_DATA
+    assert summary["matured_candidate_count"] == 2
+    assert summary["matured_price_available_count"] == 1
     assert summary["blocked_data_count"] == 1
     assert summary["resolver_path_eligible"] is False
 
@@ -141,6 +260,36 @@ def test_monitor_blocks_v3_7_when_readiness_is_not_ready(tmp_path: Path) -> None
     assert "readiness_not_ready" in summary["blocker_reasons"]
 
 
+def test_monitor_external_ready_summary_cannot_override_current_not_matured(
+    tmp_path: Path,
+) -> None:
+    capture_dir = _write_capture_run(
+        tmp_path,
+        [_capture("AAPL", "2026-06-20", "2026-07-20", "2026-06-19")],
+    )
+    _write_prices(tmp_path / "prices", "AAPL", [("2026-06-19", 100.0)])
+    readiness_path = _write_readiness_summary(
+        tmp_path,
+        status=readiness_v36.STATUS_READY,
+        input_roots=[capture_dir],
+    )
+    config = _monitor_config(
+        tmp_path,
+        input_root=capture_dir,
+        run_id="baseline_v3_6s_actual_maturity_monitor_stale_ready",
+        as_of="2026-07-19T00:00:00Z",
+        readiness_summary_path=readiness_path,
+    )
+
+    summary = monitor.run_monitor(config)
+
+    assert summary["status"] == monitor.STATUS_DATA_NOT_MATURED
+    assert summary["readiness_status"] == readiness_v36.STATUS_READY
+    assert summary["readiness_summary_root_match"] is True
+    assert summary["next_stage_planning_allowed"] is False
+    assert "current_monitor_not_resolver_path_eligible" in summary["blocker_reasons"]
+
+
 def test_monitor_ready_only_allows_next_stage_planning_not_verdict_execution(
     tmp_path: Path,
 ) -> None:
@@ -153,7 +302,11 @@ def test_monitor_ready_only_allows_next_stage_planning_not_verdict_execution(
         "AAPL",
         [("2026-06-19", 100.0), ("2026-07-20", 110.0)],
     )
-    readiness_path = _write_readiness_summary(tmp_path, status=readiness_v36.STATUS_READY)
+    readiness_path = _write_readiness_summary(
+        tmp_path,
+        status=readiness_v36.STATUS_READY,
+        input_roots=[capture_dir],
+    )
     config = _monitor_config(
         tmp_path,
         input_root=capture_dir,
@@ -165,6 +318,7 @@ def test_monitor_ready_only_allows_next_stage_planning_not_verdict_execution(
     summary = monitor.run_monitor(config)
 
     assert summary["readiness_status"] == readiness_v36.STATUS_READY
+    assert summary["readiness_summary_root_match"] is True
     assert summary["next_stage_planning_allowed"] is True
     assert summary["v3_7_verdict_allowed"] is False
     assert summary["v3_7_verdict_executed"] is False
@@ -235,7 +389,12 @@ def _write_prices(price_dir: Path, ticker: str, rows: list[tuple[str, float]]) -
     frame.to_csv(price_dir / f"{ticker}.csv", index=False)
 
 
-def _write_readiness_summary(tmp_path: Path, *, status: str) -> Path:
+def _write_readiness_summary(
+    tmp_path: Path,
+    *,
+    status: str,
+    input_roots: list[Path] | None = None,
+) -> Path:
     path = tmp_path / f"readiness_{status}.json"
     path.write_text(
         json.dumps(
@@ -243,6 +402,7 @@ def _write_readiness_summary(tmp_path: Path, *, status: str) -> Path:
                 "schema": readiness_v36.SUMMARY_SCHEMA,
                 "readiness_run_id": "baseline_v3_6_forward_live_verdict_readiness_fixture",
                 "status": status,
+                "input_roots": [str(root) for root in input_roots or []],
                 "provider_or_backend_called": False,
                 "codex_cli_called": False,
                 "formal_lite_entered": False,
