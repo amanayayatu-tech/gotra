@@ -32,6 +32,11 @@ must not read raw transcripts, provider raw outputs, `data/backtest/runs/**`,
 `data/paper_trading/**`, `.env*`, DB files, bundles, or Stage8/Stage9 local
 artifacts.
 
+Both `--file` and `--manifest` paths are normalized before artifact-boundary
+checks. Absolute paths containing forbidden repo segments are blocked before
+read. Manifest `changed_files` and document paths are scanned as boundary
+inputs, but forbidden artifact content is never loaded.
+
 ## Blocking Rules
 
 The scanner blocks on:
@@ -55,6 +60,14 @@ The scanner should avoid false positives for explicit non-claim statements such
 as `not OOS/science/public/trading claim`, `not investment advice`,
 `engineering/local only`, `historical/internal only`, `v3_7_allowed=false`, and
 `direct_llm_parametric_memory_control`.
+
+Negation is scoped to the matched boundary term's current clause; a nearby
+unrelated caveat cannot mask a later overclaim. Maturity-gate claims are scanned
+independently from generic caveat allowlists, so `not OOS; v3.7 verdict ready`
+still blocks. Explicit false/no forms such as `v3_7_allowed=false` or
+`v3.7 verdict allowed: false` are allowed. The required caveat
+`direct_llm_parametric_memory_control is not a clean no-future baseline` is
+allowed, while `direct_llm is a clean no-future baseline` remains blocked.
 
 Ambiguous wording may produce warnings, but only clear boundary violations
 block.

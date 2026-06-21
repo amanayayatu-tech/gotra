@@ -19,6 +19,7 @@ SUMMARY_SCHEMA = "gotra.baseline_v3_6ab.evidence_claim_boundary_scan_summary.v1"
 MANIFEST_SCHEMA = "gotra.baseline_v3_6ab.evidence_claim_boundary_scan_manifest.v1"
 RUN_ID_PREFIX = "baseline_v3_6ab_evidence_claim_boundary_scan_"
 SCRIPT_VERSION = "v3.6ab-20260621"
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 STATUS_CLEAN = "CLAIM_BOUNDARY_CLEAN"
 STATUS_BLOCKED_ARTIFACT = "CLAIM_BOUNDARY_BLOCKED_ARTIFACT"
@@ -30,8 +31,8 @@ STATUS_BLOCKED_RUN_ID_EXISTS = "CLAIM_BOUNDARY_BLOCKED_RUN_ID_EXISTS"
 DIRECT_LLM_INTERPRETATION = "direct_llm_parametric_memory_control"
 
 FORBIDDEN_PATH_PATTERNS = (
-    r"^data/backtest/runs/",
-    r"^data/paper_trading/",
+    r"(^|/)data/backtest/runs/",
+    r"(^|/)data/paper_trading/",
     r"(^|/)\.env",
     r"\.(sqlite|sqlite3|db)$",
     r"\.(bundle|tar|tgz|tar\.gz|zip)$",
@@ -44,7 +45,7 @@ OVERCLAIM_PATTERNS = (
         "oos_science_public_trading_claim",
         re.compile(
             r"\b(OOS|science|public|trading|investment)\b.{0,40}"
-            r"\b(pass|proof|claim|advice|recommendation|validated|accepted)\b",
+            r"\b(pass|proof|claim|evidence|advice|recommendation|validated|accepted)\b",
             re.IGNORECASE,
         ),
     ),
@@ -62,11 +63,26 @@ OVERCLAIM_PATTERNS = (
 MATURITY_GATE_PATTERNS = (
     (
         "v3_7_allowed_true",
-        re.compile(r"\bv3[_ .-]?7[_ .-]?allowed\s*[:=]\s*true\b", re.IGNORECASE),
+        re.compile(
+            r"['\"]?\bv3[_ .-]?7[_ .-]?allowed['\"]?\s*[:=]\s*true\b",
+            re.IGNORECASE,
+        ),
     ),
     (
         "v3_7_verdict_allowed",
-        re.compile(r"\bv3\.?7\b.{0,40}\b(verdict|30D)\b.{0,40}\b(allowed|ready|pass)\b", re.IGNORECASE),
+        re.compile(
+            r"\bv(?:3[._-]?7|37)\b.{0,40}\b(verdict|30D)\b"
+            r".{0,40}\b(allowed|ready|pass)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "v3_7_plain_allowed",
+        re.compile(
+            r"\bv(?:3[._-]?7|37)\b(?![^\n]{0,30}\b(verdict|30D)\b)"
+            r".{0,30}\b(?:is\s+)?(allowed|ready|pass)\b",
+            re.IGNORECASE,
+        ),
     ),
     (
         "thirty_day_forward_live_verdict",
@@ -79,7 +95,8 @@ SHORT_HORIZON_AS_30D_PATTERNS = (
         "short_horizon_as_30d_verdict",
         re.compile(
             r"\b(short[-_ ]horizon|SHORT_HORIZON).{0,80}"
-            r"\b(30D|thirty[- ]day|v3\.?7|verdict)\b.{0,40}\b(allowed|ready|pass|equivalent)\b",
+            r"\b(30D|thirty[- ]day|v(?:3[._-]?7|37)|verdict)\b"
+            r".{0,40}\b(allowed|ready|pass|equivalent)\b",
             re.IGNORECASE,
         ),
     ),
@@ -132,8 +149,24 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def normalize_scan_path(path: Path | str) -> str:
+    raw = str(path).replace("\\", "/")
+    if not raw:
+        return ""
+    try:
+        resolved = Path(raw).expanduser().resolve()
+    except OSError:
+        return raw
+    for root in (Path.cwd().resolve(), REPO_ROOT.resolve()):
+        try:
+            return resolved.relative_to(root).as_posix()
+        except ValueError:
+            continue
+    return resolved.as_posix()
+
+
 def forbidden_path(path: str) -> bool:
-    normalized = path.replace("\\", "/")
+    normalized = normalize_scan_path(path)
     return any(re.search(pattern, normalized) for pattern in FORBIDDEN_PATH_PATTERNS)
 
 
@@ -175,7 +208,7 @@ def source_from_manifest_entry(entry: Any) -> ScanSource:
     if not isinstance(entry, dict):
         return ScanSource(path="", text="", origin="manifest_invalid")
     return ScanSource(
-        path=str(entry.get("path") or entry.get("filename") or ""),
+        path=normalize_scan_path(str(entry.get("path") or entry.get("filename") or "")),
         text=str(entry.get("text") or entry.get("body") or entry.get("content") or ""),
         origin="manifest",
     )
@@ -185,12 +218,15 @@ def collect_sources(config: ScanConfig) -> tuple[list[ScanSource], list[str]]:
     sources: list[ScanSource] = []
     all_paths: list[str] = []
     if config.manifest:
-        manifest = load_manifest(config.manifest)
-        manifest_texts, manifest_paths = manifest_sources(manifest)
-        sources.extend(manifest_texts)
-        all_paths.extend(manifest_paths)
+        manifest_path = normalize_scan_path(config.manifest)
+        all_paths.append(manifest_path)
+        if not forbidden_path(manifest_path):
+            manifest = load_manifest(config.manifest)
+            manifest_texts, manifest_paths = manifest_sources(manifest)
+            sources.extend(manifest_texts)
+            all_paths.extend(manifest_paths)
     for path in config.files:
-        file_path = str(path)
+        file_path = normalize_scan_path(path)
         all_paths.append(file_path)
         if forbidden_path(file_path):
             continue
@@ -213,9 +249,38 @@ def make_blocked_item(path: str, line_number: int, rule_id: str, reason: str) ->
     }
 
 
+def clause_prefix(text: str, match_start: int) -> str:
+    prefix_start = max(
+        text.rfind(".", 0, match_start),
+        text.rfind(";", 0, match_start),
+        text.rfind("\n", 0, match_start),
+    )
+    return text[prefix_start + 1 : match_start].strip().lower()
+
+
 def is_negated(text: str, match_start: int) -> bool:
-    prefix = text[max(0, match_start - 64) : match_start].lower()
-    return any(marker in prefix for marker in ("not ", "no ", "不是", "不得", "非"))
+    return bool(re.search(r"(?:^|\b)(not|no)\b|不是|不得|非", clause_prefix(text, match_start)))
+
+
+def maturity_match_is_explicitly_false(line: str, match: re.Match[str]) -> bool:
+    lowered = line.lower()
+    window = lowered[max(0, match.start() - 24) : min(len(lowered), match.end() + 32)]
+    return bool(
+        re.search(r"[:=]\s*(false|no)\b", window)
+        or re.search(r"\bnot\s+(?:ready|allowed|pass|a\s+pass)\b", window)
+        or re.search(r"\bnot\s+(?:a\s+)?(?:30d\s+)?(?:forward-live\s+)?verdict\b", window)
+    )
+
+
+def direct_llm_clean_baseline_is_negated(line: str) -> bool:
+    return bool(
+        re.search(
+            r"\bdirect_llm(?:_parametric_memory_control)?\b"
+            r".{0,80}\bnot\s+(?:a\s+)?clean\s+no[- ]future\s+baseline\b",
+            line,
+            re.IGNORECASE,
+        )
+    )
 
 
 def line_allows_boundary(line: str) -> bool:
@@ -277,7 +342,10 @@ def scan_line(
                 "direct_llm must be labeled direct_llm_parametric_memory_control",
             )
         )
-    if re.search(r"direct_llm.{0,80}clean\s+no[- ]future\s+baseline", line, re.IGNORECASE):
+    if (
+        re.search(r"direct_llm.{0,80}clean\s+no[- ]future\s+baseline", line, re.IGNORECASE)
+        and not direct_llm_clean_baseline_is_negated(line)
+    ):
         result["direct_llm"].append(
             make_blocked_item(
                 source.path,
@@ -288,7 +356,7 @@ def scan_line(
         )
     for rule_id, pattern in MATURITY_GATE_PATTERNS:
         for match in pattern.finditer(line):
-            if is_negated(line, match.start()) or line_allows_boundary(line):
+            if is_negated(line, match.start()) or maturity_match_is_explicitly_false(line, match):
                 continue
             result["maturity_gate"].append(
                 make_blocked_item(
@@ -300,7 +368,7 @@ def scan_line(
             )
     for rule_id, pattern in SHORT_HORIZON_AS_30D_PATTERNS:
         for match in pattern.finditer(line):
-            if is_negated(line, match.start()) or line_allows_boundary(line):
+            if is_negated(line, match.start()) or maturity_match_is_explicitly_false(line, match):
                 continue
             result["short_horizon_as_30d"].append(
                 make_blocked_item(
@@ -437,6 +505,7 @@ def run_scan(config: ScanConfig) -> dict[str, Any]:
         short_horizon_as_30d_count=len(short_horizon),
     )
     summary = base_summary(config, run_root=run_root)
+    manifest_path = normalize_scan_path(config.manifest) if config.manifest else ""
     summary.update(
         {
             "scanned_file_count": len(paths),
@@ -450,8 +519,12 @@ def run_scan(config: ScanConfig) -> dict[str, Any]:
             "warnings": warnings,
             "overall_status": status,
             "scanned_paths": paths,
-            "manifest_path": str(config.manifest) if config.manifest else "",
-            "manifest_sha256": sha256_file(config.manifest) if config.manifest else "",
+            "manifest_path": manifest_path,
+            "manifest_sha256": (
+                sha256_file(config.manifest)
+                if config.manifest and not forbidden_path(manifest_path)
+                else ""
+            ),
         }
     )
     write_outputs(config=config, run_root=run_root, summary=summary)
