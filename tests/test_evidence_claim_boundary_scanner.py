@@ -149,6 +149,18 @@ def test_direct_llm_boundary_status_field_is_allowed(tmp_path: Path) -> None:
     assert summary["direct_llm_mislabel_count"] == 0
 
 
+def test_direct_llm_technical_field_does_not_exempt_same_line_claim(tmp_path: Path) -> None:
+    manifest = _write_manifest(
+        tmp_path,
+        [{"path": "docs/fields_bad.md", "text": "direct_llm_boundary_status: direct_llm verdict accepted"}],
+    )
+
+    summary = scanner.run_scan(_config(tmp_path, manifest))
+
+    assert summary["overall_status"] == scanner.STATUS_BLOCKED_DIRECT_LLM
+    assert summary["direct_llm_mislabel_count"] >= 1
+
+
 def test_short_horizon_canary_as_30d_verdict_blocks_maturity_gate(tmp_path: Path) -> None:
     manifest = _write_manifest(
         tmp_path,

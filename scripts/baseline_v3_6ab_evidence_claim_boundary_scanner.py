@@ -34,6 +34,7 @@ DIRECT_LLM_TECHNICAL_FIELDS = (
     "direct_llm_interpretation",
     "direct_llm_mislabel_count",
 )
+ALLOWED_ENV_TEMPLATE_PATHS = {".env.example"}
 
 FORBIDDEN_PATH_PATTERNS = (
     r"(^|/)data/backtest/runs/",
@@ -172,6 +173,8 @@ def normalize_scan_path(path: Path | str) -> str:
 
 def forbidden_path(path: str) -> bool:
     normalized = normalize_scan_path(path)
+    if normalized in ALLOWED_ENV_TEMPLATE_PATHS:
+        return False
     return any(re.search(pattern, normalized) for pattern in FORBIDDEN_PATH_PATTERNS)
 
 
@@ -288,9 +291,11 @@ def direct_llm_clean_baseline_is_negated(line: str) -> bool:
     )
 
 
-def direct_llm_line_is_technical_field(line: str) -> bool:
-    lowered = line.lower()
-    return any(field in lowered for field in DIRECT_LLM_TECHNICAL_FIELDS)
+def line_without_direct_llm_technical_fields(line: str) -> str:
+    remaining = line
+    for field in DIRECT_LLM_TECHNICAL_FIELDS:
+        remaining = re.sub(rf"`?\b{re.escape(field)}\b`?", "", remaining, flags=re.IGNORECASE)
+    return remaining
 
 
 def line_allows_boundary(line: str) -> bool:
@@ -331,6 +336,7 @@ def scan_line(
     line_number: int,
     result: dict[str, list[dict[str, Any]]],
 ) -> None:
+    direct_llm_line = line_without_direct_llm_technical_fields(line)
     for rule_id, pattern in OVERCLAIM_PATTERNS:
         for match in pattern.finditer(line):
             if is_negated(line, match.start()):
@@ -344,9 +350,8 @@ def scan_line(
                 )
             )
     if (
-        "direct_llm" in line
-        and DIRECT_LLM_INTERPRETATION not in line
-        and not direct_llm_line_is_technical_field(line)
+        "direct_llm" in direct_llm_line
+        and DIRECT_LLM_INTERPRETATION not in direct_llm_line
     ):
         result["direct_llm"].append(
             make_blocked_item(
@@ -357,8 +362,8 @@ def scan_line(
             )
         )
     if (
-        re.search(r"direct_llm.{0,80}clean\s+no[- ]future\s+baseline", line, re.IGNORECASE)
-        and not direct_llm_clean_baseline_is_negated(line)
+        re.search(r"direct_llm.{0,80}clean\s+no[- ]future\s+baseline", direct_llm_line, re.IGNORECASE)
+        and not direct_llm_clean_baseline_is_negated(direct_llm_line)
     ):
         result["direct_llm"].append(
             make_blocked_item(
