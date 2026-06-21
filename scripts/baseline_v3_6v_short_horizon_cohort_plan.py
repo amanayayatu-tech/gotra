@@ -115,9 +115,9 @@ def validate_config(config: PlanConfig) -> None:
     for ticker in config.tickers:
         slug = ticker_slug(ticker)
         prior = slugs.get(slug)
-        if prior is not None and prior != ticker:
+        if prior is not None:
             raise ValueError(
-                f"ticker slug collision: {prior!r} and {ticker!r} both map to {slug!r}"
+                f"duplicate ticker slug: {prior!r} and {ticker!r} both map to {slug!r}"
             )
         slugs[slug] = ticker
 

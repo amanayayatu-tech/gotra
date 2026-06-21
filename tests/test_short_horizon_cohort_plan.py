@@ -73,6 +73,18 @@ def test_short_horizon_plan_blocks_missing_price_cache(tmp_path: Path) -> None:
     assert summary["blockers"][0]["reason"] == "price_cache_unavailable"
 
 
+@pytest.mark.parametrize("tickers", [("AAPL", "AAPL"), ("BRK.B", "BRK-B")])
+def test_short_horizon_plan_rejects_duplicate_ticker_slugs(
+    tmp_path: Path,
+    tickers: tuple[str, ...],
+) -> None:
+    config = _plan_config(tmp_path, tickers=tickers, horizons=(1,))
+
+    with pytest.raises(ValueError, match="duplicate ticker slug"):
+        plan.run_plan(config)
+    assert not (tmp_path / "runs" / config.plan_run_id).exists()
+
+
 def test_short_horizon_existing_run_id_blocks_without_overwrite(tmp_path: Path) -> None:
     _write_prices(tmp_path / "prices", "AAPL")
     config = _plan_config(tmp_path, tickers=("AAPL",), horizons=(1,))

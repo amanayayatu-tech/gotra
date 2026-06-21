@@ -184,7 +184,7 @@ Commands run:
 ```bash
 uv run python -m py_compile scripts/baseline_v3_6v_short_horizon_cohort_plan.py scripts/baseline_v3_deterministic_price_only_verdict.py
 uv run ruff check --no-cache scripts/baseline_v3_6v_short_horizon_cohort_plan.py tests/test_short_horizon_cohort_plan.py scripts/baseline_v3_deterministic_price_only_verdict.py tests/test_deterministic_price_only_verdict.py
-uv run pytest -q tests/test_short_horizon_cohort_plan.py tests/test_deterministic_price_only_verdict.py
+uv run pytest -q tests/test_short_horizon_cohort_plan.py tests/test_deterministic_price_only_verdict.py tests/test_forward_live_monitor_ops.py
 uv run pytest -q
 git diff --check
 ```
@@ -193,6 +193,6 @@ Results:
 
 - py_compile: pass
 - Ruff: pass
-- Focused tests: `23 passed`
-- Full test suite: `381 passed`
+- Focused tests: `35 passed`
+- Full test suite: `386 passed`
 - `git diff --check`: pass
