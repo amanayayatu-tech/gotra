@@ -270,10 +270,13 @@ def test_workflow_contains_safe_pull_request_step() -> None:
     )
 
     assert "GOTRA changed-file boundary preflight" in workflow
+    assert "fetch-depth: 0" in workflow
     assert "github.event_name == 'pull_request'" in workflow
     assert "baseline_v3_6ag_ci_changed_files_preflight.py" in workflow
     assert "--base-sha \"$BASE_SHA\"" in workflow
     assert "--head-sha \"$HEAD_SHA\"" in workflow
+    assert "git fetch --no-tags origin \"$BASE_SHA\" \"$HEAD_SHA\"" in workflow
+    assert "git fetch --no-tags --depth=1" not in workflow
 
 
 def test_duplicate_run_id_does_not_overwrite_existing_outputs(tmp_path: Path) -> None:

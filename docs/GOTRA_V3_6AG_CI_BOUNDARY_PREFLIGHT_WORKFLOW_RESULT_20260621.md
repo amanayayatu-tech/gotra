@@ -33,7 +33,7 @@ Workflow changed: `.github/workflows/ci.yml`.
 
 The workflow now includes a pull-request-only step named
 `GOTRA changed-file boundary preflight`. The step fetches GitHub-provided base
-and head SHAs, then runs:
+and head SHAs after a full-history checkout, then runs:
 
 ```bash
 uv run python scripts/baseline_v3_6ag_ci_changed_files_preflight.py \
@@ -51,20 +51,20 @@ Command:
 
 ```bash
 uv run python scripts/baseline_v3_6ag_ci_changed_files_preflight.py \
-  --ci-adoption-run-id baseline_v3_6ag_ci_changed_files_preflight_pr48_repair_20260621T105815Z \
+  --ci-adoption-run-id baseline_v3_6ag_ci_changed_files_preflight_pr48_final_20260621T110203Z \
   --repo-root /Users/peachy/Documents/gotra \
   --base-sha origin/codex/gotra-v3-6af-ci-stack-boundary-preflight-20260621 \
   --head-sha HEAD \
-  --output-root /tmp/gotra_v3_6ag_pr48_repair_validation_20260621T105815Z/runs
+  --output-root /tmp/gotra_v3_6ag_pr48_final_boundary_check_20260621T110203Z/runs
 ```
 
 Output, not committed:
 
-`/tmp/gotra_v3_6ag_pr48_repair_validation_20260621T105815Z/runs/baseline_v3_6ag_ci_changed_files_preflight_pr48_repair_20260621T105815Z/summary.json`
+`/tmp/gotra_v3_6ag_pr48_final_boundary_check_20260621T110203Z/runs/baseline_v3_6ag_ci_changed_files_preflight_pr48_final_20260621T110203Z/summary.json`
 
 Summary sha256:
 
-`56ae05cad79fb1d14176a19b1f1f96a2058efc6f077b920ebdf41f40763d32df`
+`a21254022af39cdf91964eb21443f9a42e7df03c116fdad3ebcd12baa51dd6e4`
 
 Result:
 
@@ -75,9 +75,9 @@ Result:
 - Skipped gitlink count: `0`
 - Skipped non-file count: `0`
 - Manifest path:
-  `/tmp/gotra_v3_6ag_pr48_repair_validation_20260621T105815Z/runs/baseline_v3_6ag_ci_changed_files_preflight_pr48_repair_20260621T105815Z/changed_files_manifest.json`
+  `/tmp/gotra_v3_6ag_pr48_final_boundary_check_20260621T110203Z/runs/baseline_v3_6ag_ci_changed_files_preflight_pr48_final_20260621T110203Z/changed_files_manifest.json`
 - Preflight summary path:
-  `/tmp/gotra_v3_6ag_pr48_repair_validation_20260621T105815Z/runs/baseline_v3_6ag_ci_changed_files_preflight_pr48_repair_20260621T105815Z/preflight_runs/baseline_v3_6af_ci_stack_boundary_preflight_v3_6ag_pr48_repair_20260621T105815Z/summary.json`
+  `/tmp/gotra_v3_6ag_pr48_final_boundary_check_20260621T110203Z/runs/baseline_v3_6ag_ci_changed_files_preflight_pr48_final_20260621T110203Z/preflight_runs/baseline_v3_6af_ci_stack_boundary_preflight_v3_6ag_pr48_final_20260621T110203Z/summary.json`
 - Preflight status: `CI_STACK_BOUNDARY_PREFLIGHT_CLEAN`
 - Artifact boundary status: `clean`
 - Claim boundary status: `clean`
