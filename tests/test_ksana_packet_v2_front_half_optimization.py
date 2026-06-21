@@ -53,6 +53,25 @@ def test_missing_ranked_hypotheses_blocks_schema(tmp_path: Path) -> None:
     assert "missing_or_invalid_packet_v2_schema_field" in summary["blocker_reasons"]
 
 
+def test_invalid_evidence_layer_blocks_before_ready(tmp_path: Path) -> None:
+    packet = _packet()
+    packet["evidence_layer"] = "OOS science public proof trading advice provider run"
+
+    summary = packet_v2.run_validator(_config(tmp_path, packet=packet))
+
+    assert summary["validator_status"] == packet_v2.STATUS_BLOCKED_SCHEMA
+    assert any("evidence_layer" in item["reason"] for item in summary["blocked_items"])
+
+
+def test_non_positive_baseline_lift_is_low_information_gain(tmp_path: Path) -> None:
+    summary = packet_v2.run_validator(
+        _config(tmp_path, packet=_packet(), baseline=_richer_packet(source_suffix="baseline"))
+    )
+
+    assert summary["validator_status"] == packet_v2.STATUS_LOW_INFORMATION_GAIN
+    assert summary["information_gain_delta"] <= 0
+
+
 def test_missing_counterfactuals_blocks_schema(tmp_path: Path) -> None:
     packet = _packet()
     packet.pop("counterfactuals")
@@ -71,6 +90,35 @@ def test_missing_falsification_trigger_blocks_schema(tmp_path: Path) -> None:
 
     assert summary["validator_status"] == packet_v2.STATUS_BLOCKED_SCHEMA
     assert any("falsification_triggers" in item["reason"] for item in summary["blocked_items"])
+
+
+def test_placeholder_required_list_entries_block_schema(tmp_path: Path) -> None:
+    packet = _packet()
+    packet["counterfactuals"] = [None]
+    packet["falsification_triggers"] = [{}]
+    packet["expected_observable_evidence"] = [""]
+    packet["disagreement_with_price_only"] = ["  "]
+    packet["evidence_gaps"] = [None]
+
+    summary = packet_v2.run_validator(_config(tmp_path, packet=packet))
+
+    assert summary["validator_status"] == packet_v2.STATUS_BLOCKED_SCHEMA
+    reason = ",".join(item["reason"] for item in summary["blocked_items"])
+    assert "counterfactuals" in reason
+    assert "falsification_triggers" in reason
+    assert "expected_observable_evidence" in reason
+    assert "disagreement_with_price_only" in reason
+    assert "evidence_gaps" in reason
+
+
+def test_ranked_hypothesis_requires_non_empty_text(tmp_path: Path) -> None:
+    packet = _packet()
+    packet["ranked_hypotheses"][0]["hypothesis"] = ""
+
+    summary = packet_v2.run_validator(_config(tmp_path, packet=packet))
+
+    assert summary["validator_status"] == packet_v2.STATUS_BLOCKED_SCHEMA
+    assert any("ranked_hypotheses[0].hypothesis" in item["reason"] for item in summary["blocked_items"])
 
 
 def test_scalar_disagreement_with_price_only_blocks_schema(tmp_path: Path) -> None:
@@ -109,6 +157,42 @@ def test_missing_provenance_blocks(tmp_path: Path) -> None:
     assert "missing_provenance" in summary["blocker_reasons"]
 
 
+def test_missing_packet_manifest_returns_structured_schema_block(tmp_path: Path) -> None:
+    run_id = f"{packet_v2.RUN_ID_PREFIX}missing_manifest"
+    exit_code = packet_v2.main(
+        [
+            "--packet-manifest",
+            str(tmp_path / "missing.json"),
+            "--validator-run-id",
+            run_id,
+            "--output-dir",
+            str(tmp_path / "runs"),
+        ]
+    )
+    summary_path = tmp_path / "runs" / run_id / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+
+    assert exit_code == 2
+    assert summary["validator_status"] == packet_v2.STATUS_BLOCKED_SCHEMA
+    assert "manifest_load_error" in summary["blocker_reasons"]
+
+
+def test_invalid_json_packet_manifest_returns_structured_schema_block(tmp_path: Path) -> None:
+    manifest = tmp_path / "invalid.json"
+    manifest.write_text("{", encoding="utf-8")
+
+    summary = packet_v2.run_validator(
+        packet_v2.PacketV2Config(
+            validator_run_id=f"{packet_v2.RUN_ID_PREFIX}invalid_manifest",
+            output_dir=tmp_path / "runs",
+            packet_manifest=manifest,
+        )
+    )
+
+    assert summary["validator_status"] == packet_v2.STATUS_BLOCKED_SCHEMA
+    assert "manifest_load_error" in summary["blocker_reasons"]
+
+
 def test_forbidden_source_artifact_path_blocks_provenance(tmp_path: Path) -> None:
     packet = _packet()
     forbidden = "data/backtest/runs/ksana_packet.json"
@@ -119,6 +203,52 @@ def test_forbidden_source_artifact_path_blocks_provenance(tmp_path: Path) -> Non
 
     assert summary["validator_status"] == packet_v2.STATUS_BLOCKED_PROVENANCE
     assert "forbidden_source_artifact_path" in summary["blocker_reasons"]
+
+
+def test_embedded_manifest_payload_forbidden_path_blocks_schema(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "artifacts": [
+                    {
+                        "path": "data/backtest/runs/embedded_packet.json",
+                        "payload": _packet(),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = packet_v2.run_validator(
+        packet_v2.PacketV2Config(
+            validator_run_id=f"{packet_v2.RUN_ID_PREFIX}forbidden_embedded_path",
+            output_dir=tmp_path / "runs",
+            packet_manifest=manifest,
+        )
+    )
+
+    assert summary["validator_status"] == packet_v2.STATUS_BLOCKED_SCHEMA
+    assert "forbidden_artifact_path" in summary["blocker_reasons"]
+    assert any("forbidden_artifact_path" in item["rule_id"] for item in summary["blocked_items"])
+
+
+def test_non_object_artifact_entry_blocks_schema(tmp_path: Path) -> None:
+    artifact_file = tmp_path / "artifact_array.json"
+    artifact_file.write_text(json.dumps([None]), encoding="utf-8")
+
+    summary = packet_v2.run_validator(
+        packet_v2.PacketV2Config(
+            validator_run_id=f"{packet_v2.RUN_ID_PREFIX}non_object_artifact",
+            output_dir=tmp_path / "runs",
+            packet_artifacts=(artifact_file,),
+        )
+    )
+
+    assert summary["validator_status"] == packet_v2.STATUS_BLOCKED_SCHEMA
+    assert "non_object_artifact_entry" in summary["blocker_reasons"]
+    assert any("non_object_artifact_entry" in item["rule_id"] for item in summary["blocked_items"])
 
 
 def test_overclaim_blocks_packet(tmp_path: Path) -> None:
@@ -235,6 +365,46 @@ def _conservative_packet(source_suffix: str = "conservative") -> dict[str, objec
             "Risk remains, may not hold, might change, could change, and generic caution remains."
         ),
     )
+
+
+def _richer_packet(source_suffix: str = "rich") -> dict[str, object]:
+    packet = _packet(source_suffix=source_suffix)
+    packet["ranked_hypotheses"] = [
+        *packet["ranked_hypotheses"],
+        {
+            "rank": 3,
+            "hypothesis": "Supply mix can invalidate the margin hypothesis.",
+            "confidence": 0.48,
+            "why_it_matters": "It adds a second non-price falsifier.",
+            "falsification_triggers": ["supplier lead times expand"],
+            "expected_observable_evidence": ["supplier-side lead-time disclosure"],
+            "counterfactuals": ["if lead times expand, reduce conviction"],
+        },
+    ]
+    packet["counterfactuals"] = [
+        "if demand weakens, downgrade to neutral",
+        "if lead times expand, reduce conviction",
+    ]
+    packet["falsification_triggers"] = [
+        "margin update misses threshold",
+        "supplier lead times expand",
+    ]
+    packet["expected_observable_evidence"] = [
+        "next filing margin disclosure",
+        "supplier-side lead-time disclosure",
+    ]
+    packet["disagreement_with_price_only"] = [
+        "price-only momentum is positive, but margin risk reduces conviction",
+        "price-only ignores supply mix risk",
+    ]
+    packet["evidence_gaps"] = ["supplier confirmation", "segment-level demand disclosure"]
+    packet["uncertainty_decomposition"] = {
+        "demand": 0.3,
+        "margin": 0.3,
+        "macro": 0.2,
+        "supply": 0.2,
+    }
+    return packet
 
 
 def _packet(

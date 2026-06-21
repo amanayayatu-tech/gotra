@@ -56,7 +56,7 @@ Each packet v2 artifact must include:
 - `evidence_gaps`
 - `uncertainty_decomposition`
 - `non_claims`
-- `evidence_layer`
+- `evidence_layer=engineering/local ksana packet v2 front-half optimization fixture-only`
 - `provenance`
 - `provider_or_backend_called=false`
 - `codex_cli_new_call=false`
@@ -75,6 +75,10 @@ The validator requires structured, non-empty lists for counterfactuals,
 falsification triggers, expected observable evidence, evidence gaps, and
 `disagreement_with_price_only`. Scalar disagreement wording is blocked because
 it is not the packet v2 structure.
+
+List entries must be non-empty text. Placeholder values such as `null`, `{}`,
+or empty strings are schema blockers and do not count as information gain. Each
+`ranked_hypotheses` item must also provide a non-empty textual `hypothesis`.
 
 ## Metrics
 
@@ -117,9 +121,14 @@ The validator blocks:
 - OOS/science/public/trading/investment overclaim wording
 - `direct_llm_parametric_memory_control` clean-baseline misuse wording
 - non-false runtime flags
+- malformed or missing manifests
+- non-object artifact entries
+- non-positive `information_gain_delta` when a baseline fixture is provided
 
 `LOW_INFORMATION_GAIN` is non-blocking but not sufficient for a provider canary
 proposal. It indicates the packet is still too conservative or too generic.
+When a baseline fixture is provided, `KSANA_PACKET_V2_READY_FOR_PROVIDER_CANARY`
+also requires positive structural lift over that baseline.
 
 ## Digest Convention
 

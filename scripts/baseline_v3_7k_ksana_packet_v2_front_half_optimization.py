@@ -154,6 +154,10 @@ def non_empty_list(value: Any) -> bool:
     return isinstance(value, list) and bool(value)
 
 
+def non_empty_text_list(value: Any) -> bool:
+    return isinstance(value, list) and bool(value) and all(is_non_empty_string(item) for item in value)
+
+
 def non_empty_mapping(value: Any) -> bool:
     return isinstance(value, dict) and bool(value)
 
@@ -166,45 +170,89 @@ def list_count(value: Any) -> int:
     return 0
 
 
+def text_list_count(value: Any) -> int:
+    if not isinstance(value, list):
+        return 0
+    return sum(1 for item in value if is_non_empty_string(item))
+
+
 def artifacts_from_payload(payload: Any, *, path: str, origin: str) -> list[PacketArtifact]:
     if isinstance(payload, dict) and isinstance(payload.get("artifacts"), list):
-        return [
-            PacketArtifact(path=f"{path}#{index}", payload=dict(item), origin=origin)
-            for index, item in enumerate(payload["artifacts"])
-            if isinstance(item, dict)
-        ]
+        artifacts: list[PacketArtifact] = []
+        for index, item in enumerate(payload["artifacts"]):
+            if isinstance(item, dict):
+                artifacts.append(PacketArtifact(path=f"{path}#{index}", payload=dict(item), origin=origin))
+            else:
+                artifacts.append(
+                    PacketArtifact(
+                        path=f"{path}#{index}",
+                        payload={"_schema_error": "non_object_artifact_entry"},
+                        origin=origin,
+                    )
+                )
+        return artifacts
     if isinstance(payload, dict) and isinstance(payload.get("packets"), list):
-        return [
-            PacketArtifact(path=f"{path}#{index}", payload=dict(item), origin=origin)
-            for index, item in enumerate(payload["packets"])
-            if isinstance(item, dict)
-        ]
+        artifacts = []
+        for index, item in enumerate(payload["packets"]):
+            if isinstance(item, dict):
+                artifacts.append(PacketArtifact(path=f"{path}#{index}", payload=dict(item), origin=origin))
+            else:
+                artifacts.append(
+                    PacketArtifact(
+                        path=f"{path}#{index}",
+                        payload={"_schema_error": "non_object_artifact_entry"},
+                        origin=origin,
+                    )
+                )
+        return artifacts
     if isinstance(payload, list):
-        return [
-            PacketArtifact(path=f"{path}#{index}", payload=dict(item), origin=origin)
-            for index, item in enumerate(payload)
-            if isinstance(item, dict)
-        ]
+        artifacts = []
+        for index, item in enumerate(payload):
+            if isinstance(item, dict):
+                artifacts.append(PacketArtifact(path=f"{path}#{index}", payload=dict(item), origin=origin))
+            else:
+                artifacts.append(
+                    PacketArtifact(
+                        path=f"{path}#{index}",
+                        payload={"_schema_error": "non_object_artifact_entry"},
+                        origin=origin,
+                    )
+                )
+        return artifacts
     if isinstance(payload, dict):
         return [PacketArtifact(path=path, payload=dict(payload), origin=origin)]
-    return []
+    return [
+        PacketArtifact(
+            path=path,
+            payload={"_schema_error": "malformed_artifact_root"},
+            origin=origin,
+        )
+    ]
 
 
 def artifact_from_manifest_entry(entry: Any) -> list[PacketArtifact]:
     if not isinstance(entry, dict):
         return []
     path = normalize_path(str(entry.get("path") or entry.get("source_artifact_path") or ""))
+    if path and claim_scan.forbidden_path(path):
+        return [
+            PacketArtifact(
+                path=path,
+                payload={"_schema_error": "forbidden_artifact_path"},
+                origin="manifest_path",
+            )
+        ]
     if "payload" in entry and isinstance(entry["payload"], dict):
         return [PacketArtifact(path=path or "manifest_payload", payload=dict(entry["payload"]), origin="manifest")]
+    if "payload" in entry:
+        return [
+            PacketArtifact(
+                path=path or "manifest_payload",
+                payload={"_schema_error": "non_object_embedded_payload"},
+                origin="manifest",
+            )
+        ]
     if path:
-        if claim_scan.forbidden_path(path):
-            return [
-                PacketArtifact(
-                    path=path,
-                    payload={"_schema_error": "forbidden_artifact_path"},
-                    origin="manifest_path",
-                )
-            ]
         file_path = (REPO_ROOT / path).resolve() if not Path(path).is_absolute() else Path(path)
         return artifacts_from_payload(load_json(file_path), path=path, origin="manifest_path")
     return []
@@ -222,9 +270,20 @@ def collect_artifacts(
         if claim_scan.forbidden_path(manifest_path):
             load_errors.append(make_blocker(manifest_path, "forbidden_artifact_path", "manifest path is forbidden"))
         else:
-            manifest_payload = load_json(manifest)
+            try:
+                manifest_payload = load_json(manifest)
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                load_errors.append(make_blocker(manifest_path, "manifest_load_error", str(exc)))
+                manifest_payload = None
             if not isinstance(manifest_payload, dict):
-                load_errors.append(make_blocker(manifest_path, "malformed_manifest_root", "manifest must be a JSON object"))
+                if manifest_payload is not None:
+                    load_errors.append(
+                        make_blocker(
+                            manifest_path,
+                            "malformed_manifest_root",
+                            "manifest must be a JSON object",
+                        )
+                    )
             else:
                 entries = manifest_payload.get("artifacts", manifest_payload.get("packets", []))
                 if not isinstance(entries, list):
@@ -350,6 +409,8 @@ def validate_schema(artifact: PacketArtifact) -> list[dict[str, Any]]:
         type_errors.append("research_mode")
     if not is_non_empty_string(payload.get("why_it_matters")):
         type_errors.append("why_it_matters")
+    if payload.get("evidence_layer") != EVIDENCE_LAYER:
+        type_errors.append("evidence_layer")
     if "confidence" in payload and (not is_number(payload["confidence"]) or not 0 <= float(payload["confidence"]) <= 1):
         type_errors.append("confidence")
 
@@ -368,9 +429,9 @@ def validate_schema(artifact: PacketArtifact) -> list[dict[str, Any]]:
         "counterfactuals",
         "evidence_gaps",
     ):
-        if key in payload and not non_empty_list(payload[key]):
+        if key in payload and not non_empty_text_list(payload[key]):
             type_errors.append(key)
-    if "disagreement_with_price_only" in payload and not non_empty_list(payload["disagreement_with_price_only"]):
+    if "disagreement_with_price_only" in payload and not non_empty_text_list(payload["disagreement_with_price_only"]):
         type_errors.append("disagreement_with_price_only")
     if "uncertainty_decomposition" in payload and not (
         non_empty_mapping(payload["uncertainty_decomposition"]) or non_empty_list(payload["uncertainty_decomposition"])
@@ -393,10 +454,14 @@ def validate_schema(artifact: PacketArtifact) -> list[dict[str, Any]]:
             confidence = item["confidence"]
             if not is_number(confidence) or not 0 <= float(confidence) <= 1:
                 type_errors.append(f"ranked_hypotheses[{index}].confidence")
+        if "hypothesis" in item and not is_non_empty_string(item["hypothesis"]):
+            type_errors.append(f"ranked_hypotheses[{index}].hypothesis")
         if "why_it_matters" in item and not isinstance(item["why_it_matters"], str):
             type_errors.append(f"ranked_hypotheses[{index}].why_it_matters")
+        if "counterfactuals" in item and not non_empty_text_list(item["counterfactuals"]):
+            type_errors.append(f"ranked_hypotheses[{index}].counterfactuals")
         for key in ("falsification_triggers", "expected_observable_evidence"):
-            if key in item and not non_empty_list(item[key]):
+            if key in item and not non_empty_text_list(item[key]):
                 type_errors.append(f"ranked_hypotheses[{index}].{key}")
     failures = missing + sorted(set(type_errors)) + hypothesis_missing
     if failures:
@@ -412,6 +477,8 @@ def validate_schema(artifact: PacketArtifact) -> list[dict[str, Any]]:
 
 def validate_provenance(artifact: PacketArtifact) -> list[dict[str, Any]]:
     payload = artifact.payload
+    if payload.get("_schema_error"):
+        return []
     provenance = payload.get("provenance")
     if not isinstance(provenance, dict):
         return [make_blocker(artifact.path, "missing_provenance", "provenance must be an object")]
@@ -459,8 +526,8 @@ def scan_overclaim(artifacts: list[PacketArtifact]) -> list[dict[str, Any]]:
 
 
 def nested_list_count(payload: dict[str, Any], key: str, hypotheses: list[dict[str, Any]]) -> int:
-    total = list_count(payload.get(key))
-    total += sum(list_count(item.get(key)) for item in hypotheses)
+    total = text_list_count(payload.get(key))
+    total += sum(text_list_count(item.get(key)) for item in hypotheses)
     return total
 
 
@@ -481,11 +548,15 @@ def metrics_for_artifacts(artifacts: list[PacketArtifact]) -> dict[str, Any]:
         source_artifact_path = source_artifact_path or str(payload.get("source_artifact_path") or "")
         hypotheses = ranked_hypotheses(payload)
         hypothesis_count += len(hypotheses)
-        ranked_hypothesis_count += sum(1 for item in hypotheses if item.get("rank") is not None)
+        ranked_hypothesis_count += sum(
+            1
+            for item in hypotheses
+            if item.get("rank") is not None and is_non_empty_string(item.get("hypothesis"))
+        )
         counterfactual_count += nested_list_count(payload, "counterfactuals", hypotheses)
         falsifiable_trigger_count += nested_list_count(payload, "falsification_triggers", hypotheses)
-        explicit_disagreement_count += list_count(payload.get("disagreement_with_price_only"))
-        evidence_gap_count += list_count(payload.get("evidence_gaps"))
+        explicit_disagreement_count += text_list_count(payload.get("disagreement_with_price_only"))
+        evidence_gap_count += text_list_count(payload.get("evidence_gaps"))
         uncertainty_decomposition_count += list_count(payload.get("uncertainty_decomposition"))
         generic_caution_phrase_count += generic_caution_count(payload)
     return {
@@ -539,6 +610,8 @@ def information_gain_status(metrics: dict[str, Any]) -> str:
 def choose_status(
     *,
     metrics: dict[str, Any],
+    baseline_artifact_count: int,
+    information_gain_delta: int,
     schema_failures: list[dict[str, Any]],
     provenance_failures: list[dict[str, Any]],
     overclaim_failures: list[dict[str, Any]],
@@ -550,7 +623,12 @@ def choose_status(
         return STATUS_BLOCKED_PROVENANCE
     if overclaim_failures:
         return STATUS_BLOCKED_OVERCLAIM
-    return information_gain_status(metrics)
+    candidate_status = information_gain_status(metrics)
+    if candidate_status != STATUS_READY:
+        return candidate_status
+    if baseline_artifact_count > 0 and information_gain_delta <= 0:
+        return STATUS_LOW_INFORMATION_GAIN
+    return STATUS_READY
 
 
 def base_summary(config: PacketV2Config, *, run_root: Path) -> dict[str, Any]:
@@ -615,12 +693,17 @@ def build_summary(config: PacketV2Config, *, run_root: Path) -> dict[str, Any]:
     )
     metrics = metrics_for_artifacts(packet_artifacts)
     baseline_metrics = metrics_for_artifacts(baseline_artifacts)
+    candidate_score = information_gain_score(metrics)
+    baseline_score = information_gain_score(baseline_metrics)
+    information_gain_delta = candidate_score - baseline_score
     schema_failures = [failure for artifact in packet_artifacts for failure in validate_schema(artifact)]
     provenance_failures = [failure for artifact in packet_artifacts for failure in validate_provenance(artifact)]
     overclaim_failures = scan_overclaim(packet_artifacts + baseline_artifacts)
     load_errors = packet_load_errors + baseline_load_errors
     status = choose_status(
         metrics=metrics,
+        baseline_artifact_count=int(baseline_metrics["input_artifact_count"]),
+        information_gain_delta=information_gain_delta,
         schema_failures=schema_failures,
         provenance_failures=provenance_failures,
         overclaim_failures=overclaim_failures,
@@ -629,8 +712,6 @@ def build_summary(config: PacketV2Config, *, run_root: Path) -> dict[str, Any]:
     blockers = load_errors + schema_failures + provenance_failures + overclaim_failures
     summary = base_summary(config, run_root=run_root)
     summary.update(metrics)
-    candidate_score = information_gain_score(metrics)
-    baseline_score = information_gain_score(baseline_metrics)
     summary.update(
         {
             "validator_status": status,
@@ -638,7 +719,7 @@ def build_summary(config: PacketV2Config, *, run_root: Path) -> dict[str, Any]:
             "baseline_artifact_count": int(baseline_metrics["input_artifact_count"]),
             "baseline_information_gain_score": baseline_score,
             "candidate_information_gain_score": candidate_score,
-            "information_gain_delta": candidate_score - baseline_score,
+            "information_gain_delta": information_gain_delta,
             "overclaim_blocker_count": len(overclaim_failures),
             "schema_blocker_count": len(load_errors) + len(schema_failures),
             "provenance_blocker_count": len(provenance_failures),
