@@ -43,13 +43,23 @@ inputs for this recheck. The command verifies:
 - source summary path is not a forbidden artifact path
 - source summary sha256 matches the expected value
 - source run id matches the expected run id
+- source summary schema is the expected v3.6Y short-horizon capture summary
+  schema
+- source summary status is the successful short-horizon capture status
 - source artifact path is present or discoverable
 - source artifact path is not a forbidden artifact path
+- explicit source artifact path in the source summary matches the loaded source
+  artifact
 - source artifact sha256 matches the expected value
+- source artifact identity matches the source summary maturity ledger:
+  source decision id, ticker, local decision date, horizon days, horizon end date,
+  arm, and input layer where present
 - source identity fields are present: run id, decision id, ticker, capture
   timestamp, horizon end date, prompt hash, and parsed decision hash
-- claim-boundary text does not make OOS/science/public/trading or 30D verdict
-  claims
+- top-level and nested `decision` claim-boundary text does not make
+  OOS/science/public/trading or 30D verdict claims
+- source summary/artifact future-data markers are clean
+- `latest_visible_price_date` is not after the decision/capture allowed date
 
 ## Maturity Logic
 
@@ -70,6 +80,7 @@ Allowed summary statuses:
 - `SHORT_HORIZON_READY`
 - `SHORT_HORIZON_NOT_MATURED`
 - `BLOCKED_DATA`
+- `BLOCKED_FUTURE_DATA`
 - `BLOCKED_PROVENANCE`
 - `BLOCKED_SCHEMA`
 - `BLOCKED_OVERCLAIM`

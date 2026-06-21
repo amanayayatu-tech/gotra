@@ -18,6 +18,7 @@ import pandas as pd
 from gotra.backtest.price_cache import read_price_cache
 from gotra.backtest.protocol import parse_date
 from scripts import baseline_v3_6ab_evidence_claim_boundary_scanner as claim_scan
+from scripts import baseline_v3_6y_short_horizon_first_capture as capture_v36y
 from scripts import baseline_v3_four_arm as v3
 
 
@@ -33,6 +34,7 @@ DEFAULT_OUTCOME_WINDOW_DAYS = 7
 STATUS_READY = "SHORT_HORIZON_READY"
 STATUS_NOT_MATURED = "SHORT_HORIZON_NOT_MATURED"
 STATUS_BLOCKED_DATA = "BLOCKED_DATA"
+STATUS_BLOCKED_FUTURE_DATA = "BLOCKED_FUTURE_DATA"
 STATUS_BLOCKED_PROVENANCE = "BLOCKED_PROVENANCE"
 STATUS_BLOCKED_SCHEMA = "BLOCKED_SCHEMA"
 STATUS_BLOCKED_OVERCLAIM = "BLOCKED_OVERCLAIM"
@@ -154,6 +156,16 @@ def bool_false(value: Any) -> bool:
     return isinstance(value, bool) and value is False
 
 
+def bool_true(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    if isinstance(value, int):
+        return value > 0
+    return False
+
+
 def int_value(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
@@ -235,6 +247,19 @@ def discover_artifact_path(summary: dict[str, Any], config: RecheckConfig) -> Pa
     raise RecheckError(STATUS_BLOCKED_PROVENANCE, "missing_source_artifact_path", "source artifact path not found")
 
 
+def recursive_text_sources(value: Any, *, path: str) -> list[claim_scan.ScanSource]:
+    sources: list[claim_scan.ScanSource] = []
+    if isinstance(value, str):
+        sources.append(claim_scan.ScanSource(path=path, text=value, origin="short_horizon_canary"))
+    elif isinstance(value, dict):
+        for key, item in sorted(value.items()):
+            sources.extend(recursive_text_sources(item, path=f"{path}.{key}"))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            sources.extend(recursive_text_sources(item, path=f"{path}[{index}]"))
+    return sources
+
+
 def claim_sources(payload: dict[str, Any], *, path: str) -> list[claim_scan.ScanSource]:
     sources: list[claim_scan.ScanSource] = []
     for field in CLAIM_TEXT_FIELDS:
@@ -251,6 +276,9 @@ def claim_sources(payload: dict[str, Any], *, path: str) -> list[claim_scan.Scan
                             origin="short_horizon_canary",
                         )
                     )
+    decision = payload.get("decision")
+    if isinstance(decision, (dict, list)):
+        sources.extend(recursive_text_sources(decision, path=f"{path}:decision"))
     return sources
 
 
@@ -267,6 +295,184 @@ def claim_blockers(*, summary: dict[str, Any], artifact: dict[str, Any], summary
     )
 
 
+def validate_source_summary_success(summary: dict[str, Any]) -> None:
+    if summary.get("schema") != capture_v36y.SUMMARY_SCHEMA:
+        raise RecheckError(
+            STATUS_BLOCKED_SCHEMA,
+            "source_summary_schema_mismatch",
+            "source summary is not the expected v3.6Y short-horizon capture summary schema",
+        )
+    if summary.get("status") != capture_v36y.STATUS_PASS:
+        raise RecheckError(
+            STATUS_BLOCKED_PROVENANCE,
+            "source_summary_not_pass",
+            f"source summary status is not pass: {summary.get('status')}",
+        )
+    if int_value(summary.get("actual_capture_artifacts")) != 1:
+        raise RecheckError(
+            STATUS_BLOCKED_PROVENANCE,
+            "source_summary_capture_count_not_one",
+            "source summary must contain exactly one capture artifact",
+        )
+    if int_value(summary.get("future_data_violation_count")) not in {0}:
+        raise RecheckError(
+            STATUS_BLOCKED_FUTURE_DATA,
+            "source_summary_future_data_violation",
+            "source summary future_data_violation_count must be explicitly zero",
+        )
+    if int_value(summary.get("deterministic_reference_future_data_violations")) not in {0}:
+        raise RecheckError(
+            STATUS_BLOCKED_FUTURE_DATA,
+            "source_summary_reference_future_data_violation",
+            "source summary deterministic_reference_future_data_violations must be explicitly zero",
+        )
+    if summary.get("formal_lite_entered") is not False:
+        raise RecheckError(
+            STATUS_BLOCKED_PROVENANCE,
+            "source_summary_formal_lite_entered",
+            "source summary unexpectedly entered formal-lite",
+        )
+    if summary.get("direct_llm_interpretation") != DIRECT_LLM_INTERPRETATION:
+        raise RecheckError(
+            STATUS_BLOCKED_PROVENANCE,
+            "source_summary_direct_llm_interpretation_missing",
+            "source summary missing direct_llm_parametric_memory_control caveat",
+        )
+
+
+def source_maturity_ledger_row(summary: dict[str, Any]) -> dict[str, Any]:
+    ledger = summary.get("maturity_ledger")
+    if not isinstance(ledger, list) or len(ledger) != 1:
+        raise RecheckError(
+            STATUS_BLOCKED_PROVENANCE,
+            "source_summary_maturity_ledger_not_one",
+            "source summary maturity_ledger must contain exactly one row",
+        )
+    row = ledger[0]
+    if not isinstance(row, dict):
+        raise RecheckError(
+            STATUS_BLOCKED_SCHEMA,
+            "source_summary_maturity_ledger_row_malformed",
+            "source summary maturity_ledger row must be an object",
+        )
+    required = [
+        "source_decision_id",
+        "ticker",
+        "decision_date_local",
+        "horizon_days",
+        "horizon_end_date",
+    ]
+    missing = [field for field in required if not first_non_empty(row.get(field))]
+    if missing:
+        raise RecheckError(
+            STATUS_BLOCKED_PROVENANCE,
+            "source_summary_maturity_ledger_missing_fields",
+            ",".join(missing),
+        )
+    return row
+
+
+def compare_identity_field(*, field: str, artifact_value: Any, ledger_value: Any) -> None:
+    if str(artifact_value) != str(ledger_value):
+        raise RecheckError(
+            STATUS_BLOCKED_PROVENANCE,
+            "source_artifact_identity_mismatch",
+            f"source artifact {field} mismatch against maturity_ledger: artifact={artifact_value!r} ledger={ledger_value!r}",
+        )
+
+
+def validate_summary_artifact_binding(*, summary: dict[str, Any], artifact: dict[str, Any]) -> None:
+    ledger_row = source_maturity_ledger_row(summary)
+    compare_identity_field(
+        field="source_decision_id",
+        artifact_value=artifact.get("source_decision_id"),
+        ledger_value=ledger_row.get("source_decision_id"),
+    )
+    compare_identity_field(
+        field="ticker",
+        artifact_value=artifact.get("ticker"),
+        ledger_value=ledger_row.get("ticker"),
+    )
+    compare_identity_field(
+        field="decision_date_local",
+        artifact_value=first_non_empty(artifact.get("decision_date_local"), artifact.get("decision_date")),
+        ledger_value=ledger_row.get("decision_date_local"),
+    )
+    compare_identity_field(
+        field="horizon_days",
+        artifact_value=int_value(artifact.get("horizon_days")),
+        ledger_value=int_value(ledger_row.get("horizon_days")),
+    )
+    compare_identity_field(
+        field="horizon_end_date",
+        artifact_value=artifact.get("horizon_end_date"),
+        ledger_value=ledger_row.get("horizon_end_date"),
+    )
+    for optional_field in ("arm", "input_layer"):
+        ledger_value = ledger_row.get(optional_field)
+        if first_non_empty(ledger_value):
+            compare_identity_field(
+                field=optional_field,
+                artifact_value=artifact.get(optional_field),
+                ledger_value=ledger_value,
+            )
+
+
+def same_resolved_path(left: Path, right: Path) -> bool:
+    return left.expanduser().resolve(strict=False) == right.expanduser().resolve(strict=False)
+
+
+def validate_source_artifact_path_binding(*, summary: dict[str, Any], summary_path: Path, artifact_path: Path) -> None:
+    path_values = [
+        first_non_empty(summary.get("source_artifact_path")),
+        first_non_empty(summary.get("source_capture_artifact")),
+        first_non_empty(summary.get("capture_artifact_path")),
+        first_non_empty(nested_value(summary, "provenance", "source_artifact_path")),
+    ]
+    expected_paths = [
+        resolve_optional_path(value, base_dir=summary_path.parent)
+        for value in path_values
+        if value
+    ]
+    if expected_paths and not any(same_resolved_path(path, artifact_path) for path in expected_paths):
+        raise RecheckError(
+            STATUS_BLOCKED_PROVENANCE,
+            "source_artifact_path_mismatch",
+            "source artifact path does not match the verified source summary",
+        )
+
+
+def validate_source_future_data_guard(*, summary: dict[str, Any], artifact: dict[str, Any], identity: dict[str, Any]) -> None:
+    if bool_true(summary.get("future_data_violation")) or bool_true(artifact.get("future_data_violation")):
+        raise RecheckError(
+            STATUS_BLOCKED_FUTURE_DATA,
+            "source_future_data_violation",
+            "source summary/artifact reports future_data_violation",
+        )
+    decision_date_text = first_non_empty(
+        identity.get("decision_date"),
+        artifact.get("decision_date_local"),
+        artifact.get("decision_date"),
+    )
+    if not decision_date_text:
+        capture_timestamp = first_non_empty(identity.get("capture_timestamp"), artifact.get("capture_timestamp"))
+        if capture_timestamp:
+            decision_date_text = parse_timestamp(capture_timestamp).date().isoformat()
+    if not decision_date_text:
+        raise RecheckError(STATUS_BLOCKED_SCHEMA, "missing_decision_date", "missing decision/capture allowed date")
+    try:
+        latest_visible = parse_date(str(identity["latest_visible_price_date"]))
+        allowed_date = parse_date(str(decision_date_text))
+    except ValueError as exc:
+        raise RecheckError(STATUS_BLOCKED_SCHEMA, "invalid_source_price_visibility_date", str(exc)) from exc
+    if latest_visible > allowed_date:
+        raise RecheckError(
+            STATUS_BLOCKED_FUTURE_DATA,
+            "source_future_visible_price_date",
+            "source latest_visible_price_date is after the decision/capture allowed date",
+        )
+
+
 def load_source_bundle(config: RecheckConfig) -> SourceBundle:
     summary_path_text = normalize_path(config.source_summary)
     if claim_scan.forbidden_path(summary_path_text):
@@ -280,6 +486,7 @@ def load_source_bundle(config: RecheckConfig) -> SourceBundle:
     source_run_id = first_non_empty(summary.get("run_id"), summary.get("source_run_id"))
     if source_run_id != config.expected_run_id:
         raise RecheckError(STATUS_BLOCKED_PROVENANCE, "source_run_id_mismatch", "source run id mismatch")
+    validate_source_summary_success(summary)
 
     artifact_path = discover_artifact_path(summary, config)
     artifact_path_text = normalize_path(artifact_path)
@@ -291,6 +498,12 @@ def load_source_bundle(config: RecheckConfig) -> SourceBundle:
     if artifact_sha != config.expected_source_artifact_sha256:
         raise RecheckError(STATUS_BLOCKED_PROVENANCE, "source_artifact_sha256_mismatch", "source artifact sha256 mismatch")
     artifact = load_json_object(artifact_path)
+    validate_source_artifact_path_binding(
+        summary=summary,
+        summary_path=config.source_summary,
+        artifact_path=artifact_path,
+    )
+    validate_summary_artifact_binding(summary=summary, artifact=artifact)
     blockers = claim_blockers(
         summary=summary,
         artifact=artifact,
@@ -303,6 +516,7 @@ def load_source_bundle(config: RecheckConfig) -> SourceBundle:
     identity = source_identity(summary=summary, artifact=artifact, artifact_path=artifact_path)
     if identity["source_run_id"] != config.expected_run_id:
         raise RecheckError(STATUS_BLOCKED_PROVENANCE, "source_artifact_run_id_mismatch", "source artifact run id mismatch")
+    validate_source_future_data_guard(summary=summary, artifact=artifact, identity=identity)
     return SourceBundle(
         summary=summary,
         summary_sha256=summary_sha,

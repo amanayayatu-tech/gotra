@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from scripts import baseline_v3_6y_short_horizon_first_capture as capture_v36y
 from scripts import baseline_v3_7d_short_horizon_canary_maturity_recheck as recheck
 
 
@@ -191,6 +192,99 @@ def test_claim_overreach_blocks_overclaim(tmp_path: Path) -> None:
     assert summary["v3_7_actual_verdict_executable"] is False
 
 
+def test_nested_decision_claim_overreach_blocks_overclaim(tmp_path: Path) -> None:
+    source_summary, source_sha, artifact_path, _artifact_sha = _write_source_bundle(
+        tmp_path,
+        artifact_updates={
+            "decision": {
+                "reasoning": "This short-horizon output is OOS public science proof.",
+                "risk_factors": ["This is trading advice."],
+            }
+        },
+    )
+    artifact_sha = recheck.sha256_file(artifact_path)
+
+    summary = recheck.run_recheck(
+        _config(
+            tmp_path,
+            source_summary=source_summary,
+            source_sha=source_sha,
+            artifact_path=artifact_path,
+            artifact_sha=artifact_sha,
+            as_of="2026-06-23T00:00:00Z",
+        )
+    )
+
+    assert summary["maturity_status"] == recheck.STATUS_BLOCKED_OVERCLAIM
+    assert summary["v3_7_actual_verdict_executable"] is False
+
+
+def test_future_visible_source_price_blocks_future_data(tmp_path: Path) -> None:
+    source_summary, source_sha, artifact_path, _artifact_sha = _write_source_bundle(
+        tmp_path,
+        artifact_updates={"latest_visible_price_date": "2026-06-22"},
+    )
+    artifact_sha = recheck.sha256_file(artifact_path)
+
+    summary = recheck.run_recheck(
+        _config(
+            tmp_path,
+            source_summary=source_summary,
+            source_sha=source_sha,
+            artifact_path=artifact_path,
+            artifact_sha=artifact_sha,
+            as_of="2026-06-23T00:00:00Z",
+        )
+    )
+
+    assert summary["maturity_status"] == recheck.STATUS_BLOCKED_FUTURE_DATA
+    assert "source_future_visible_price_date" in summary["blocker_reasons"]
+    assert summary["v3_7_actual_verdict_executable"] is False
+
+
+def test_summary_ledger_mismatch_blocks_provenance(tmp_path: Path) -> None:
+    source_summary, source_sha, artifact_path, _artifact_sha = _write_source_bundle(
+        tmp_path,
+        artifact_updates={"source_decision_id": "different-source-decision-id"},
+    )
+    artifact_sha = recheck.sha256_file(artifact_path)
+
+    summary = recheck.run_recheck(
+        _config(
+            tmp_path,
+            source_summary=source_summary,
+            source_sha=source_sha,
+            artifact_path=artifact_path,
+            artifact_sha=artifact_sha,
+            as_of="2026-06-23T00:00:00Z",
+        )
+    )
+
+    assert summary["maturity_status"] == recheck.STATUS_BLOCKED_PROVENANCE
+    assert "source_artifact_identity_mismatch" in summary["blocker_reasons"]
+
+
+def test_failed_source_summary_blocks_ready(tmp_path: Path) -> None:
+    source_summary, source_sha, artifact_path, artifact_sha = _write_source_bundle(
+        tmp_path,
+        summary_updates={"status": capture_v36y.STATUS_SCHEMA_FAIL},
+    )
+
+    summary = recheck.run_recheck(
+        _config(
+            tmp_path,
+            source_summary=source_summary,
+            source_sha=source_sha,
+            artifact_path=artifact_path,
+            artifact_sha=artifact_sha,
+            as_of="2026-06-23T00:00:00Z",
+        )
+    )
+
+    assert summary["maturity_status"] == recheck.STATUS_BLOCKED_PROVENANCE
+    assert "source_summary_not_pass" in summary["blocker_reasons"]
+
+
 def test_forbidden_source_artifact_path_blocks_provenance(tmp_path: Path) -> None:
     source_summary, source_sha, _artifact_path, artifact_sha = _write_source_bundle(tmp_path)
 
@@ -251,15 +345,19 @@ def _write_source_bundle(
     tmp_path: Path,
     *,
     artifact_updates: dict[str, object] | None = None,
+    summary_updates: dict[str, object] | None = None,
 ) -> tuple[Path, str, Path, str]:
     run_root = tmp_path / "source_run" / SOURCE_RUN_ID
     artifact_path = run_root / "captures" / "direct_llm" / "capture_2026-06-21_aapl_1d.json"
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     artifact: dict[str, object] = {
-        "schema": "gotra.short_horizon.canary_capture.fixture.v1",
+        "schema": capture_v36y.CAPTURE_SCHEMA,
         "run_id": SOURCE_RUN_ID,
         "source_decision_id": "source-decision-id",
+        "capture_status": "captured",
         "ticker": "AAPL",
+        "arm": "direct_llm",
+        "input_layer": "price_only_packet",
         "capture_timestamp": "2026-06-21T03:00:00Z",
         "decision_timestamp_utc": "2026-06-21T03:00:00Z",
         "decision_date": "2026-06-21",
@@ -270,11 +368,16 @@ def _write_source_bundle(
         "horizon_end_date": "2026-06-22",
         "prompt_hash": "prompt-hash",
         "parsed_decision_hash": "parsed-decision-hash",
+        "outcome_price_available_after_utc": "2026-06-23T00:00:00Z",
         "backend": "codex_cli_llm_backend",
         "codex_cli_version": "0.141.0",
         "model": "gpt-5.5",
         "reasoning": "high",
+        "formal_lite_entered": False,
+        "future_data_violation": False,
         "future_outcome_status": "not_matured",
+        "future_outcome_scoring_status": "NOT_MATURED",
+        "arm_interpretation": "direct_llm_parametric_memory_control",
         "summary": "Short-horizon engineering fixture for local metadata recheck only.",
     }
     if artifact_updates:
@@ -282,15 +385,38 @@ def _write_source_bundle(
     _write_json(artifact_path, artifact)
     summary_path = run_root / "summary.json"
     summary = {
-        "schema": "gotra.short_horizon.canary_summary.fixture.v1",
+        "schema": capture_v36y.SUMMARY_SCHEMA,
         "run_id": SOURCE_RUN_ID,
+        "status": capture_v36y.STATUS_PASS,
+        "run_root": str(run_root),
         "source_artifact_path": str(artifact_path),
         "capture_timestamp": "2026-06-21T03:00:00Z",
         "horizon": "1D",
         "horizon_days": 1,
         "horizon_end_date": "2026-06-22",
         "prompt_hash": "prompt-hash",
+        "prompt_hash_count": 1,
         "parsed_decision_hash": "parsed-decision-hash",
+        "parsed_decision_hash_count": 1,
+        "actual_capture_artifacts": 1,
+        "capture_error_count": 0,
+        "future_data_violation_count": 0,
+        "deterministic_reference_future_data_violations": 0,
+        "maturity_ledger_count": 1,
+        "maturity_ledger": [
+            {
+                "source_decision_id": "source-decision-id",
+                "ticker": "AAPL",
+                "arm": "direct_llm",
+                "input_layer": "price_only_packet",
+                "decision_date_local": "2026-06-21",
+                "horizon_days": 1,
+                "horizon_end_date": "2026-06-22",
+                "outcome_price_available_after_utc": "2026-06-23T00:00:00Z",
+                "future_outcome_status": "not_matured",
+                "outcome_scoring_allowed_now": False,
+            }
+        ],
         "provider_or_backend_called": True,
         "codex_cli_called": True,
         "formal_lite_entered": False,
@@ -302,6 +428,8 @@ def _write_source_bundle(
             "not a 30D forward-live verdict",
         ],
     }
+    if summary_updates:
+        summary.update(summary_updates)
     _write_json(summary_path, summary)
     return summary_path, recheck.sha256_file(summary_path), artifact_path, recheck.sha256_file(artifact_path)
 
