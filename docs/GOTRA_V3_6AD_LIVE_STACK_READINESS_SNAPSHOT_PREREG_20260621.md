@@ -7,7 +7,7 @@ Date: 2026-06-21 Asia/Shanghai
 Evidence layer: `engineering_live_stack_readiness_snapshot`.
 
 This stage adds a local/read-only live stacked PR readiness snapshot and review
-bundle refresher for the open #36-#44 stack. It helps a human review current PR
+bundle refresher for the open #36-#45 stack. It helps a human review current PR
 topology, CI, review, artifact-boundary, claim-boundary, and merge-state risk.
 It does not merge PRs, does not modify `main`, does not squash or rebase, does
 not call Kimi/GLM/DeepSeek providers, does not call Codex CLI, does not run
@@ -23,7 +23,7 @@ The command supports two input modes:
 
 - `--snapshot`: fixture or read-only exported JSON. Tests use this mode and do
   not require GitHub network access.
-- `--use-gh --repo amanayayatu-tech/gotra --pr-range 36-44`: read-only GitHub
+- `--use-gh --repo amanayayatu-tech/gotra --pr-range 36-45`: read-only GitHub
   live snapshot export through `gh api graphql`. This mode reads PR metadata,
   status checks, review threads, changed files, PR bodies, branch names, head
   SHAs, draft state, and `mergeStateStatus`. It performs no GitHub mutation.
@@ -40,6 +40,8 @@ themselves.
 The snapshot blocks human merge review readiness when any of these are present:
 
 - missing PRs in the requested stack range: `SNAPSHOT_INCOMPLETE`
+- incomplete GitHub changed-file pagination: `SNAPSHOT_INCOMPLETE`
+- any requested PR with missing or non-`OPEN` state: `BLOCKED_TOPOLOGY`
 - CI failed, cancelled, timed out, pending, or missing: `BLOCKED_CI`
 - active unresolved P1/P2 review thread: `BLOCKED_REVIEW`
 - draft PR, broken topology, or wrong root base: `BLOCKED_TOPOLOGY`
@@ -54,7 +56,15 @@ The snapshot blocks human merge review readiness when any of these are present:
 
 The live PR-body claim scan may ignore explicit negative-boundary or test
 coverage wording, such as "Cannot say", `v3_7_allowed=false`, and
-`non-claim` boundary descriptions. Positive overclaims still block.
+`non-claim` boundary descriptions. False v3.7 lines must be unambiguously
+negative: positive forms such as `v3_7_allowed=true (was false before)` and
+`v3.7 is allowed, not false anymore` still block.
+
+Fixture snapshots are checked against the requested `--pr-range`; a partial
+fixture cannot declare a clean stack by omitting PRs from the requested range.
+Live GitHub changed files are paginated until `pageInfo.hasNextPage=false`.
+If pagination cannot be completed or confirmed, the snapshot is incomplete and
+must not report artifact boundary clean.
 
 ## Summary Contract
 
@@ -67,6 +77,7 @@ The summary includes at least:
 - `repo`
 - `open_pr_count`
 - `pr_numbers`
+- `expected_pr_numbers`
 - `expected_stack_order`
 - `base_chain`
 - `head_shas`
@@ -79,6 +90,8 @@ The summary includes at least:
 - `merge_packet_status`
 - `conflict_dry_run_status`
 - `merge_state_status_summary`
+- `missing_pr_numbers`
+- `incomplete_pr_numbers`
 - `live_stack_snapshot_status`
 - `ready_for_human_merge_review`
 - `auto_merge_executed=false`

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
+
+import pytest
 
 from scripts import baseline_v3_6ad_live_stack_readiness_snapshot as snapshot
 
@@ -16,7 +19,7 @@ def test_clean_stack_fixture_is_ready_without_v3_7(tmp_path: Path) -> None:
     assert summary["auto_merge_executed"] is False
     assert summary["v3_7_allowed"] is False
     assert summary["source_mode"] == snapshot.SOURCE_FIXTURE
-    assert summary["open_pr_count"] == 9
+    assert summary["open_pr_count"] == 10
     assert summary["provider_or_backend_called"] is False
     assert summary["codex_cli_new_call"] is False
     assert summary["formal_lite_entered"] is False
@@ -145,6 +148,49 @@ def test_canary_non_claim_boundary_line_does_not_block(tmp_path: Path) -> None:
     assert summary["claim_boundary_status"] == "clean"
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "v3_7_allowed=true (was false before)",
+        "v3.7 is allowed, not false anymore",
+    ],
+)
+def test_positive_v3_7_claim_with_false_word_still_blocks(
+    tmp_path: Path,
+    body: str,
+) -> None:
+    payload = _clean_snapshot()
+    payload["pull_requests"][4]["body"] = body
+    path = _write_snapshot(tmp_path, payload)
+
+    summary = snapshot.build_snapshot(_config(tmp_path, path))
+
+    assert summary["live_stack_snapshot_status"] == snapshot.STATUS_BLOCKED_CLAIM_BOUNDARY
+    assert summary["claim_boundary_violation_count"] >= 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "v3_7_allowed=false",
+        "v3.7 verdict allowed: false",
+        "v3.7 not allowed",
+    ],
+)
+def test_unambiguous_false_v3_7_boundary_lines_are_clean(
+    tmp_path: Path,
+    body: str,
+) -> None:
+    payload = _clean_snapshot()
+    payload["pull_requests"][4]["body"] = body
+    path = _write_snapshot(tmp_path, payload)
+
+    summary = snapshot.build_snapshot(_config(tmp_path, path))
+
+    assert summary["live_stack_snapshot_status"] == snapshot.STATUS_READY
+    assert summary["claim_boundary_status"] == "clean"
+
+
 def test_dirty_merge_state_blocks_snapshot(tmp_path: Path) -> None:
     payload = _clean_snapshot()
     payload["pull_requests"][2]["mergeStateStatus"] = "DIRTY"
@@ -194,7 +240,7 @@ def test_graphql_status_check_rollup_contexts_nodes_are_success(tmp_path: Path) 
 
     assert summary["live_stack_snapshot_status"] == snapshot.STATUS_READY
     assert summary["ci_all_success"] is True
-    assert summary["ci_success_count"] == 18
+    assert summary["ci_success_count"] == 20
 
 
 def test_data_not_matured_is_boundary_note_not_snapshot_blocker(tmp_path: Path) -> None:
@@ -207,6 +253,114 @@ def test_data_not_matured_is_boundary_note_not_snapshot_blocker(tmp_path: Path) 
     assert summary["live_stack_snapshot_status"] == snapshot.STATUS_READY
     assert summary["v3_7_allowed"] is False
     assert any("DATA_NOT_MATURED" in warning for warning in summary["warnings"])
+
+
+@pytest.mark.parametrize("state", ["CLOSED", "MERGED", ""])
+def test_pr_state_must_be_open(tmp_path: Path, state: str) -> None:
+    payload = _clean_snapshot()
+    if state:
+        payload["pull_requests"][3]["state"] = state
+    else:
+        del payload["pull_requests"][3]["state"]
+    path = _write_snapshot(tmp_path, payload)
+
+    summary = snapshot.build_snapshot(_config(tmp_path, path))
+
+    assert summary["live_stack_snapshot_status"] == snapshot.STATUS_BLOCKED_TOPOLOGY
+    assert any("pr_state_not_open" in reason for reason in summary["blocking_reasons"])
+
+
+def test_fixture_missing_requested_pr_range_is_incomplete(tmp_path: Path) -> None:
+    payload = _clean_snapshot()
+    payload["pull_requests"] = payload["pull_requests"][:1]
+    path = _write_snapshot(tmp_path, payload)
+
+    summary = snapshot.build_snapshot(_config(tmp_path, path))
+
+    assert summary["live_stack_snapshot_status"] == snapshot.STATUS_INCOMPLETE
+    assert summary["ready_for_human_merge_review"] is False
+    assert 37 in summary["missing_pr_numbers"]
+    assert 45 in summary["missing_pr_numbers"]
+
+
+def test_live_gh_paginates_changed_files_and_blocks_forbidden_after_first_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    first_page_nodes = [{"path": f"docs/safe_{index}.md"} for index in range(100)]
+    second_page_nodes = [{"path": "data/backtest/runs/raw.json"}]
+    outputs = [
+        _gh_response(
+            _gh_pr(
+                36,
+                files_nodes=first_page_nodes,
+                has_next=True,
+                end_cursor="cursor-1",
+            )
+        ),
+        _gh_response(
+            _gh_pr(
+                36,
+                files_nodes=second_page_nodes,
+                has_next=False,
+                end_cursor=None,
+            )
+        ),
+    ]
+
+    def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(" ".join(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout=outputs.pop(0), stderr="")
+
+    monkeypatch.setattr(snapshot.subprocess, "run", fake_run)
+
+    summary = snapshot.build_snapshot(
+        snapshot.SnapshotConfig(
+            snapshot_run_id="baseline_v3_6ad_live_stack_readiness_snapshot_unit",
+            output_dir=tmp_path / "runs",
+            use_gh=True,
+            repo="amanayayatu-tech/gotra",
+            pr_range="36",
+        )
+    )
+
+    assert len(calls) == 2
+    assert summary["live_stack_snapshot_status"] == snapshot.STATUS_BLOCKED_ARTIFACT
+    assert summary["artifact_boundary_violation_count"] == 1
+
+
+def test_incomplete_live_gh_file_pagination_blocks_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _gh_response(
+        _gh_pr(
+            36,
+            files_nodes=[{"path": "docs/safe.md"}],
+            has_next=True,
+            end_cursor=None,
+        )
+    )
+
+    def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 0, stdout=response, stderr="")
+
+    monkeypatch.setattr(snapshot.subprocess, "run", fake_run)
+
+    summary = snapshot.build_snapshot(
+        snapshot.SnapshotConfig(
+            snapshot_run_id="baseline_v3_6ad_live_stack_readiness_snapshot_unit",
+            output_dir=tmp_path / "runs",
+            use_gh=True,
+            repo="amanayayatu-tech/gotra",
+            pr_range="36",
+        )
+    )
+
+    assert summary["live_stack_snapshot_status"] == snapshot.STATUS_INCOMPLETE
+    assert summary["ready_for_human_merge_review"] is False
+    assert summary["incomplete_pr_numbers"] == [36]
 
 
 def _config(tmp_path: Path, path: Path) -> snapshot.SnapshotConfig:
@@ -274,6 +428,12 @@ def _clean_snapshot() -> dict[str, object]:
             "codex/gotra-v3-6ab-evidence-claim-boundary-scanner-20260621",
             "codex/gotra-v3-6ac-stack-merge-readiness-packet-20260621",
         ),
+        (
+            45,
+            "Add live stack readiness snapshot",
+            "codex/gotra-v3-6ac-stack-merge-readiness-packet-20260621",
+            "codex/gotra-v3-6ad-live-stack-readiness-snapshot-20260621",
+        ),
     ]
     return {
         "schema": "gotra.test.live_stack_readiness_snapshot.v1",
@@ -321,4 +481,52 @@ def _clean_snapshot() -> dict[str, object]:
                 ),
             }
         ],
+    }
+
+
+def _gh_response(pr: dict[str, object] | None) -> str:
+    return json.dumps({"data": {"repository": {"pullRequest": pr}}})
+
+
+def _gh_pr(
+    number: int,
+    *,
+    files_nodes: list[dict[str, str]],
+    has_next: bool,
+    end_cursor: str | None,
+) -> dict[str, object]:
+    return {
+        "number": number,
+        "title": "Add actual forward-live maturity monitor",
+        "baseRefName": "main",
+        "headRefName": "codex/gotra-v3-6s-actual-maturity-monitor-20260621",
+        "headRefOid": "sha-36",
+        "isDraft": False,
+        "mergeStateStatus": "CLEAN",
+        "state": "OPEN",
+        "statusCheckRollup": {
+            "contexts": {
+                "nodes": [
+                    {
+                        "__typename": "CheckRun",
+                        "name": "Python checks",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                    }
+                ]
+            }
+        },
+        "reviewThreads": {"nodes": []},
+        "files": {
+            "nodes": files_nodes,
+            "pageInfo": {
+                "hasNextPage": has_next,
+                "endCursor": end_cursor,
+            },
+        },
+        "body": (
+            "engineering/local only; not OOS/science/public/trading claim; "
+            "direct_llm_parametric_memory_control is not a clean no-future baseline; "
+            "v3_7_allowed=false."
+        ),
     }

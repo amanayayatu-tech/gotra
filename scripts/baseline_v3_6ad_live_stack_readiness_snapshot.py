@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -49,7 +50,7 @@ class SnapshotConfig:
     snapshot: Path | None = None
     use_gh: bool = False
     repo: str = "amanayayatu-tech/gotra"
-    pr_range: str = "36-44"
+    pr_range: str = "36-45"
     expected_root_base: str = "main"
     repo_root: Path | None = None
     stack_heads: tuple[str, ...] = ()
@@ -124,28 +125,23 @@ def load_source_snapshot(
 
 def fetch_gh_snapshot(*, repo: str, numbers: list[int]) -> dict[str, Any]:
     owner, name = parse_repo(repo)
-    query = gh_query(owner=owner, name=name, numbers=numbers)
-    completed = subprocess.run(
-        ["gh", "api", "graphql", "-f", f"query={query}"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    payload = json.loads(completed.stdout)
-    repository = payload.get("data", {}).get("repository", {})
     prs: list[dict[str, Any]] = []
     missing: list[int] = []
+    incomplete: list[int] = []
     for number in numbers:
-        entry = repository.get(f"pr{number}")
+        entry = fetch_gh_pr(owner=owner, name=name, number=number)
         if entry is None:
             missing.append(number)
             continue
+        if entry.pop("_files_pagination_incomplete", False):
+            incomplete.append(number)
         prs.append(entry)
     return {
         "schema": "gotra.baseline_v3_6ad.gh_live_stack_snapshot_source.v1",
         "repo": repo,
         "pr_numbers": numbers,
         "missing_pr_numbers": missing,
+        "incomplete_pr_numbers": incomplete,
         "pull_requests": prs,
         "readiness_status": "DATA_NOT_MATURED",
         "snapshot_created_at_utc": datetime.now(UTC).replace(microsecond=0).isoformat().replace(
@@ -155,6 +151,69 @@ def fetch_gh_snapshot(*, repo: str, numbers: list[int]) -> dict[str, Any]:
     }
 
 
+def fetch_gh_pr(*, owner: str, name: str, number: int) -> dict[str, Any] | None:
+    entry = gh_pull_request_page(owner=owner, name=name, number=number, after=None)
+    if entry is None:
+        return None
+    files = entry.get("files", {})
+    nodes, has_next, cursor, page_confirmed = files_page_info(files)
+    all_nodes = list(nodes)
+    incomplete = not page_confirmed
+    while has_next:
+        if not cursor:
+            incomplete = True
+            break
+        next_entry = gh_pull_request_page(owner=owner, name=name, number=number, after=cursor)
+        if next_entry is None:
+            incomplete = True
+            break
+        next_files = next_entry.get("files", {})
+        nodes, has_next, cursor, page_confirmed = files_page_info(next_files)
+        all_nodes.extend(nodes)
+        incomplete = incomplete or not page_confirmed
+    entry["files"] = {
+        "nodes": all_nodes,
+        "pageInfo": {
+            "hasNextPage": False if not incomplete else bool(has_next),
+            "endCursor": cursor,
+            "complete": not incomplete,
+        },
+    }
+    entry["_files_pagination_incomplete"] = incomplete
+    return entry
+
+
+def gh_pull_request_page(
+    *,
+    owner: str,
+    name: str,
+    number: int,
+    after: str | None,
+) -> dict[str, Any] | None:
+    query = gh_pr_query(owner=owner, name=name, number=number, after=after)
+    completed = subprocess.run(
+        ["gh", "api", "graphql", "-f", f"query={query}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(completed.stdout)
+    return payload.get("data", {}).get("repository", {}).get("pullRequest")
+
+
+def files_page_info(files: Any) -> tuple[list[dict[str, Any]], bool, str | None, bool]:
+    if not isinstance(files, dict):
+        return [], False, None, False
+    raw_nodes = files.get("nodes", [])
+    nodes = [node for node in raw_nodes if isinstance(node, dict)] if isinstance(raw_nodes, list) else []
+    page_info = files.get("pageInfo")
+    if not isinstance(page_info, dict):
+        return nodes, False, None, False
+    has_next = bool(page_info.get("hasNextPage"))
+    cursor = page_info.get("endCursor")
+    return nodes, has_next, str(cursor) if cursor else None, True
+
+
 def parse_repo(repo: str) -> tuple[str, str]:
     parts = repo.strip().split("/")
     if len(parts) != 2 or not all(parts):
@@ -162,9 +221,10 @@ def parse_repo(repo: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
-def gh_query(*, owner: str, name: str, numbers: list[int]) -> str:
+def gh_pr_query(*, owner: str, name: str, number: int, after: str | None) -> str:
     owner_json = json.dumps(owner)
     name_json = json.dumps(name)
+    after_clause = f", after: {json.dumps(after)}" if after else ""
     fields = """
       number
       title
@@ -202,16 +262,22 @@ def gh_query(*, owner: str, name: str, numbers: list[int]) -> str:
           }
         }
       }
-      files(first: 100) {
+      files(first: 100%s) {
         nodes {
           path
         }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
       }
-    """
-    aliases = "\n".join(
-        f"pr{number}: pullRequest(number: {number}) {{{fields}}}" for number in numbers
+    """ % after_clause
+    return (
+        "query { "
+        f"repository(owner: {owner_json}, name: {name_json}) "
+        f"{{ pullRequest(number: {number}) {{{fields}}} }} "
+        "}"
     )
-    return f"query {{ repository(owner: {owner_json}, name: {name_json}) {{ {aliases} }} }}"
 
 
 def normalize_pr_for_snapshot(pr: dict[str, Any]) -> dict[str, Any]:
@@ -318,19 +384,20 @@ def negative_boundary_heading(lowered: str) -> bool:
 def safe_false_v3_7_line(lowered: str) -> bool:
     if "v3.7" not in lowered and "v3_7" not in lowered and "v37" not in lowered:
         return False
-    return any(
-        marker in lowered
-        for marker in (
-            "false",
-            "forbidden",
-            "disallowed",
-            "blocked",
-            "not allowed",
-            "do not execute",
-            "does not execute",
-            "not execute",
-        )
+    explicit_false = (
+        re.search(r"['\"]?\bv3[_ .-]?7[_ .-]?allowed['\"]?\s*[:=]\s*(false|no)\b", lowered)
+        or re.search(r"\bv(?:3[._-]?7|37)\b.{0,40}\ballowed\s*:\s*(false|no)\b", lowered)
+        or re.search(r"\bv(?:3[._-]?7|37)\b.{0,40}\b(not\s+allowed|disallowed|forbidden|blocked)\b", lowered)
+        or re.search(r"\b(do(?:es)?\s+not|not)\s+(execute|authorize).{0,40}\bv(?:3[._-]?7|37)\b", lowered)
     )
+    if not explicit_false:
+        return False
+    positive_override = re.search(
+        r"['\"]?\bv3[_ .-]?7[_ .-]?allowed['\"]?\s*[:=]\s*true\b"
+        r"|\bv(?:3[._-]?7|37)\b.{0,40}\b(?:is\s+)?(allowed|ready|pass)\b",
+        lowered,
+    )
+    return positive_override is None
 
 
 def test_coverage_boundary_line(lowered: str) -> bool:
@@ -403,8 +470,9 @@ def choose_snapshot_status(
     conflict_status: str,
     conflict_reasons: list[str],
     missing_pr_numbers: list[int],
+    incomplete_pr_numbers: list[int],
 ) -> str:
-    if missing_pr_numbers:
+    if missing_pr_numbers or incomplete_pr_numbers:
         return STATUS_INCOMPLETE
     if topology_failures:
         return STATUS_BLOCKED_TOPOLOGY
@@ -440,6 +508,42 @@ def conflict_dry_run(
         )
         return merge_packet.local_conflict_dry_run(packet_config)
     return fixture_status, fixture_reasons
+
+
+def requested_pr_numbers(config: SnapshotConfig) -> list[int]:
+    return parse_pr_range(config.pr_range)
+
+
+def snapshot_completeness_failures(
+    *,
+    expected_numbers: list[int],
+    prs: list[dict[str, Any]],
+    snapshot: dict[str, Any],
+) -> tuple[list[int], list[int], list[str]]:
+    actual_numbers = {stack_audit.pr_number(pr) for pr in prs}
+    provided_missing = {
+        int(number)
+        for number in snapshot.get("missing_pr_numbers", [])
+        if isinstance(number, int) or str(number).isdigit()
+    }
+    missing = sorted((set(expected_numbers) - actual_numbers) | provided_missing)
+    incomplete = sorted(
+        int(number)
+        for number in snapshot.get("incomplete_pr_numbers", [])
+        if isinstance(number, int) or str(number).isdigit()
+    )
+    state_failures = check_pr_states(prs)
+    return missing, incomplete, state_failures
+
+
+def check_pr_states(prs: list[dict[str, Any]]) -> list[str]:
+    failures: list[str] = []
+    for pr in prs:
+        number = stack_audit.pr_number(pr)
+        state = str(pr.get("state") or "").upper()
+        if state != "OPEN":
+            failures.append(f"stack_topology:pr_state_not_open:pr_{number}:state={state or 'missing'}")
+    return failures
 
 
 def base_summary(
@@ -534,15 +638,19 @@ def build_snapshot(config: SnapshotConfig) -> dict[str, Any]:
         run_root=run_root,
     )
     prs = normalize_prs_for_snapshot(stack_audit.pr_list(snapshot))
-    missing_pr_numbers = [
-        int(number)
-        for number in snapshot.get("missing_pr_numbers", [])
-        if isinstance(number, int) or str(number).isdigit()
-    ]
+    expected_numbers = requested_pr_numbers(config)
+    missing_pr_numbers, incomplete_pr_numbers, state_failures = snapshot_completeness_failures(
+        expected_numbers=expected_numbers,
+        prs=prs,
+        snapshot=snapshot,
+    )
     topology_status, topology_failures = stack_audit.check_stack_topology(
         prs,
         expected_root_base=config.expected_root_base,
     )
+    if state_failures:
+        topology_status = "blocked"
+        topology_failures.extend(state_failures)
     draft_failures = merge_packet.check_draft_prs(prs)
     if draft_failures:
         topology_status = "blocked"
@@ -572,9 +680,14 @@ def build_snapshot(config: SnapshotConfig) -> dict[str, Any]:
         conflict_status=conflict_status,
         conflict_reasons=conflict_reasons,
         missing_pr_numbers=missing_pr_numbers,
+        incomplete_pr_numbers=incomplete_pr_numbers,
     )
     blocking_reasons = (
         [f"snapshot_incomplete:missing_pr_{number}" for number in missing_pr_numbers]
+        + [
+            f"snapshot_incomplete:changed_files_pagination_incomplete:pr_{number}"
+            for number in incomplete_pr_numbers
+        ]
         + topology_failures
         + ci_failures
         + review_failures
@@ -598,6 +711,7 @@ def build_snapshot(config: SnapshotConfig) -> dict[str, Any]:
         {
             "open_pr_count": len(prs),
             "pr_numbers": pr_numbers,
+            "expected_pr_numbers": expected_numbers,
             "expected_stack_order": merge_packet.expected_merge_order(prs),
             "base_chain": base_chain(prs),
             "head_shas": head_shas(prs),
@@ -622,6 +736,7 @@ def build_snapshot(config: SnapshotConfig) -> dict[str, Any]:
             "claim_boundary_violation_count": claim_count,
             "maturity_boundary_status": maturity_status,
             "missing_pr_numbers": missing_pr_numbers,
+            "incomplete_pr_numbers": incomplete_pr_numbers,
             "pull_requests": [
                 {
                     "number": stack_audit.pr_number(pr),
@@ -631,6 +746,7 @@ def build_snapshot(config: SnapshotConfig) -> dict[str, Any]:
                     "head_sha": str(pr.get("headRefOid") or pr.get("head_sha") or ""),
                     "is_draft": bool(pr.get("isDraft", pr.get("is_draft", False))),
                     "merge_state_status": str(pr.get("mergeStateStatus") or ""),
+                    "state": str(pr.get("state") or ""),
                 }
                 for pr in prs
             ],
@@ -715,7 +831,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--snapshot", type=Path)
     parser.add_argument("--use-gh", action="store_true")
     parser.add_argument("--repo", default="amanayayatu-tech/gotra")
-    parser.add_argument("--pr-range", default="36-44")
+    parser.add_argument("--pr-range", default="36-45")
     parser.add_argument(
         "--output-dir",
         type=Path,
