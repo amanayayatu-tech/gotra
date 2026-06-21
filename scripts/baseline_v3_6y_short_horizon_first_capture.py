@@ -36,6 +36,8 @@ STATUS_NOT_RUN = "SHORT_HORIZON_CAPTURE_CANARY_NOT_RUN"
 STATUS_BLOCKED_RUN_ID_EXISTS = "SHORT_HORIZON_CAPTURE_BLOCKED_RUN_ID_EXISTS"
 STATUS_BLOCKED_DATA = "SHORT_HORIZON_CAPTURE_BLOCKED_DATA"
 STATUS_BLOCKED_BACKEND = "SHORT_HORIZON_CAPTURE_BLOCKED_BACKEND"
+STATUS_SCHEMA_FAIL = "SHORT_HORIZON_CAPTURE_SCHEMA_FAIL"
+STATUS_PROVENANCE_FAIL = "SHORT_HORIZON_CAPTURE_PROVENANCE_FAIL"
 STATUS_FAIL = "SHORT_HORIZON_CAPTURE_CANARY_FAIL"
 
 FUTURE_OUTCOME_STATUS = "not_matured"
@@ -64,6 +66,10 @@ FORBIDDEN_OUTCOME_FIELDS = {
 }
 
 Mode = Literal["mock", "codex-cli-capture"]
+
+
+class ShortHorizonProvenanceError(ValueError):
+    """Raised when a capture decision references unavailable provenance."""
 
 
 @dataclass(frozen=True)
@@ -144,6 +150,22 @@ def validate_config(config: CanaryConfig) -> None:
         raise ValueError("at least one arm is required")
     if not config.input_layers:
         raise ValueError("at least one input layer is required")
+    unsupported_layers = sorted(
+        layer for layer in config.input_layers if layer != "price_only_packet"
+    )
+    if unsupported_layers:
+        raise ValueError(
+            "v3.6Y first-capture canary only supports price_only_packet; "
+            "richer_research_packet/both require real filtered research artifacts "
+            "and are blocked in this canary"
+        )
+    unsupported_arms = sorted(arm for arm in config.arms if arm != "direct_llm")
+    if unsupported_arms:
+        raise ValueError(
+            "v3.6Y first-capture canary only supports direct_llm; "
+            "full_gotra/all require visible feedback provenance and are blocked in "
+            "this canary"
+        )
     if config.backend_concurrency <= 0:
         raise ValueError("backend_concurrency must be > 0")
     slugs: dict[str, str] = {}
@@ -187,6 +209,7 @@ def source_decision_id(
     input_layer: v3.InputLayer,
     decision_date_local: date,
     horizon_days: int,
+    prompt_hash: str,
 ) -> str:
     return stable_json_hash(
         {
@@ -197,6 +220,7 @@ def source_decision_id(
             "input_layer": input_layer,
             "decision_date_local": decision_date_local.isoformat(),
             "horizon_days": horizon_days,
+            "prompt_hash": prompt_hash,
         }
     )
 
@@ -291,6 +315,26 @@ def validate_decision_identity(
         )
     if mismatches:
         raise ValueError("decision identity mismatch: " + "; ".join(mismatches))
+
+
+def validate_visible_alaya_memory_refs(
+    *,
+    decision: v3.ProviderDecision,
+    arm: v3.Arm,
+    visible_feedback_refs: set[str],
+) -> None:
+    if arm != "full_gotra":
+        return
+    refs = [str(item) for item in decision.alaya_memory_refs]
+    if not refs:
+        return
+    invalid_refs = sorted(ref for ref in refs if ref not in visible_feedback_refs)
+    if not visible_feedback_refs or invalid_refs:
+        raise ShortHorizonProvenanceError(
+            "invalid alaya_memory_refs for short-horizon capture: "
+            + ",".join(invalid_refs or refs)
+            + f"; visible_feedback_refs={len(visible_feedback_refs)}"
+        )
 
 
 def validate_no_outcome_fields(payload: dict[str, Any]) -> None:
@@ -420,6 +464,11 @@ def capture_one(
         decision_date_local=decision_date,
         horizon_days=config.horizon_days,
     )
+    validate_visible_alaya_memory_refs(
+        decision=decision,
+        arm=arm,
+        visible_feedback_refs=set(),
+    )
     source_id = source_decision_id(
         run_id=config.run_id,
         ticker=ticker,
@@ -427,6 +476,7 @@ def capture_one(
         input_layer=input_layer,
         decision_date_local=decision_date,
         horizon_days=config.horizon_days,
+        prompt_hash=prompt_hash,
     )
     artifact = {
         "schema": CAPTURE_SCHEMA,
@@ -460,6 +510,7 @@ def capture_one(
         if config.mode != "mock"
         else config.codex_cli_reasoning_setting,
         "prompt_hash": prompt_hash,
+        "source_prompt_identity_hash": prompt_hash,
         "output_transcript_path": decision.output_transcript_path
         if config.mode != "mock"
         else "",
@@ -564,6 +615,9 @@ def summary_base(config: CanaryConfig, *, run_root: Path) -> dict[str, Any]:
         "capture_error_count": 0,
         "capture_errors": [],
         "prompt_hash_count": 0,
+        "codex_cli_version": "",
+        "codex_cli_version_count": 0,
+        "codex_cli_version_values": [],
         "codex_cli_transcript_path_count": 0,
         "parsed_decision_hash_count": 0,
         "future_data_violation_count": 0,
@@ -647,6 +701,49 @@ def write_summary_files(
     )
 
 
+def capture_failure_category(capture_errors: list[dict[str, Any]]) -> str:
+    if not capture_errors:
+        return ""
+    if any(
+        str(error.get("error_type")) == "ShortHorizonProvenanceError"
+        for error in capture_errors
+    ):
+        return "provenance"
+    schema_error_classes = {"JSONDecodeError", "SchemaContractError", "InputEchoError"}
+    schema_error_types = {"KeyError", "TypeError", "ValueError"}
+    if any(
+        str(error.get("provider_error_class")) in schema_error_classes
+        or str(error.get("error_type")) in schema_error_types
+        for error in capture_errors
+    ):
+        return "schema"
+    backend_error_classes = {
+        "AuthMissing",
+        "CodexCliBackendBlocked",
+        "TimeoutException",
+        "ConnectionError",
+        "HTTPError",
+        "RateLimitError",
+    }
+    if all(
+        str(error.get("provider_error_class")) in backend_error_classes
+        or str(error.get("error_type")) in {"ProviderRequestError", "RuntimeError"}
+        for error in capture_errors
+    ):
+        return "backend"
+    return "schema"
+
+
+def blocker_reasons_for_status(status: str) -> list[str]:
+    if status == STATUS_BLOCKED_BACKEND:
+        return ["backend_blocked"]
+    if status == STATUS_PROVENANCE_FAIL:
+        return ["capture_provenance_failed"]
+    if status == STATUS_SCHEMA_FAIL:
+        return ["capture_schema_failed"]
+    return ["capture_failed"]
+
+
 def run_capture(config: CanaryConfig) -> dict[str, Any]:
     validate_config(config)
     run_root = config.output_dir / config.run_id
@@ -658,7 +755,7 @@ def run_capture(config: CanaryConfig) -> dict[str, Any]:
         return not_run_summary(
             config,
             run_root=run_root,
-            reason="codex_cli_backend_requires_explicit_execute_backend",
+        reason="codex_cli_backend_requires_explicit_execute_backend",
         )
 
     run_root.mkdir(parents=True, exist_ok=True)
@@ -736,6 +833,9 @@ def run_capture(config: CanaryConfig) -> dict[str, Any]:
                         "arm": arm,
                         "input_layer": input_layer,
                         "error_type": exc.__class__.__name__,
+                        "provider_error_class": str(
+                            getattr(exc, "provider_error_class", "")
+                        ),
                         "error_message": v3.redact_error(str(exc)),
                     }
                 )
@@ -746,6 +846,13 @@ def run_capture(config: CanaryConfig) -> dict[str, Any]:
     )
     transcript_count = sum(1 for item in artifacts if item.get("output_transcript_path"))
     parsed_hash_count = sum(1 for item in artifacts if item.get("parsed_decision_hash"))
+    codex_cli_versions = sorted(
+        {
+            str(item.get("codex_cli_version"))
+            for item in artifacts
+            if str(item.get("codex_cli_version") or "")
+        }
+    )
     expected = expected_capture_decisions(config)
     backend_called = config.mode == "codex-cli-capture" and config.execute_backend
     status = (
@@ -757,8 +864,14 @@ def run_capture(config: CanaryConfig) -> dict[str, Any]:
         and reference_future_violations == 0
         else STATUS_FAIL
     )
-    if backend_called and capture_errors and not artifacts:
-        status = STATUS_BLOCKED_BACKEND
+    failure_category = capture_failure_category(capture_errors)
+    if capture_errors:
+        if failure_category == "backend":
+            status = STATUS_BLOCKED_BACKEND
+        elif failure_category == "provenance":
+            status = STATUS_PROVENANCE_FAIL
+        else:
+            status = STATUS_SCHEMA_FAIL
     summary = summary_base(config, run_root=run_root)
     summary.update(
         {
@@ -767,6 +880,11 @@ def run_capture(config: CanaryConfig) -> dict[str, Any]:
             "capture_error_count": len(capture_errors),
             "capture_errors": capture_errors[:10],
             "prompt_hash_count": sum(1 for item in artifacts if item.get("prompt_hash")),
+            "codex_cli_version": codex_cli_versions[0]
+            if len(codex_cli_versions) == 1
+            else "",
+            "codex_cli_version_count": len(codex_cli_versions),
+            "codex_cli_version_values": codex_cli_versions,
             "codex_cli_transcript_path_count": transcript_count,
             "parsed_decision_hash_count": parsed_hash_count,
             "future_data_violation_count": future_violations,
@@ -778,7 +896,7 @@ def run_capture(config: CanaryConfig) -> dict[str, Any]:
             "codex_cli_called": backend_called,
             "blocker_reasons": []
             if status == STATUS_PASS
-            else ["backend_blocked" if status == STATUS_BLOCKED_BACKEND else "capture_failed"],
+            else blocker_reasons_for_status(status),
         }
     )
     write_summary_files(config=config, run_root=run_root, summary=summary)

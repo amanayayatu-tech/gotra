@@ -39,13 +39,22 @@ so this stage does not change 30D forward-live semantics. It supports:
 - `codex-cli-capture` mode with an explicit `--execute-backend` safety switch.
 - One-ticker first canary by default.
 - Short-horizon `horizon_days`, default `1`.
+- Conservative first-canary input contract: only `direct_llm` plus
+  `price_only_packet` is allowed until real filtered research artifacts and
+  visible feedback provenance are wired for richer/full_gotra captures.
 - Required future-only metadata:
   `capture_timestamp_utc`, `decision_date_local`, `horizon_end_date`,
   `outcome_price_available_after_utc`, backend/model/reasoning, `prompt_hash`,
   transcript path, parsed decision hash, and `future_outcome_status=not_matured`.
 - Maturity ledger rows linking `source_decision_id` to the future outcome
-  availability timestamp.
+  availability timestamp. After PR review hardening, `source_decision_id`
+  includes the prompt identity hash so overwrite/replay joins cannot silently
+  attach stale outcomes to a changed capture prompt.
 - No outcome scoring fields and no winner/verdict fields in capture artifacts.
+- Separate terminal statuses distinguish backend blockers from schema and
+  provenance failures: `SHORT_HORIZON_CAPTURE_BLOCKED_BACKEND`,
+  `SHORT_HORIZON_CAPTURE_SCHEMA_FAIL`, and
+  `SHORT_HORIZON_CAPTURE_PROVENANCE_FAIL`.
 
 ## Preregistered Canary Shape
 
@@ -191,11 +200,48 @@ Recorded artifact metadata:
 The raw transcript is local-only and is not committed or printed in this
 document.
 
+## PR Review Hardening
+
+This PR was hardened after five active P2 review comments. The hardening is
+engineering/local only; no additional real Codex CLI backend capture was run.
+
+Fixes:
+
+- `richer_research_packet` / `both` are rejected for v3.6Y first-capture
+  canaries unless a future stage explicitly supplies real filtered research
+  artifacts. The canary no longer allows a capture labeled richer/ksana while
+  silently sending price-only input.
+- `full_gotra` / `all` are rejected for v3.6Y first-capture canaries because no
+  visible feedback set is supplied. A defensive provenance validator also fails
+  any non-empty `alaya_memory_refs` when no visible feedback refs exist.
+- Schema/identity failures are reported as
+  `SHORT_HORIZON_CAPTURE_SCHEMA_FAIL`, and provenance failures are reported as
+  `SHORT_HORIZON_CAPTURE_PROVENANCE_FAIL`; they are no longer collapsed into
+  `SHORT_HORIZON_CAPTURE_BLOCKED_BACKEND`.
+- Successful real backend summaries now carry summary-level
+  `codex_cli_version`, `codex_cli_version_count`, and
+  `codex_cli_version_values`.
+- `source_decision_id` now includes `prompt_hash` via
+  `source_prompt_identity_hash`, so it identifies the actual source artifact and
+  prompt, not only the ticker/date/horizon slot.
+
+Post-hardening mock validation, not committed:
+
+```text
+run_id=baseline_v3_6y_short_horizon_first_capture_mock_reviewfix_20260621T051630Z
+summary=/tmp/gotra_v3_6y_short_horizon_first_capture_mock_reviewfix_20260621T051630Z/runs/baseline_v3_6y_short_horizon_first_capture_mock_reviewfix_20260621T051630Z/summary.json
+summary_sha256=1ee04437bd3313f48cff4202c37a0674676495bd16095b8e766b59ac69519b46
+status=SHORT_HORIZON_CAPTURE_CANARY_PASS
+actual_capture_artifacts=1
+future_outcome_status=not_matured
+source_decision_id=4f8c14536158eb1e2e09be579f0bbb778233edff7ee8b5bcbefde8657d24f48d
+```
+
 ## Maturity Ledger
 
 The canary maturity ledger has one row:
 
-- `source_decision_id`:
+- Recorded pre-review-hardening `source_decision_id`:
   `c4cc681621586695bd66755b9903b85433c1fdd6768fd28e4c21e9c7e29fcd3d`
 - Ticker: `AAPL`
 - Arm: `direct_llm`
@@ -229,9 +275,9 @@ Results:
 
 - py_compile: pass
 - Ruff: pass
-- Focused tests: `5 passed`
-- v3.6Y/v3.6V/v3.6X regression set: `23 passed`
-- Full test suite: `399 passed`
+- Focused tests: `10 passed`
+- v3.6Y/v3.6V/v3.6X regression set: `28 passed`
+- Full test suite: `404 passed`
 - `git diff --check`: pass
 
 ## Artifact Boundary

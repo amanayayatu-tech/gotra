@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from scripts import baseline_v3_6y_short_horizon_first_capture as canary
 from scripts import baseline_v3_four_arm as v3
@@ -147,6 +148,9 @@ def test_codex_cli_fake_backend_records_required_metadata(
     assert summary["status"] == canary.STATUS_PASS
     assert summary["provider_or_backend_called"] is True
     assert summary["codex_cli_called"] is True
+    assert summary["codex_cli_version"] == "codex-cli 0.test"
+    assert summary["codex_cli_version_count"] == 1
+    assert summary["codex_cli_version_values"] == ["codex-cli 0.test"]
     assert summary["codex_cli_transcript_path_count"] == 1
     assert summary["parsed_decision_hash_count"] == 1
     assert artifact["backend"] == v3.CODEX_CLI_BACKEND
@@ -158,6 +162,92 @@ def test_codex_cli_fake_backend_records_required_metadata(
     assert Path(artifact["output_transcript_path"]).is_relative_to(
         tmp_path / "runs" / config.run_id
     )
+
+
+def test_richer_input_layers_are_rejected_before_capture(tmp_path: Path) -> None:
+    _write_prices(tmp_path / "prices", "AAPL")
+    config = replace(
+        _config(
+            tmp_path,
+            mode="mock",
+            run_id="baseline_v3_6y_short_horizon_first_capture_richer_blocked_unit",
+        ),
+        input_layers=("richer_research_packet",),
+    )
+
+    with pytest.raises(ValueError, match="only supports price_only_packet"):
+        canary.run_capture(config)
+
+    assert not (tmp_path / "runs" / config.run_id / "captures").exists()
+
+    both_config = replace(
+        config,
+        run_id="baseline_v3_6y_short_horizon_first_capture_both_blocked_unit",
+        input_layers=v3.INPUT_LAYERS,
+    )
+    with pytest.raises(ValueError, match="only supports price_only_packet"):
+        canary.run_capture(both_config)
+
+
+def test_full_gotra_arms_are_rejected_before_capture(tmp_path: Path) -> None:
+    _write_prices(tmp_path / "prices", "AAPL")
+    config = replace(
+        _config(
+            tmp_path,
+            mode="mock",
+            run_id="baseline_v3_6y_short_horizon_first_capture_full_gotra_blocked_unit",
+        ),
+        arms=("full_gotra",),
+    )
+
+    with pytest.raises(ValueError, match="only supports direct_llm"):
+        canary.run_capture(config)
+
+    assert not (tmp_path / "runs" / config.run_id / "captures").exists()
+
+    all_config = replace(
+        config,
+        run_id="baseline_v3_6y_short_horizon_first_capture_all_blocked_unit",
+        arms=v3.ARMS,
+    )
+    with pytest.raises(ValueError, match="only supports direct_llm"):
+        canary.run_capture(all_config)
+
+
+def test_full_gotra_memory_refs_without_feedback_are_provenance_failure(
+    tmp_path: Path,
+) -> None:
+    _write_prices(tmp_path / "prices", "AAPL")
+    config = _config(
+        tmp_path,
+        mode="mock",
+        run_id="baseline_v3_6y_short_horizon_first_capture_memory_ref_unit",
+    )
+    visible_rows, _future_rows_excluded, _latest_visible = canary.visible_price_rows(
+        "AAPL",
+        decision_date_local=canary.local_capture_date(config),
+        price_dir=config.price_dir,
+    )
+    payload = canary.build_prompt_payload(
+        config=config,
+        ticker="AAPL",
+        arm="full_gotra",
+        input_layer="price_only_packet",
+        visible_rows=visible_rows,
+    )
+    decision = v3.MockDecisionClient(
+        provider="local_mock",
+        provider_model=config.provider_model,
+        provider_base_url="local://mock",
+    ).complete(payload)
+    decision = replace(decision, arm="full_gotra", alaya_memory_refs=["invented-ref"])
+
+    with pytest.raises(canary.ShortHorizonProvenanceError):
+        canary.validate_visible_alaya_memory_refs(
+            decision=decision,
+            arm="full_gotra",
+            visible_feedback_refs=set(),
+        )
 
 
 def test_backend_blocker_does_not_fabricate_capture(tmp_path: Path, monkeypatch) -> None:
@@ -199,6 +289,67 @@ def test_backend_blocker_does_not_fabricate_capture(tmp_path: Path, monkeypatch)
     assert "backend_blocked" in summary["blocker_reasons"]
 
 
+def test_schema_failure_is_not_reported_as_backend_blocker(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _write_prices(tmp_path / "prices", "AAPL")
+
+    class WrongIdentityCodexClient:
+        def __init__(self, **kwargs: object) -> None:
+            self.provider_model = str(kwargs["model"])
+            self.reasoning_setting = str(kwargs["reasoning_setting"])
+
+        def complete(
+            self,
+            payload: dict[str, object],
+            *,
+            request_timeout_seconds: float | None = None,
+        ) -> v3.ProviderDecision:
+            del request_timeout_seconds
+            decision = v3.MockDecisionClient(
+                provider="local_mock",
+                provider_model=self.provider_model,
+                provider_base_url="local://mock",
+            ).complete(payload)
+            return replace(
+                decision,
+                ticker="MSFT",
+                backend_name=v3.CODEX_CLI_BACKEND,
+                codex_cli_version="codex-cli 0.test",
+                codex_cli_model=self.provider_model,
+                codex_cli_reasoning_setting=self.reasoning_setting,
+            )
+
+    monkeypatch.setattr(v3, "CodexCliBackendDecisionClient", WrongIdentityCodexClient)
+    run_id = "baseline_v3_6y_short_horizon_first_capture_schema_fail_unit"
+
+    exit_code = canary.main(
+        [
+            "--mode",
+            "codex-cli-capture",
+            "--execute-backend",
+            "--run-id",
+            run_id,
+            "--output-dir",
+            str(tmp_path / "runs"),
+            "--price-dir",
+            str(tmp_path / "prices"),
+            "--capture-timestamp-utc",
+            CAPTURE_TS.isoformat().replace("+00:00", "Z"),
+        ]
+    )
+    summary = json.loads(
+        (tmp_path / "runs" / run_id / "summary.json").read_text(encoding="utf-8")
+    )
+
+    assert exit_code == 1
+    assert summary["status"] == canary.STATUS_SCHEMA_FAIL
+    assert summary["status"] != canary.STATUS_BLOCKED_BACKEND
+    assert "capture_schema_failed" in summary["blocker_reasons"]
+    assert summary["capture_errors"][0]["error_type"] == "ValueError"
+
+
 def test_existing_run_id_blocks_without_overwrite(tmp_path: Path) -> None:
     _write_prices(tmp_path / "prices", "AAPL")
     run_id = "baseline_v3_6y_short_horizon_first_capture_collision_unit"
@@ -213,6 +364,22 @@ def test_existing_run_id_blocks_without_overwrite(tmp_path: Path) -> None:
     assert summary["actual_capture_artifacts"] == 0
     assert summary["provider_or_backend_called"] is False
     assert (run_root / "sentinel.txt").read_text(encoding="utf-8") == "exists"
+
+
+def test_source_decision_id_changes_with_prompt_hash() -> None:
+    base_kwargs = {
+        "run_id": "baseline_v3_6y_short_horizon_first_capture_source_id_unit",
+        "ticker": "AAPL",
+        "arm": "direct_llm",
+        "input_layer": "price_only_packet",
+        "decision_date_local": date(2026, 6, 21),
+        "horizon_days": 1,
+    }
+
+    first = canary.source_decision_id(**base_kwargs, prompt_hash="prompt-a")
+    second = canary.source_decision_id(**base_kwargs, prompt_hash="prompt-b")
+
+    assert first != second
 
 
 def _price_rows(days: int = 80) -> pd.DataFrame:
