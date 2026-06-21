@@ -29,6 +29,11 @@ STATUS_BLOCKED_MATURITY_GATE = "CLAIM_BOUNDARY_BLOCKED_MATURITY_GATE"
 STATUS_BLOCKED_RUN_ID_EXISTS = "CLAIM_BOUNDARY_BLOCKED_RUN_ID_EXISTS"
 
 DIRECT_LLM_INTERPRETATION = "direct_llm_parametric_memory_control"
+DIRECT_LLM_TECHNICAL_FIELDS = (
+    "direct_llm_boundary_status",
+    "direct_llm_interpretation",
+    "direct_llm_mislabel_count",
+)
 
 FORBIDDEN_PATH_PATTERNS = (
     r"(^|/)data/backtest/runs/",
@@ -283,6 +288,11 @@ def direct_llm_clean_baseline_is_negated(line: str) -> bool:
     )
 
 
+def direct_llm_line_is_technical_field(line: str) -> bool:
+    lowered = line.lower()
+    return any(field in lowered for field in DIRECT_LLM_TECHNICAL_FIELDS)
+
+
 def line_allows_boundary(line: str) -> bool:
     lowered = line.lower()
     return any(
@@ -333,7 +343,11 @@ def scan_line(
                     "evidence claim exceeds engineering/local/internal boundary",
                 )
             )
-    if "direct_llm" in line and DIRECT_LLM_INTERPRETATION not in line:
+    if (
+        "direct_llm" in line
+        and DIRECT_LLM_INTERPRETATION not in line
+        and not direct_llm_line_is_technical_field(line)
+    ):
         result["direct_llm"].append(
             make_blocked_item(
                 source.path,
