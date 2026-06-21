@@ -235,6 +235,10 @@ def gh_pr_query(*, owner: str, name: str, number: int, after: str | None) -> str
       isDraft
       mergeStateStatus
       state
+      mergedAt
+      mergeCommit {
+        oid
+      }
       statusCheckRollup {
         contexts(first: 100) {
           nodes {
