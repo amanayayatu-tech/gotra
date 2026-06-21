@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -20,10 +21,32 @@ def test_conservative_baseline_and_structured_candidate_improves_fixture_metrics
     assert summary["delta_counterfactual_count"] > 0
     assert summary["delta_falsifiable_trigger_count"] > 0
     assert summary["delta_generic_caution_phrase_count"] < 0
+    assert summary["structural_improvement_met"] is True
     assert summary["provider_or_backend_called"] is False
     assert summary["codex_cli_new_call"] is False
     assert summary["formal_lite_entered"] is False
     assert summary["v3_7_allowed"] is False
+
+
+def test_low_information_baseline_without_positive_structural_deltas_not_improved(
+    tmp_path: Path,
+) -> None:
+    summary = comparison.run_comparison(
+        _config(
+            tmp_path,
+            baseline=_low_information_structurally_rich_artifact(),
+            candidate=_artifact(),
+        )
+    )
+
+    assert summary["baseline_information_gain_status"] == comparison.LOW_INFORMATION_GAIN
+    assert summary["candidate_information_gain_status"] == comparison.SUFFICIENT
+    assert summary["comparison_status"] == comparison.STATUS_READY
+    assert summary["comparison_status"] != comparison.STATUS_IMPROVED
+    assert summary["delta_ranked_hypothesis_count"] <= 0
+    assert summary["delta_counterfactual_count"] <= 0
+    assert summary["delta_falsifiable_trigger_count"] <= 0
+    assert summary["structural_improvement_met"] is False
 
 
 def test_contract_candidate_is_schema_and_provenance_clean(tmp_path: Path) -> None:
@@ -123,6 +146,18 @@ def test_ready_or_improved_does_not_execute_verdict(tmp_path: Path) -> None:
     assert "trading_advice" not in summary
 
 
+def test_manifest_records_verifiable_summary_digest(tmp_path: Path) -> None:
+    summary = comparison.run_comparison(
+        _config(tmp_path, baseline=_low_information_artifact(), candidate=_artifact())
+    )
+    summary_path = Path(summary["summary_path"])
+    manifest_path = Path(summary["manifest_path"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert manifest["summary_sha256"] == _sha256(summary_path)
+    assert summary["summary_digest_target"] == "manifest.summary_sha256"
+
+
 def _config(
     tmp_path: Path,
     *,
@@ -169,6 +204,52 @@ def _low_information_artifact(source_suffix: str = "baseline") -> dict[str, obje
         uncertainty_decomposition={"unknown": 1.0},
         summary="This is not investment advice. It could be uncertain and may have risk.",
     )
+
+
+def _low_information_structurally_rich_artifact() -> dict[str, object]:
+    return _artifact(
+        source_suffix="rich_baseline",
+        hypotheses=[
+            {
+                "rank": 1,
+                "confidence": 0.45,
+                "why_it_matters": "Risk remains and uncertainty remains.",
+                "falsification_triggers": ["trigger one"],
+                "expected_observable_evidence": ["observable one"],
+            },
+            {
+                "rank": 2,
+                "confidence": 0.42,
+                "why_it_matters": "Limited information means risk remains.",
+                "falsification_triggers": ["trigger two"],
+                "expected_observable_evidence": ["observable two"],
+            },
+            {
+                "rank": 3,
+                "confidence": 0.4,
+                "why_it_matters": "Uncertainty remains and no conclusion is possible.",
+                "falsification_triggers": ["trigger three"],
+                "expected_observable_evidence": ["observable three"],
+            },
+        ],
+        counterfactuals=["c1", "c2", "c3"],
+        disagreement_with_price_only=["structured disagreement"],
+        evidence_gaps=["gap"],
+        uncertainty_decomposition={"demand": 0.4, "margin": 0.35, "macro": 0.25},
+        summary=(
+            "This is not investment advice. It could be uncertain and may have risk. "
+            "Uncertainty remains, limited information remains, and no conclusion is available. "
+            "Risk remains and generic caution remains."
+        ),
+    )
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _artifact(

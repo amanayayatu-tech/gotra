@@ -41,16 +41,32 @@ The harness calls the v3.6AI analyzer separately for baseline and candidate
 fixtures, then compares structural front-half metrics. Runtime output is written
 to `/tmp` or a caller-supplied ignored output root and is not committed.
 
+Review hardening:
+
+- `COGNITIVE_LIFT_FIXTURE_IMPROVED` now requires positive structural deltas for
+  ranked hypotheses, counterfactuals, and falsification triggers. A
+  low-information baseline caused only by generic caution wording is no longer
+  enough to claim fixture improvement when the candidate has non-positive
+  structural deltas.
+- The final `summary.json` digest is recorded in `manifest.json` as
+  `summary_sha256`; the summary does not store a self-invalidating digest field.
+
 ## Local Mock Validation
 
 Run id:
-`baseline_v3_6aj_cognitive_lift_fixture_comparison_mock_20260621T114338Z`
+`baseline_v3_6aj_cognitive_lift_fixture_comparison_repair_20260621T120914Z`
 
 Summary path:
-`/tmp/gotra_v3_6aj_cognitive_lift_fixture_comparison/runs/baseline_v3_6aj_cognitive_lift_fixture_comparison_mock_20260621T114338Z/summary.json`
+`/tmp/gotra_v3_6aj_repair_validation_20260621T120914Z/runs/baseline_v3_6aj_cognitive_lift_fixture_comparison_repair_20260621T120914Z/summary.json`
 
 Summary sha256:
-`087f2354b5f4acfa08150ce3e9dc579bc4c36b4b08eef0b0e2067a23658e11bf`
+`dfb31f3c568c43fa52403a18a928ab7138cceab0dd0f1014b6434b2caf5fbcb0`
+
+Digest manifest path:
+`/tmp/gotra_v3_6aj_repair_validation_20260621T120914Z/runs/baseline_v3_6aj_cognitive_lift_fixture_comparison_repair_20260621T120914Z/manifest.json`
+
+Digest manifest sha256:
+`2c84c4e1fdca97f466b3ec47156b498a2bcd89782a5d3a0b875d89030a73ceb6`
 
 Summary status:
 
@@ -61,6 +77,8 @@ Summary status:
 - `delta_counterfactual_count=2`
 - `delta_falsifiable_trigger_count=2`
 - `delta_generic_caution_phrase_count=-6`
+- `structural_improvement_met=true`
+- `positive_structural_delta_count=3`
 - `provider_or_backend_called=false`
 - `codex_cli_new_call=false`
 - `formal_lite_entered=false`
@@ -76,6 +94,8 @@ Focused tests cover:
 
 - conservative baseline plus structured candidate -> fixture structural
   improvement
+- caution-heavy baseline with non-positive structural deltas -> comparison ready,
+  not improved
 - contract-compliant baseline and candidate -> fixture comparison ready
 - malformed candidate -> `BLOCKED_SCHEMA`
 - missing provenance -> `BLOCKED_PROVENANCE`
@@ -83,6 +103,7 @@ Focused tests cover:
 - `direct_llm_parametric_memory_control` clean-baseline misuse -> blocked
 - `direct_llm_parametric_memory_control` boundary -> accepted
 - low-information candidate -> `LOW_INFORMATION_GAIN_CANDIDATE`
+- manifest-side final `summary.json` digest is verifiable
 - no provider, no new Codex CLI, no formal-lite, and `v3_7_allowed=false`
 
 ## Boundary

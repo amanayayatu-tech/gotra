@@ -46,6 +46,16 @@ then compared on structural metrics:
 - schema blockers
 - overclaim blockers
 
+Review-hardening rule: `COGNITIVE_LIFT_FIXTURE_IMPROVED` requires a sufficient
+candidate and positive structural deltas for ranked hypotheses,
+counterfactuals, and falsification triggers. If the baseline is low-information
+only because it is caution-heavy, but the candidate does not improve these
+structural counts, the harness reports a non-improved comparison-ready status
+instead of overstating improvement.
+
+The final `summary.json` digest is recorded in `manifest.json` as
+`summary_sha256`; the summary does not store a self-invalidating digest field.
+
 ## Summary Fields
 
 The summary must include at least:
@@ -67,6 +77,8 @@ The summary must include at least:
 - `delta_counterfactual_count`
 - `delta_falsifiable_trigger_count`
 - `delta_generic_caution_phrase_count`
+- `structural_improvement_met`
+- `positive_structural_delta_count`
 - `provenance_link_count`
 - `overclaim_blocker_count`
 - `schema_blocker_count`

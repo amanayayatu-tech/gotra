@@ -58,6 +58,11 @@ BLOCKED_STATUS_MAP = {
 }
 LOW_INFORMATION_GAIN = lift_audit.STATUS_LOW_INFORMATION_GAIN
 SUFFICIENT = "SUFFICIENT_FOR_FIXTURE_COMPARISON"
+STRUCTURAL_IMPROVEMENT_METRICS = (
+    "ranked_hypothesis_count",
+    "counterfactual_count",
+    "falsifiable_trigger_count",
+)
 
 
 @dataclass(frozen=True)
@@ -141,6 +146,19 @@ def delta(candidate: dict[str, Any], baseline: dict[str, Any], key: str) -> int:
     return int_metric(candidate, key) - int_metric(baseline, key)
 
 
+def structural_improvement_deltas(
+    baseline: dict[str, Any], candidate: dict[str, Any]
+) -> dict[str, int]:
+    return {key: delta(candidate, baseline, key) for key in STRUCTURAL_IMPROVEMENT_METRICS}
+
+
+def has_positive_structural_improvement(
+    baseline: dict[str, Any], candidate: dict[str, Any]
+) -> bool:
+    deltas = structural_improvement_deltas(baseline, candidate)
+    return all(value > 0 for value in deltas.values())
+
+
 def blocked_status(baseline: dict[str, Any], candidate: dict[str, Any]) -> str | None:
     statuses = {str(baseline.get("overall_status") or ""), str(candidate.get("overall_status") or "")}
     for status in BLOCKED_STATUS_ORDER:
@@ -162,10 +180,14 @@ def comparison_status(baseline: dict[str, Any], candidate: dict[str, Any]) -> st
     candidate_info = str(candidate.get("information_gain_status") or "")
     if candidate_info == LOW_INFORMATION_GAIN:
         return STATUS_LOW_CANDIDATE
-    if baseline_info == LOW_INFORMATION_GAIN and candidate_info == SUFFICIENT:
+    if (
+        baseline_info == LOW_INFORMATION_GAIN
+        and candidate_info == SUFFICIENT
+        and has_positive_structural_improvement(baseline, candidate)
+    ):
         return STATUS_IMPROVED
     if baseline_info == LOW_INFORMATION_GAIN:
-        return STATUS_LOW_BASELINE
+        return STATUS_READY
     return STATUS_READY
 
 
@@ -243,6 +265,9 @@ def base_summary(config: ComparisonConfig, *, run_root: Path) -> dict[str, Any]:
         "delta_counterfactual_count": 0,
         "delta_falsifiable_trigger_count": 0,
         "delta_generic_caution_phrase_count": 0,
+        "structural_improvement_required_metric_count": len(STRUCTURAL_IMPROVEMENT_METRICS),
+        "positive_structural_delta_count": 0,
+        "structural_improvement_met": False,
         "provenance_link_count": 0,
         "overclaim_blocker_count": 0,
         "schema_blocker_count": 0,
@@ -274,6 +299,8 @@ def build_summary(
     candidate: dict[str, Any],
 ) -> dict[str, Any]:
     status = comparison_status(baseline, candidate)
+    improvement_deltas = structural_improvement_deltas(baseline, candidate)
+    positive_structural_delta_count = sum(1 for value in improvement_deltas.values() if value > 0)
     summary = base_summary(config, run_root=run_root)
     summary.update(
         {
@@ -308,6 +335,10 @@ def build_summary(
             "delta_generic_caution_phrase_count": delta(
                 candidate, baseline, "generic_caution_phrase_count"
             ),
+            "structural_improvement_required_metrics": sorted(STRUCTURAL_IMPROVEMENT_METRICS),
+            "positive_structural_delta_count": positive_structural_delta_count,
+            "structural_improvement_met": positive_structural_delta_count
+            == len(STRUCTURAL_IMPROVEMENT_METRICS),
             "provenance_link_count": int_metric(baseline, "provenance_link_count")
             + int_metric(candidate, "provenance_link_count"),
             "overclaim_blocker_count": overclaim_blocker_count(baseline, candidate),
@@ -345,10 +376,15 @@ def write_outputs(config: ComparisonConfig, summary: dict[str, Any], *, run_root
     manifest_path = run_root / "manifest.json"
     summary["summary_path"] = str(summary_path)
     summary["manifest_path"] = str(manifest_path)
+    summary["summary_digest_target"] = "manifest.summary_sha256"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    summary_sha256 = sha256_file(summary_path)
     manifest = {
         "schema": MANIFEST_SCHEMA,
         "comparison_run_id": config.comparison_run_id,
+        "summary_path": str(summary_path),
+        "summary_sha256": summary_sha256,
+        "summary_digest_target": "summary.json final payload",
         "baseline_manifest": normalize_path(config.baseline_manifest),
         "candidate_manifest": normalize_path(config.candidate_manifest),
         "baseline_artifacts": [normalize_path(path) for path in config.baseline_artifacts],
@@ -359,8 +395,6 @@ def write_outputs(config: ComparisonConfig, summary: dict[str, Any], *, run_root
         "v3_7_allowed": False,
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-    summary["summary_sha256"] = sha256_file(summary_path)
-    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def blocked_run_id_summary(config: ComparisonConfig, *, run_root: Path) -> dict[str, Any]:
