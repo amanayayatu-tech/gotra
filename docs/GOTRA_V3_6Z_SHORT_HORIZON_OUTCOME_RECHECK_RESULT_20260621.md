@@ -33,6 +33,8 @@ investment advice. Historical `direct_llm` remains
   `/tmp/gotra_v3_6y_short_horizon_first_capture_codex_20260621T045041Z/runs/baseline_v3_6y_short_horizon_first_capture_codex_20260621T045041Z/summary.json`
 - Source summary sha256:
   `c40ecbe021afcd313abb896616e5dcd79329465c73496ccbf118f789f4682da9`
+- Source capture artifact sha256:
+  `c2b3a18e356ec6aa95dcab7bb35414f5298006c1c3f7c91989362c1271079e2c`
 - Source capture backend metadata:
   `codex_cli_llm_backend`, `codex-cli 0.141.0`, `gpt-5.5`, reasoning `high`
 - Source capture timestamp: `2026-06-21T03:00:00Z`
@@ -48,22 +50,23 @@ Command:
 
 ```bash
 uv run python scripts/baseline_v3_6z_short_horizon_outcome_recheck.py \
-  --recheck-run-id baseline_v3_6z_short_horizon_outcome_recheck_actual_20260621T052745Z \
+  --recheck-run-id baseline_v3_6z_short_horizon_outcome_recheck_reviewfix_20260621T054734Z \
   --source-summary /tmp/gotra_v3_6y_short_horizon_first_capture_codex_20260621T045041Z/runs/baseline_v3_6y_short_horizon_first_capture_codex_20260621T045041Z/summary.json \
   --expected-source-summary-sha256 c40ecbe021afcd313abb896616e5dcd79329465c73496ccbf118f789f4682da9 \
+  --expected-capture-artifact-sha256 c2b3a18e356ec6aa95dcab7bb35414f5298006c1c3f7c91989362c1271079e2c \
   --expected-run-id baseline_v3_6y_short_horizon_first_capture_codex_20260621T045041Z \
-  --output-dir /tmp/gotra_v3_6z_short_horizon_outcome_recheck_actual_20260621T052745Z/runs \
+  --output-dir /tmp/gotra_v3_6z_short_horizon_outcome_recheck_reviewfix_20260621T054734Z/runs \
   --as-of-timestamp-utc 2026-06-21T05:25:00Z \
   --price-dir data/backtest/prices
 ```
 
 Output, not committed:
 
-`/tmp/gotra_v3_6z_short_horizon_outcome_recheck_actual_20260621T052745Z/runs/baseline_v3_6z_short_horizon_outcome_recheck_actual_20260621T052745Z/summary.json`
+`/tmp/gotra_v3_6z_short_horizon_outcome_recheck_reviewfix_20260621T054734Z/runs/baseline_v3_6z_short_horizon_outcome_recheck_reviewfix_20260621T054734Z/summary.json`
 
 Summary sha256:
 
-`87d583ce8d24f0880666067cacaa3102e9fe4c5565682edfb5270041179e771f`
+`72258021aecff98422c3ce9108fa5563511420928a605467d6eb2d35929a9f98`
 
 Result:
 
@@ -82,6 +85,18 @@ Result:
 Interpretation: the 1D short-horizon source canary has not yet reached the
 daily-close availability boundary. v3.6Z correctly did not resolve or score the
 outcome.
+
+## Review Hardening
+
+PR review hardening added two provenance guards:
+
+- `arm` and `input_layer` are required source capture identity fields. Missing
+  values now produce structured `BLOCKED_PROVENANCE` and CLI non-zero, not a
+  bare `KeyError`.
+- The source capture artifact is bound to the verified source summary by both
+  `--expected-capture-artifact-sha256` and the source summary
+  `maturity_ledger`. The recheck now rejects mismatched `source_decision_id`,
+  ticker, decision date, horizon, arm, or input layer before maturity/scoring.
 
 ## Local Validation
 
@@ -103,10 +118,10 @@ Results:
 
 - py_compile: pass
 - Ruff: pass
-- Focused tests: `6 passed`
-- v3.6Z/v3.6Y regression tests: `16 passed`
+- Focused tests: `16 passed`
+- v3.6Z/v3.6Y regression tests: `26 passed`
 - v3.5B/v3.5E/v3.6 readiness regression tests: `43 passed`
-- Full test suite: `410 passed`
+- Full test suite: `420 passed`
 - `git diff --check`: pass
 
 Covered behavior:
@@ -115,6 +130,10 @@ Covered behavior:
 - matured but no outcome price -> `BLOCKED_DATA`
 - matured with price -> `SHORT_HORIZON_READY` with one resolved/scored canary
 - malformed or wrong source summary -> `BLOCKED_PROVENANCE`
+- source capture artifact hash mismatch -> `BLOCKED_PROVENANCE`
+- missing `arm` / `input_layer` in capture artifact -> `BLOCKED_PROVENANCE`
+- capture artifact identity mismatch against verified source summary ledger ->
+  `BLOCKED_PROVENANCE`
 - actual direction buckets restricted to `long` / `avoid` / `neutral`
 - no provider, no new Codex CLI call, no formal-lite, no v3.7 verdict
 

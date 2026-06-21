@@ -45,6 +45,7 @@ class RecheckConfig:
     recheck_run_id: str
     source_summary: Path
     expected_source_summary_sha256: str
+    expected_capture_artifact_sha256: str
     expected_run_id: str
     output_dir: Path
     as_of_timestamp_utc: datetime
@@ -57,6 +58,7 @@ class RecheckConfig:
 class SourceBundle:
     summary: dict[str, Any]
     summary_sha256: str
+    artifact_sha256: str
     artifact_path: Path
     artifact: dict[str, Any]
 
@@ -85,6 +87,8 @@ def validate_config(config: RecheckConfig) -> None:
         raise ValueError("expected_run_id is required")
     if not config.expected_source_summary_sha256:
         raise ValueError("expected_source_summary_sha256 is required")
+    if not config.expected_capture_artifact_sha256:
+        raise ValueError("expected_capture_artifact_sha256 is required")
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -146,19 +150,56 @@ def load_source_bundle(config: RecheckConfig) -> SourceBundle:
     if len(artifacts) != 1:
         raise ValueError(f"expected exactly one source capture artifact, found {len(artifacts)}")
     artifact_path, artifact = artifacts[0]
-    validate_source_artifact(summary=summary, artifact=artifact)
+    artifact_sha = file_sha256(artifact_path)
+    if artifact_sha != config.expected_capture_artifact_sha256:
+        raise ValueError(
+            "source capture artifact sha256 mismatch: "
+            f"expected={config.expected_capture_artifact_sha256} actual={artifact_sha}"
+        )
+    ledger_row = source_maturity_ledger_row(summary)
+    validate_source_artifact(summary=summary, artifact=artifact, ledger_row=ledger_row)
     return SourceBundle(
         summary=summary,
         summary_sha256=summary_sha,
+        artifact_sha256=artifact_sha,
         artifact_path=artifact_path,
         artifact=artifact,
     )
 
 
-def validate_source_artifact(*, summary: dict[str, Any], artifact: dict[str, Any]) -> None:
+def source_maturity_ledger_row(summary: dict[str, Any]) -> dict[str, Any]:
+    ledger = summary.get("maturity_ledger")
+    if not isinstance(ledger, list) or len(ledger) != 1:
+        raise ValueError("source summary maturity_ledger must contain exactly one row")
+    row = ledger[0]
+    if not isinstance(row, dict):
+        raise ValueError("source summary maturity_ledger row must be an object")
+    required = [
+        "source_decision_id",
+        "ticker",
+        "decision_date_local",
+        "horizon_days",
+        "horizon_end_date",
+        "arm",
+        "input_layer",
+    ]
+    missing = [field for field in required if not row.get(field)]
+    if missing:
+        raise ValueError("source summary maturity_ledger missing required fields: " + ",".join(missing))
+    return row
+
+
+def validate_source_artifact(
+    *,
+    summary: dict[str, Any],
+    artifact: dict[str, Any],
+    ledger_row: dict[str, Any],
+) -> None:
     required_fields = [
         "source_decision_id",
         "ticker",
+        "arm",
+        "input_layer",
         "decision_date_local",
         "horizon_days",
         "horizon_end_date",
@@ -173,6 +214,41 @@ def validate_source_artifact(*, summary: dict[str, Any], artifact: dict[str, Any
         raise ValueError("source capture artifact missing required fields: " + ",".join(missing))
     if artifact.get("run_id") != summary.get("run_id"):
         raise ValueError("source artifact run_id does not match summary")
+    compare_identity_field(
+        field="source_decision_id",
+        artifact_value=artifact.get("source_decision_id"),
+        ledger_value=ledger_row.get("source_decision_id"),
+    )
+    compare_identity_field(
+        field="ticker",
+        artifact_value=artifact.get("ticker"),
+        ledger_value=ledger_row.get("ticker"),
+    )
+    compare_identity_field(
+        field="decision_date_local",
+        artifact_value=artifact.get("decision_date_local"),
+        ledger_value=ledger_row.get("decision_date_local"),
+    )
+    compare_identity_field(
+        field="horizon_days",
+        artifact_value=int(artifact.get("horizon_days") or 0),
+        ledger_value=int(ledger_row.get("horizon_days") or 0),
+    )
+    compare_identity_field(
+        field="horizon_end_date",
+        artifact_value=artifact.get("horizon_end_date"),
+        ledger_value=ledger_row.get("horizon_end_date"),
+    )
+    compare_identity_field(
+        field="arm",
+        artifact_value=artifact.get("arm"),
+        ledger_value=ledger_row.get("arm"),
+    )
+    compare_identity_field(
+        field="input_layer",
+        artifact_value=artifact.get("input_layer"),
+        ledger_value=ledger_row.get("input_layer"),
+    )
     if artifact.get("future_outcome_status") != capture_v36y.FUTURE_OUTCOME_STATUS:
         raise ValueError("source artifact future_outcome_status is not not_matured")
     if artifact.get("formal_lite_entered") is True:
@@ -185,6 +261,14 @@ def validate_source_artifact(*, summary: dict[str, Any], artifact: dict[str, Any
         str(artifact["decision_date_local"])
     ):
         raise ValueError("source artifact horizon_end_date must be after decision_date_local")
+
+
+def compare_identity_field(*, field: str, artifact_value: Any, ledger_value: Any) -> None:
+    if artifact_value != ledger_value:
+        raise ValueError(
+            f"source artifact {field} mismatch against maturity_ledger: "
+            f"artifact={artifact_value!r} ledger={ledger_value!r}"
+        )
 
 
 def daily_close_available_cutoff(as_of_timestamp_utc: datetime) -> date:
@@ -252,7 +336,7 @@ def source_identity(bundle: SourceBundle) -> dict[str, Any]:
         "source_run_id": artifact["run_id"],
         "source_decision_id": artifact["source_decision_id"],
         "source_capture_artifact": str(bundle.artifact_path),
-        "source_artifact_sha256": file_sha256(bundle.artifact_path),
+        "source_artifact_sha256": bundle.artifact_sha256,
         "ticker": artifact["ticker"],
         "arm": artifact["arm"],
         "arm_interpretation": artifact["arm_interpretation"],
@@ -294,6 +378,8 @@ def base_summary(
         "source_summary_path": str(config.source_summary),
         "source_summary_sha256": source_summary_sha,
         "expected_source_summary_sha256": config.expected_source_summary_sha256,
+        "expected_capture_artifact_sha256": config.expected_capture_artifact_sha256,
+        "source_artifact_sha256": bundle.artifact_sha256 if bundle else "",
         "as_of_timestamp_utc": config.as_of_timestamp_utc.isoformat().replace(
             "+00:00",
             "Z",
@@ -517,6 +603,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--recheck-run-id", required=True)
     parser.add_argument("--source-summary", type=Path, required=True)
     parser.add_argument("--expected-source-summary-sha256", required=True)
+    parser.add_argument("--expected-capture-artifact-sha256", required=True)
     parser.add_argument("--expected-run-id", required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("data/backtest/runs"))
     parser.add_argument("--as-of-timestamp-utc", default="")
@@ -531,6 +618,7 @@ def config_from_args(args: argparse.Namespace) -> RecheckConfig:
         recheck_run_id=str(args.recheck_run_id),
         source_summary=args.source_summary,
         expected_source_summary_sha256=str(args.expected_source_summary_sha256),
+        expected_capture_artifact_sha256=str(args.expected_capture_artifact_sha256),
         expected_run_id=str(args.expected_run_id),
         output_dir=args.output_dir,
         as_of_timestamp_utc=parse_timestamp(str(args.as_of_timestamp_utc or "")),

@@ -22,6 +22,7 @@ The command requires explicit source identity inputs:
 
 - `--source-summary`
 - `--expected-source-summary-sha256`
+- `--expected-capture-artifact-sha256`
 - `--expected-run-id`
 
 For the v3.6Y source canary:
@@ -32,6 +33,8 @@ For the v3.6Y source canary:
   `/tmp/gotra_v3_6y_short_horizon_first_capture_codex_20260621T045041Z/runs/baseline_v3_6y_short_horizon_first_capture_codex_20260621T045041Z/summary.json`
 - Expected source summary sha256:
   `c40ecbe021afcd313abb896616e5dcd79329465c73496ccbf118f789f4682da9`
+- Expected source capture artifact sha256:
+  `c2b3a18e356ec6aa95dcab7bb35414f5298006c1c3f7c91989362c1271079e2c`
 - Source backend metadata: `codex_cli_llm_backend`, `codex-cli 0.141.0`,
   `gpt-5.5`, reasoning `high`
 
@@ -49,8 +52,12 @@ The recheck must block with `BLOCKED_PROVENANCE` when:
 - source run id differs from the expected run id
 - source summary is not a passing v3.6Y capture summary
 - source capture artifact is missing
+- source capture artifact sha256 differs from the expected hash
 - prompt hash, parsed decision hash, transcript path metadata, or core
   decision artifact identity is missing
+- source capture artifact identity does not match the verified source
+  summary `maturity_ledger`: `source_decision_id`, ticker, decision date,
+  horizon, arm, and input layer must bind to the same canary row
 
 The recheck must return `SHORT_HORIZON_NOT_MATURED` when the horizon close is not
 yet available under the daily-close rule. Daily close for date D is available at

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from scripts import baseline_v3_6y_short_horizon_first_capture as capture_v36y
 from scripts import baseline_v3_6z_short_horizon_outcome_recheck as recheck
@@ -11,7 +12,7 @@ from scripts import baseline_v3_four_arm as v3
 
 
 def test_immature_horizon_returns_not_matured(tmp_path: Path) -> None:
-    source_summary, source_sha = _write_source_bundle(tmp_path)
+    source_summary, source_sha, _artifact_path, artifact_sha = _write_source_bundle(tmp_path)
     _write_prices(
         tmp_path / "prices",
         [
@@ -23,6 +24,7 @@ def test_immature_horizon_returns_not_matured(tmp_path: Path) -> None:
         tmp_path,
         source_summary=source_summary,
         source_sha=source_sha,
+        capture_sha=artifact_sha,
         as_of="2026-06-22T00:00:00Z",
     )
 
@@ -40,12 +42,13 @@ def test_immature_horizon_returns_not_matured(tmp_path: Path) -> None:
 
 
 def test_matured_missing_outcome_price_blocks_data(tmp_path: Path) -> None:
-    source_summary, source_sha = _write_source_bundle(tmp_path)
+    source_summary, source_sha, _artifact_path, artifact_sha = _write_source_bundle(tmp_path)
     _write_prices(tmp_path / "prices", [("2026-06-20", 100.0)])
     config = _config(
         tmp_path,
         source_summary=source_summary,
         source_sha=source_sha,
+        capture_sha=artifact_sha,
         as_of="2026-06-23T00:00:00Z",
     )
 
@@ -59,7 +62,7 @@ def test_matured_missing_outcome_price_blocks_data(tmp_path: Path) -> None:
 
 
 def test_matured_with_price_resolves_and_scores_short_canary(tmp_path: Path) -> None:
-    source_summary, source_sha = _write_source_bundle(tmp_path)
+    source_summary, source_sha, _artifact_path, artifact_sha = _write_source_bundle(tmp_path)
     _write_prices(
         tmp_path / "prices",
         [
@@ -71,6 +74,7 @@ def test_matured_with_price_resolves_and_scores_short_canary(tmp_path: Path) -> 
         tmp_path,
         source_summary=source_summary,
         source_sha=source_sha,
+        capture_sha=artifact_sha,
         as_of="2026-06-23T00:00:00Z",
     )
 
@@ -90,11 +94,12 @@ def test_matured_with_price_resolves_and_scores_short_canary(tmp_path: Path) -> 
 
 
 def test_malformed_or_wrong_source_summary_blocks_provenance(tmp_path: Path) -> None:
-    source_summary, _source_sha = _write_source_bundle(tmp_path)
+    source_summary, _source_sha, _artifact_path, artifact_sha = _write_source_bundle(tmp_path)
     config = _config(
         tmp_path,
         source_summary=source_summary,
         source_sha="0" * 64,
+        capture_sha=artifact_sha,
         as_of="2026-06-23T00:00:00Z",
     )
 
@@ -110,6 +115,7 @@ def test_malformed_or_wrong_source_summary_blocks_provenance(tmp_path: Path) -> 
         tmp_path,
         source_summary=tmp_path / "missing_summary.json",
         source_sha="0" * 64,
+        capture_sha=artifact_sha,
         run_id="baseline_v3_6z_short_horizon_outcome_recheck_missing_source_unit",
         as_of="2026-06-23T00:00:00Z",
     )
@@ -119,6 +125,131 @@ def test_malformed_or_wrong_source_summary_blocks_provenance(tmp_path: Path) -> 
     assert missing["source_summary_sha256"] == ""
 
 
+@pytest.mark.parametrize("missing_field", ["arm", "input_layer"])
+def test_missing_capture_identity_fields_block_provenance_and_cli_nonzero(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    source_summary, source_sha, artifact_path, _artifact_sha = _write_source_bundle(tmp_path)
+    artifact_sha = _mutate_artifact(
+        artifact_path,
+        lambda artifact: artifact.pop(missing_field),
+    )
+
+    exit_code = recheck.main(
+        [
+            "--recheck-run-id",
+            f"baseline_v3_6z_short_horizon_outcome_recheck_missing_{missing_field}_unit",
+            "--source-summary",
+            str(source_summary),
+            "--expected-source-summary-sha256",
+            source_sha,
+            "--expected-capture-artifact-sha256",
+            artifact_sha,
+            "--expected-run-id",
+            SOURCE_RUN_ID,
+            "--output-dir",
+            str(tmp_path / "runs"),
+            "--as-of-timestamp-utc",
+            "2026-06-23T00:00:00Z",
+            "--price-dir",
+            str(tmp_path / "prices"),
+        ]
+    )
+
+    assert exit_code == 1
+    summary = recheck.load_json(
+        tmp_path
+        / "runs"
+        / f"baseline_v3_6z_short_horizon_outcome_recheck_missing_{missing_field}_unit"
+        / "summary.json"
+    )
+    assert summary["status"] == recheck.STATUS_BLOCKED_PROVENANCE
+    assert f"missing required fields: {missing_field}" in summary["blocker_reasons"][0]
+
+
+def test_capture_artifact_source_decision_id_mismatch_blocks_provenance(
+    tmp_path: Path,
+) -> None:
+    source_summary, source_sha, artifact_path, _artifact_sha = _write_source_bundle(tmp_path)
+    artifact_sha = _mutate_artifact(
+        artifact_path,
+        lambda artifact: artifact.__setitem__("source_decision_id", "stale-source-decision-id"),
+    )
+
+    summary = recheck.run_recheck(
+        _config(
+            tmp_path,
+            source_summary=source_summary,
+            source_sha=source_sha,
+            capture_sha=artifact_sha,
+            as_of="2026-06-23T00:00:00Z",
+        )
+    )
+
+    assert summary["status"] == recheck.STATUS_BLOCKED_PROVENANCE
+    assert "source_decision_id mismatch against maturity_ledger" in summary["blocker_reasons"][0]
+    assert summary["resolved_count"] == 0
+    assert summary["scored_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ticker", "MSFT"),
+        ("decision_date_local", "2026-06-20"),
+        ("horizon_days", 2),
+        ("horizon_end_date", "2026-06-23"),
+        ("arm", "full_gotra"),
+        ("input_layer", "richer_research_packet"),
+    ],
+)
+def test_capture_artifact_identity_mismatch_blocks_provenance(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    source_summary, source_sha, artifact_path, _artifact_sha = _write_source_bundle(tmp_path)
+    artifact_sha = _mutate_artifact(
+        artifact_path,
+        lambda artifact: artifact.__setitem__(field, value),
+    )
+
+    summary = recheck.run_recheck(
+        _config(
+            tmp_path,
+            source_summary=source_summary,
+            source_sha=source_sha,
+            capture_sha=artifact_sha,
+            as_of="2026-06-23T00:00:00Z",
+        )
+    )
+
+    assert summary["status"] == recheck.STATUS_BLOCKED_PROVENANCE
+    assert f"{field} mismatch against maturity_ledger" in summary["blocker_reasons"][0]
+    assert summary["resolved_count"] == 0
+    assert summary["scored_count"] == 0
+
+
+def test_wrong_expected_capture_artifact_sha_blocks_provenance(tmp_path: Path) -> None:
+    source_summary, source_sha, _artifact_path, _artifact_sha = _write_source_bundle(tmp_path)
+
+    summary = recheck.run_recheck(
+        _config(
+            tmp_path,
+            source_summary=source_summary,
+            source_sha=source_sha,
+            capture_sha="0" * 64,
+            as_of="2026-06-23T00:00:00Z",
+        )
+    )
+
+    assert summary["status"] == recheck.STATUS_BLOCKED_PROVENANCE
+    assert "source capture artifact sha256 mismatch" in summary["blocker_reasons"][0]
+    assert summary["resolved_count"] == 0
+    assert summary["scored_count"] == 0
+
+
 def test_actual_direction_buckets_are_v3_contract(tmp_path: Path) -> None:
     assert _ready_direction(tmp_path / "neutral", 100.0, 100.5) == "neutral"
     assert _ready_direction(tmp_path / "long", 100.0, 102.0) == "long"
@@ -126,7 +257,7 @@ def test_actual_direction_buckets_are_v3_contract(tmp_path: Path) -> None:
 
 
 def test_cli_blocked_provenance_is_non_zero(tmp_path: Path) -> None:
-    source_summary, _source_sha = _write_source_bundle(tmp_path)
+    source_summary, _source_sha, _artifact_path, artifact_sha = _write_source_bundle(tmp_path)
 
     exit_code = recheck.main(
         [
@@ -136,6 +267,8 @@ def test_cli_blocked_provenance_is_non_zero(tmp_path: Path) -> None:
             str(source_summary),
             "--expected-source-summary-sha256",
             "bad",
+            "--expected-capture-artifact-sha256",
+            artifact_sha,
             "--expected-run-id",
             SOURCE_RUN_ID,
             "--output-dir",
@@ -154,7 +287,7 @@ SOURCE_RUN_ID = "baseline_v3_6y_short_horizon_first_capture_codex_unit"
 
 
 def _ready_direction(tmp_path: Path, decision_price: float, outcome_price: float) -> str:
-    source_summary, source_sha = _write_source_bundle(tmp_path)
+    source_summary, source_sha, _artifact_path, artifact_sha = _write_source_bundle(tmp_path)
     _write_prices(
         tmp_path / "prices",
         [
@@ -167,6 +300,7 @@ def _ready_direction(tmp_path: Path, decision_price: float, outcome_price: float
             tmp_path,
             source_summary=source_summary,
             source_sha=source_sha,
+            capture_sha=artifact_sha,
             as_of="2026-06-23T00:00:00Z",
         )
     )
@@ -174,7 +308,7 @@ def _ready_direction(tmp_path: Path, decision_price: float, outcome_price: float
     return str(summary["actual_direction"])
 
 
-def _write_source_bundle(tmp_path: Path) -> tuple[Path, str]:
+def _write_source_bundle(tmp_path: Path) -> tuple[Path, str, Path, str]:
     run_root = tmp_path / "source_run" / SOURCE_RUN_ID
     artifact_path = (
         run_root
@@ -221,10 +355,7 @@ def _write_source_bundle(tmp_path: Path) -> tuple[Path, str]:
             "expected_change_pct": 1.0,
         },
     }
-    artifact_path.write_text(
-        json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    _write_json(artifact_path, artifact)
     summary_path = run_root / "summary.json"
     summary = {
         "schema": capture_v36y.SUMMARY_SCHEMA,
@@ -256,11 +387,23 @@ def _write_source_bundle(tmp_path: Path) -> tuple[Path, str]:
             }
         ],
     }
-    summary_path.write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True),
+    _write_json(summary_path, summary)
+    return summary_path, recheck.file_sha256(summary_path), artifact_path, recheck.file_sha256(artifact_path)
+
+
+def _mutate_artifact(artifact_path: Path, mutate: object) -> str:
+    artifact = recheck.load_json(artifact_path)
+    assert callable(mutate)
+    mutate(artifact)
+    _write_json(artifact_path, artifact)
+    return recheck.file_sha256(artifact_path)
+
+
+def _write_json(path: Path, payload: dict[str, object]) -> None:
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    return summary_path, recheck.file_sha256(summary_path)
 
 
 def _write_prices(price_dir: Path, rows: list[tuple[str, float]]) -> None:
@@ -284,6 +427,7 @@ def _config(
     *,
     source_summary: Path,
     source_sha: str,
+    capture_sha: str,
     as_of: str,
     run_id: str = "baseline_v3_6z_short_horizon_outcome_recheck_unit",
 ) -> recheck.RecheckConfig:
@@ -291,6 +435,7 @@ def _config(
         recheck_run_id=run_id,
         source_summary=source_summary,
         expected_source_summary_sha256=source_sha,
+        expected_capture_artifact_sha256=capture_sha,
         expected_run_id=SOURCE_RUN_ID,
         output_dir=tmp_path / "runs",
         as_of_timestamp_utc=recheck.parse_timestamp(as_of),
