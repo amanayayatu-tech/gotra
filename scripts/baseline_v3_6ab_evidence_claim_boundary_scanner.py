@@ -288,6 +288,19 @@ def direct_llm_clean_baseline_is_negated(line: str) -> bool:
     )
 
 
+def direct_llm_clean_baseline_is_guard_description(line: str) -> bool:
+    return bool(
+        re.search(
+            r"\bdirect_llm(?:_parametric_memory_control)?\b"
+            r".{0,80}\b(blocks?|blocked|blocking|rejects?|rejected|rejecting|"
+            r"prevents?|prevented|preventing|guards?\s+against)\b"
+            r".{0,80}\bclean\s+no[- ]future\s+baseline\b",
+            line,
+            re.IGNORECASE,
+        )
+    )
+
+
 def direct_llm_line_is_technical_field(line: str) -> bool:
     lowered = line.lower()
     return any(field in lowered for field in DIRECT_LLM_TECHNICAL_FIELDS)
@@ -359,6 +372,7 @@ def scan_line(
     if (
         re.search(r"direct_llm.{0,80}clean\s+no[- ]future\s+baseline", line, re.IGNORECASE)
         and not direct_llm_clean_baseline_is_negated(line)
+        and not direct_llm_clean_baseline_is_guard_description(line)
     ):
         result["direct_llm"].append(
             make_blocked_item(
