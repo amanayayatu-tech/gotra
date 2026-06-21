@@ -80,6 +80,17 @@ def test_base_topology_break_blocks_stack(tmp_path: Path) -> None:
     assert any("pr_40" in reason for reason in summary["blocking_reasons"])
 
 
+def test_root_base_mismatch_blocks_stack(tmp_path: Path) -> None:
+    payload = _clean_snapshot()
+    payload["pull_requests"][0]["baseRefName"] = "old-feature-branch"
+    snapshot = _write_snapshot(tmp_path, payload)
+
+    summary = audit.audit_snapshot(_config(tmp_path, snapshot))
+
+    assert summary["overall_status"] == audit.STATUS_BLOCKED_TOPOLOGY
+    assert any("root_base_mismatch" in reason for reason in summary["blocking_reasons"])
+
+
 def test_forbidden_artifact_path_blocks_stack(tmp_path: Path) -> None:
     payload = _clean_snapshot()
     payload["pull_requests"][0]["changed_files"].append("data/backtest/runs/raw.json")
@@ -89,6 +100,19 @@ def test_forbidden_artifact_path_blocks_stack(tmp_path: Path) -> None:
 
     assert summary["overall_status"] == audit.STATUS_BLOCKED_ARTIFACT
     assert summary["artifact_boundary_violation_count"] == 1
+    assert "data/backtest/runs/raw.json" in summary["blocking_reasons"][0]
+
+
+def test_connection_shaped_changed_files_block_forbidden_artifacts(tmp_path: Path) -> None:
+    payload = _clean_snapshot()
+    payload["pull_requests"][0]["files"] = {
+        "nodes": [{"path": "data/backtest/runs/raw.json"}]
+    }
+    snapshot = _write_snapshot(tmp_path, payload)
+
+    summary = audit.audit_snapshot(_config(tmp_path, snapshot))
+
+    assert summary["overall_status"] == audit.STATUS_BLOCKED_ARTIFACT
     assert "data/backtest/runs/raw.json" in summary["blocking_reasons"][0]
 
 
@@ -106,6 +130,33 @@ def test_evidence_overclaim_blocks_stack(tmp_path: Path) -> None:
 
     assert summary["overall_status"] == audit.STATUS_BLOCKED_OVERCLAIM
     assert summary["evidence_overclaim_count"] >= 1
+
+
+def test_negation_must_apply_to_specific_overclaim_phrase(tmp_path: Path) -> None:
+    payload = _clean_snapshot()
+    payload["evidence_documents"].append(
+        {
+            "path": "docs/bad_negation_scope.md",
+            "text": "not trading advice; OOS pass",
+        }
+    )
+    snapshot = _write_snapshot(tmp_path, payload)
+
+    summary = audit.audit_snapshot(_config(tmp_path, snapshot))
+
+    assert summary["overall_status"] == audit.STATUS_BLOCKED_OVERCLAIM
+    assert any("OOS" in reason for reason in summary["blocking_reasons"])
+
+
+def test_pr_body_evidence_overclaim_blocks_stack(tmp_path: Path) -> None:
+    payload = _clean_snapshot()
+    payload["pull_requests"][1]["body"] = "This PR proves an OOS pass."
+    snapshot = _write_snapshot(tmp_path, payload)
+
+    summary = audit.audit_snapshot(_config(tmp_path, snapshot))
+
+    assert summary["overall_status"] == audit.STATUS_BLOCKED_OVERCLAIM
+    assert any("pr_37_body" in reason for reason in summary["blocking_reasons"])
 
 
 def test_direct_llm_without_parametric_memory_caveat_blocks_stack(tmp_path: Path) -> None:
