@@ -125,6 +125,47 @@ def test_direct_llm_negated_clean_baseline_caveat_is_allowed(tmp_path: Path) -> 
     assert summary["direct_llm_mislabel_count"] == 0
 
 
+def test_direct_llm_guard_description_is_allowed(tmp_path: Path) -> None:
+    manifest = _write_manifest(
+        tmp_path,
+        [
+            {
+                "path": "docs/guard.md",
+                "text": (
+                    "`direct_llm` boundary requires "
+                    "`direct_llm_parametric_memory_control` and blocks clean "
+                    "no-future baseline wording."
+                ),
+            }
+        ],
+    )
+    summary = scanner.run_scan(_config(tmp_path, manifest))
+
+    assert summary["overall_status"] == scanner.STATUS_CLEAN
+    assert summary["direct_llm_mislabel_count"] == 0
+
+
+def test_direct_llm_guard_description_must_target_clean_baseline_claim(tmp_path: Path) -> None:
+    manifest = _write_manifest(
+        tmp_path,
+        [
+            {
+                "path": "docs/guard_bad.md",
+                "text": (
+                    "direct_llm_parametric_memory_control blocks unrelated checks "
+                    "and is a clean no-future baseline."
+                ),
+            }
+        ],
+    )
+
+    summary = scanner.run_scan(_config(tmp_path, manifest))
+
+    assert summary["overall_status"] == scanner.STATUS_BLOCKED_DIRECT_LLM
+    assert summary["direct_llm_mislabel_count"] >= 1
+    assert any(item["rule_id"] == "direct_llm_clean_no_future_baseline" for item in summary["blocked_items"])
+
+
 def test_direct_llm_parametric_memory_control_is_allowed(tmp_path: Path) -> None:
     manifest = _write_manifest(
         tmp_path,

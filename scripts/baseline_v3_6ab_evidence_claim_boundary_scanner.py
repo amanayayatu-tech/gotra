@@ -291,6 +291,32 @@ def direct_llm_clean_baseline_is_negated(line: str) -> bool:
     )
 
 
+def direct_llm_clean_baseline_is_guard_description(line: str) -> bool:
+    for clause in re.split(r"[.;\n]", line):
+        if not re.search(r"\bdirect_llm(?:_parametric_memory_control)?\b", clause, re.IGNORECASE):
+            continue
+        verb = re.search(
+            r"\b(blocks?|blocked|blocking|rejects?|rejected|rejecting|"
+            r"prevents?|prevented|preventing|guards?\s+against)\b",
+            clause,
+            re.IGNORECASE,
+        )
+        if not verb:
+            continue
+        tail = clause[verb.end() :]
+        if re.search(r"\band\s+(?:it\s+)?is\s+(?:a\s+)?clean\s+no[- ]future\s+baseline\b", tail, re.IGNORECASE):
+            continue
+        if re.search(
+            r"\b(?:clean\s+no[- ]future\s+baseline|"
+            r"direct_llm(?:_parametric_memory_control)?\s+(?:as|being|is)\s+(?:a\s+)?clean\s+no[- ]future\s+baseline)\b"
+            r"(?:\s+(?:wording|claim|phrase|misuse|statement|classification|interpretation|label(?:ing)?|assertion))?",
+            tail,
+            re.IGNORECASE,
+        ):
+            return True
+    return False
+
+
 def line_without_direct_llm_technical_fields(line: str) -> str:
     remaining = line
     for field in DIRECT_LLM_TECHNICAL_FIELDS:
@@ -364,6 +390,7 @@ def scan_line(
     if (
         re.search(r"direct_llm.{0,80}clean\s+no[- ]future\s+baseline", direct_llm_line, re.IGNORECASE)
         and not direct_llm_clean_baseline_is_negated(direct_llm_line)
+        and not direct_llm_clean_baseline_is_guard_description(direct_llm_line)
     ):
         result["direct_llm"].append(
             make_blocked_item(
