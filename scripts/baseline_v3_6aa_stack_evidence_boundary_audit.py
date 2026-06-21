@@ -67,6 +67,7 @@ class AuditConfig:
     audit_run_id: str
     snapshot: Path
     output_dir: Path
+    expected_root_base: str = "main"
     next_30d_check_after: str = NEXT_30D_CHECK_AFTER
     next_short_horizon_check_after: str = NEXT_SHORT_HORIZON_CHECK_AFTER
     allow_overwrite: bool = False
@@ -137,7 +138,11 @@ def pr_base(pr: dict[str, Any]) -> str:
     return str(pr.get("baseRefName") or pr.get("base_ref") or pr.get("base") or "")
 
 
-def check_stack_topology(prs: list[dict[str, Any]]) -> tuple[str, list[str]]:
+def check_stack_topology(
+    prs: list[dict[str, Any]],
+    *,
+    expected_root_base: str,
+) -> tuple[str, list[str]]:
     if not prs:
         return "missing", ["stack_topology:no_open_prs"]
     failures: list[str] = []
@@ -149,6 +154,11 @@ def check_stack_topology(prs: list[dict[str, Any]]) -> tuple[str, list[str]]:
         if not head or not base:
             failures.append(f"stack_topology:missing_head_or_base:pr_{number}")
             continue
+        if index == 0 and base != expected_root_base:
+            failures.append(
+                "stack_topology:root_base_mismatch:"
+                f"pr_{number}:base={base}:expected={expected_root_base}"
+            )
         if index > 0 and base != previous_head:
             failures.append(
                 "stack_topology:base_chain_break:"
@@ -238,14 +248,38 @@ def changed_paths(snapshot: dict[str, Any], prs: list[dict[str, Any]]) -> list[s
     paths: list[str] = []
     for key in ("changed_files", "changedFiles", "files"):
         raw = snapshot.get(key, [])
-        if isinstance(raw, list):
-            paths.extend(path_from_entry(entry) for entry in raw)
+        paths.extend(paths_from_collection(raw))
     for pr in prs:
         for key in ("changed_files", "changedFiles", "files"):
             raw = pr.get(key, [])
-            if isinstance(raw, list):
-                paths.extend(path_from_entry(entry) for entry in raw)
+            paths.extend(paths_from_collection(raw))
     return sorted({path for path in paths if path})
+
+
+def paths_from_collection(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list):
+        paths: list[str] = []
+        for entry in raw:
+            paths.extend(paths_from_collection(entry))
+        return paths
+    if isinstance(raw, dict):
+        direct = path_from_entry(raw)
+        paths = [direct] if direct else []
+        for key in ("nodes", "edges"):
+            nested = raw.get(key)
+            if not isinstance(nested, list):
+                continue
+            for entry in nested:
+                if key == "edges" and isinstance(entry, dict) and "node" in entry:
+                    paths.extend(paths_from_collection(entry.get("node")))
+                else:
+                    paths.extend(paths_from_collection(entry))
+        return paths
+    return []
 
 
 def path_from_entry(entry: Any) -> str:
@@ -273,6 +307,9 @@ def evidence_documents(snapshot: dict[str, Any], prs: list[dict[str, Any]]) -> l
         raw = pr.get("evidence_documents", [])
         if isinstance(raw, list):
             docs.extend(document_entry(entry) for entry in raw)
+        body = str(pr.get("body") or "")
+        if body:
+            docs.append({"path": f"pr_{pr_number(pr)}_body", "text": body})
     return [doc for doc in docs if doc.get("text") or doc.get("path")]
 
 
@@ -303,8 +340,13 @@ def check_evidence_overclaims(docs: list[dict[str, str]]) -> tuple[int, list[str
 
 
 def overclaim_match_is_negated(text: str, match_start: int) -> bool:
-    prefix = text[max(0, match_start - 48) : match_start].lower()
-    return any(marker in prefix for marker in ("not ", "no ", "不是", "不得", "非"))
+    prefix_start = max(
+        text.rfind(".", 0, match_start),
+        text.rfind(";", 0, match_start),
+        text.rfind("\n", 0, match_start),
+    )
+    prefix = text[prefix_start + 1 : match_start].strip().lower()
+    return bool(re.search(r"(?:^|\b)(not|no)\b|不是|不得|非", prefix))
 
 
 def choose_status(blockers: dict[str, list[str]]) -> str:
@@ -340,6 +382,7 @@ def base_summary(config: AuditConfig, *, run_root: Path, snapshot_sha: str) -> d
         "v3_7_verdict_executed": False,
         "next_30d_check_after": config.next_30d_check_after,
         "next_short_horizon_check_after": config.next_short_horizon_check_after,
+        "expected_root_base": config.expected_root_base,
         "evidence_layer": "engineering_stack_audit",
         "overall_status": STATUS_CLEAN,
         "blocking_reasons": [],
@@ -378,7 +421,10 @@ def audit_snapshot(config: AuditConfig) -> dict[str, Any]:
     snapshot = load_snapshot(config.snapshot)
     snapshot_sha = sha256_file(config.snapshot)
     prs = pr_list(snapshot)
-    topology_status, topology_failures = check_stack_topology(prs)
+    topology_status, topology_failures = check_stack_topology(
+        prs,
+        expected_root_base=config.expected_root_base,
+    )
     ci_success_count, ci_failures = check_ci(prs)
     active_p1_p2, nonblocking_reviews, review_failures = check_reviews(prs)
     paths = changed_paths(snapshot, prs)
@@ -463,6 +509,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=Path("/tmp/gotra_v3_6aa_stack_evidence_boundary_audit/runs"),
     )
     parser.add_argument("--next-30d-check-after", default=NEXT_30D_CHECK_AFTER)
+    parser.add_argument("--expected-root-base", default="main")
     parser.add_argument(
         "--next-short-horizon-check-after",
         default=NEXT_SHORT_HORIZON_CHECK_AFTER,
@@ -476,6 +523,7 @@ def config_from_args(args: argparse.Namespace) -> AuditConfig:
         audit_run_id=str(args.audit_run_id),
         snapshot=args.snapshot,
         output_dir=args.output_dir,
+        expected_root_base=str(args.expected_root_base),
         next_30d_check_after=str(args.next_30d_check_after),
         next_short_horizon_check_after=str(args.next_short_horizon_check_after),
         allow_overwrite=bool(args.allow_overwrite),

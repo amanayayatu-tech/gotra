@@ -24,8 +24,10 @@ The intended topology is:
 
 `#36 -> #37 -> #38 -> #39 -> #40 -> #41 -> #42(v3.6AA)`
 
-Each PR base must point to the previous PR head branch. A broken base/head chain
-is `STACK_AUDIT_BLOCKED_TOPOLOGY`.
+The first PR in the audited stack must be rooted at the configured
+`expected_root_base`, default `main`. Each later PR base must point to the
+previous PR head branch. A wrong root base or broken base/head chain is
+`STACK_AUDIT_BLOCKED_TOPOLOGY`.
 
 ## Blocking Rules
 
@@ -44,6 +46,12 @@ The audit blocks when any of the following is present:
 - evidence overclaim, including OOS/science/public/trading claims or `direct_llm`
   without `direct_llm_parametric_memory_control`:
   `STACK_AUDIT_BLOCKED_OVERCLAIM`
+
+Changed-file parsing accepts list-shaped and GitHub connection-shaped inputs
+such as `files.nodes[].path`. PR body text is scanned as evidence-boundary text
+without copying raw body text into blocker messages. Negation only suppresses an
+overclaim when it applies to the matched phrase itself, so `not trading advice;
+OOS pass` still blocks.
 
 Unresolved non-P1/P2 comments are counted but do not block.
 
