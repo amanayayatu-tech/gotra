@@ -384,11 +384,11 @@ def negative_boundary_heading(lowered: str) -> bool:
 def safe_false_v3_7_line(lowered: str) -> bool:
     if "v3.7" not in lowered and "v3_7" not in lowered and "v37" not in lowered:
         return False
-    if re.search(r"['\"]?\bv3[_ .-]?7[_ .-]?allowed['\"]?\s*[:=]\s*true\b", lowered):
+    if re.search(r"['\"]?\bv3[_ .-]?7[_ .-]?allowed['\"]?\s*[:=]\s*[`'\"]?true\b", lowered):
         return False
     explicit_false = (
-        re.search(r"['\"]?\bv3[_ .-]?7[_ .-]?allowed['\"]?\s*[:=]\s*(false|no)\b", lowered)
-        or re.search(r"\bv(?:3[._-]?7|37)\b.{0,40}\ballowed\s*:\s*(false|no)\b", lowered)
+        re.search(r"['\"]?\bv3[_ .-]?7[_ .-]?allowed['\"]?\s*[:=]\s*[`'\"]?(false|no)\b", lowered)
+        or re.search(r"\bv(?:3[._-]?7|37)\b.{0,40}\ballowed\s*:\s*[`'\"]?(false|no)\b", lowered)
         or re.search(r"\bv(?:3[._-]?7|37)\b.{0,40}\b(not\s+allowed|disallowed|forbidden|blocked)\b", lowered)
         or re.search(r"\b(do(?:es)?\s+not|not)\s+(execute|authorize).{0,40}\bv(?:3[._-]?7|37)\b", lowered)
     )
@@ -403,7 +403,7 @@ def safe_false_v3_7_line(lowered: str) -> bool:
         after = lowered[match.end() : match.end() + 20]
         if re.search(r"\b(?:not\s+allowed|disallowed|forbidden|blocked)\b", phrase):
             continue
-        if re.match(r"\s*[:=]\s*(false|no)\b", after):
+        if re.match(r"\s*[:=]\s*[`'\"]?(false|no)\b", after):
             continue
         return False
     return True

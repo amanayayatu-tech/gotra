@@ -173,9 +173,11 @@ def test_positive_v3_7_claim_with_false_word_still_blocks(
     "body",
     [
         "v3.7 allowed: false",
+        "v3.7 allowed: `false`",
         "v3_7_allowed=false",
         "v3.7 verdict allowed: false",
         "v3.7 30D verdict allowed: false",
+        "v3.7 30D verdict allowed: `false`",
         "v3.7 not allowed",
     ],
 )

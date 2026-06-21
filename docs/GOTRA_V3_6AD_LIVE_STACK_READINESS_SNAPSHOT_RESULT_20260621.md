@@ -31,18 +31,18 @@ Command:
 
 ```bash
 uv run python scripts/baseline_v3_6ad_live_stack_readiness_snapshot.py \
-  --snapshot-run-id baseline_v3_6ad_live_stack_readiness_snapshot_reviewfix_fixture_20260621T084444Z \
+  --snapshot-run-id baseline_v3_6ad_live_stack_readiness_snapshot_reviewfix_fixture_20260621T084840Z \
   --snapshot /tmp/gotra_v3_6ad_live_stack_readiness_snapshot_reviewfix_20260621T083401Z/fixture_snapshot.json \
-  --output-dir /tmp/gotra_v3_6ad_live_stack_readiness_snapshot_reviewfix_20260621T084444Z/runs
+  --output-dir /tmp/gotra_v3_6ad_live_stack_readiness_snapshot_reviewfix_20260621T084840Z/runs
 ```
 
 Output, not committed:
 
-`/tmp/gotra_v3_6ad_live_stack_readiness_snapshot_reviewfix_20260621T084444Z/runs/baseline_v3_6ad_live_stack_readiness_snapshot_reviewfix_fixture_20260621T084444Z/summary.json`
+`/tmp/gotra_v3_6ad_live_stack_readiness_snapshot_reviewfix_20260621T084840Z/runs/baseline_v3_6ad_live_stack_readiness_snapshot_reviewfix_fixture_20260621T084840Z/summary.json`
 
 Summary sha256:
 
-`e00a9145d5271926fa6805c57766740abe9fdae64f349323a25673b7ffebc92e`
+`c65d78d495a46e60dffb371df3be3806df39f4acda89d2b598045e85a161277b`
 
 Result:
 
@@ -109,9 +109,9 @@ Result:
 
 - py_compile: pass
 - Ruff: pass
-- Focused v3.6AD tests: `27 passed`
-- v3.6AA/v3.6AB/v3.6AC/v3.6AD regression tests: `76 passed`
-- Full test suite: `496 passed`
+- Focused v3.6AD tests: `29 passed`
+- v3.6AA/v3.6AB/v3.6AC/v3.6AD regression tests: `78 passed`
+- Full test suite: `498 passed`
 
 ## Covered Behavior
 
