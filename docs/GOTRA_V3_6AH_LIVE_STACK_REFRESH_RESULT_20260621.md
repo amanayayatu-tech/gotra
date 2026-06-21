@@ -114,6 +114,7 @@ uv run ruff check --no-cache scripts/baseline_v3_6ah_live_stack_refresh.py tests
 uv run pytest -q tests/test_evidence_claim_boundary_scanner.py tests/test_live_stack_refresh.py
 uv run pytest -q tests/test_stack_evidence_boundary_audit.py tests/test_evidence_claim_boundary_scanner.py tests/test_stack_merge_readiness_packet.py tests/test_live_stack_readiness_snapshot.py tests/test_continuous_stack_boundary_guard.py tests/test_ci_stack_boundary_preflight.py tests/test_ci_changed_files_preflight.py tests/test_live_stack_refresh.py
 uv run pytest -q
+uv run python scripts/baseline_v3_6ag_ci_changed_files_preflight.py --base-sha f7477dac767be753bf7e4f286c74c9b294fc0502 --head-sha <review-fix-head> --output-root /tmp/gotra_v3_6ah_ci_changed_file_preflight_20260621T111658Z
 ```
 
 Result:
@@ -128,6 +129,10 @@ Result:
   because the scanner source and tests intentionally contain blocked example
   strings. Boundary behavior is covered by focused tests and the v3.6AH
   fixture/live refresh summaries above.
+- v3.6AG changed-file CI preflight over the review-fix diff:
+  `CI_STACK_BOUNDARY_PREFLIGHT_CLEAN`; artifact, claim, maturity, and direct-arm
+  boundaries all `clean`; summary sha256
+  `6bdf616ef49bce43c8820494352c8bc4960ce155a9799165628aa5deeb001d09`.
 
 ## Hardening Notes
 
