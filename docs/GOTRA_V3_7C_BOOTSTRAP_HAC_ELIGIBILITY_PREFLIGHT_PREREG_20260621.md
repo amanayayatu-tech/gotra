@@ -58,6 +58,18 @@ one arm and include:
 The preflight pairs deterministic reference rows with `full_gotra` rows by
 `(ticker, decision_date, horizon_days)`.
 
+`horizon_days` must be exactly `30`; short-horizon canary rows are not valid
+inputs for this v3.7 30D eligibility preflight.
+
+Top-level source fields do not satisfy the nested provenance contract. The
+nested `provenance.source_run_id`, `provenance.source_artifact_path`, and
+`provenance.source_artifact_sha256` fields must be present and must match the
+top-level source fields.
+
+Path-only manifest entries such as `{"path": "fixture.json"}` are supported
+and are resolved relative to the manifest file. Forbidden paths are blocked
+before loading.
+
 ## Eligibility Checks
 
 The preflight checks:
@@ -103,11 +115,17 @@ The preflight must block:
 - negative or non-integer count fields
 - missing or mismatched provenance
 - forbidden source artifact paths
+- missing `future_data_violation_count`
 - future-data violations
+- non-30D horizons
 - duplicate pair keys
 - missing deterministic reference or `full_gotra` pair members
-- insufficient sample, date, ticker, or cluster coverage
+- insufficient sample, paired-clean, date, ticker, or cluster coverage
 - winner/verdict/OOS/science/public/trading overclaim wording
+
+The CLI exits `0` only for `V3_7_BOOTSTRAP_HAC_PREFLIGHT_READY`. All other
+statuses, including data-insufficient and insufficient-coverage statuses, exit
+non-zero for shell/CI callers.
 
 ## Digest Convention
 

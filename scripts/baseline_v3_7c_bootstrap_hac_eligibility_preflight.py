@@ -48,6 +48,7 @@ BLOCKED_STATUSES = {
     STATUS_BLOCKED_PAIRING,
     STATUS_BLOCKED_OVERCLAIM,
 }
+CLI_SUCCESS_STATUSES = {STATUS_READY}
 
 DETERMINISTIC_KINDS = {"deterministic_reference", "deterministic_price_only", "price_only_reference"}
 FULL_GOTRA_KINDS = {"full_gotra"}
@@ -65,6 +66,9 @@ CLAIM_TEXT_FIELDS = (
     "claims",
     "notes",
     "narrative",
+    "rationale",
+    "reasoning",
+    "statement",
     "verdict",
     "verdict_claim",
     "winner",
@@ -192,7 +196,13 @@ def key_from_payload(payload: dict[str, Any]) -> tuple[str, str, int] | None:
     return ticker, decision_date, horizon_days
 
 
-def payload_entries(payload: Any, *, path: str, origin: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def payload_entries(
+    payload: Any,
+    *,
+    path: str,
+    origin: str,
+    base_dir: Path | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
     blockers: list[dict[str, Any]] = []
     if isinstance(payload, dict) and isinstance(payload.get("fixtures"), list):
@@ -212,6 +222,18 @@ def payload_entries(payload: Any, *, path: str, origin: str) -> tuple[list[dict[
         row_path = f"{path}#{index}" if len(raw_rows) > 1 else path
         if not isinstance(entry, dict):
             blockers.append(blocker(row_path, "malformed_fixture_row", "fixture row must be an object"))
+            continue
+        if "path" in entry and "payload" not in entry and len(entry) == 1:
+            entry_path = str(entry.get("path") or "").strip()
+            if not entry_path:
+                blockers.append(blocker(row_path, "missing_fixture_path", "path-only fixture entry requires path"))
+                continue
+            fixture_path = Path(entry_path).expanduser()
+            if not fixture_path.is_absolute() and base_dir is not None:
+                fixture_path = base_dir / fixture_path
+            file_rows, file_blockers = load_fixture_file(fixture_path)
+            rows.extend(file_rows)
+            blockers.extend(file_blockers)
             continue
         if "payload" in entry:
             payload_entry = entry.get("payload")
@@ -240,7 +262,7 @@ def load_fixture_file(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, 
         payload = load_json(path)
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         return [], [blocker(normalized, "fixture_load_error", str(exc))]
-    return payload_entries(payload, path=normalized, origin="file")
+    return payload_entries(payload, path=normalized, origin="file", base_dir=path.parent)
 
 
 def load_manifest(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -256,7 +278,7 @@ def load_manifest(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]
     raw = payload.get("fixtures", payload.get("rows", payload.get("artifacts", [])))
     if not isinstance(raw, list):
         return [], [blocker(normalized, "malformed_manifest_rows", "manifest fixtures/rows must be a list")]
-    return payload_entries(raw, path=normalized, origin="manifest")
+    return payload_entries(raw, path=normalized, origin="manifest", base_dir=path.parent)
 
 
 def collect_payloads(config: PreflightConfig) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -284,8 +306,8 @@ def validate_schema(payload: dict[str, Any], path: str) -> list[dict[str, Any]]:
             date.fromisoformat(decision_date)
         except ValueError:
             failures.append("decision_date")
-        if horizon_days <= 0:
-            failures.append("horizon_days")
+        if horizon_days != 30:
+            failures.append("horizon_days_must_be_30")
 
     kind = canonical_kind(payload)
     if kind not in {"deterministic_reference", "full_gotra"}:
@@ -304,7 +326,9 @@ def validate_schema(payload: dict[str, Any], path: str) -> list[dict[str, Any]]:
         elif value is not None and not isinstance(value, (int, float)):
             failures.append(field)
     for field in NONNEGATIVE_COUNT_FIELDS:
-        if field in payload:
+        if field == "future_data_violation_count" and field not in payload:
+            failures.append(field)
+        elif field in payload:
             value = int_value(payload.get(field))
             if value is None or value < 0:
                 failures.append(field)
@@ -314,21 +338,20 @@ def validate_schema(payload: dict[str, Any], path: str) -> list[dict[str, Any]]:
     return []
 
 
-def provenance_values(payload: dict[str, Any]) -> dict[str, str]:
-    provenance = payload.get("provenance")
-    if not isinstance(provenance, dict):
-        provenance = {}
+def top_level_provenance_values(payload: dict[str, Any]) -> dict[str, str]:
     return {
-        "source_run_id": str(payload.get("source_run_id") or provenance.get("source_run_id") or ""),
-        "source_artifact_path": str(
-            payload.get("source_artifact_path") or provenance.get("source_artifact_path") or ""
-        ),
+        "source_run_id": str(payload.get("source_run_id") or ""),
+        "source_artifact_path": str(payload.get("source_artifact_path") or ""),
+        "source_artifact_sha256": str(payload.get("source_artifact_sha256") or payload.get("source_hash") or ""),
+    }
+
+
+def nested_provenance_values(provenance: dict[str, Any]) -> dict[str, str]:
+    return {
+        "source_run_id": str(provenance.get("source_run_id") or ""),
+        "source_artifact_path": str(provenance.get("source_artifact_path") or ""),
         "source_artifact_sha256": str(
-            payload.get("source_artifact_sha256")
-            or payload.get("source_hash")
-            or provenance.get("source_artifact_sha256")
-            or provenance.get("source_hash")
-            or ""
+            provenance.get("source_artifact_sha256") or provenance.get("source_hash") or ""
         ),
     }
 
@@ -338,18 +361,25 @@ def validate_provenance(payload: dict[str, Any], path: str) -> list[dict[str, An
     if not isinstance(provenance, dict):
         return [blocker(path, "missing_provenance", "provenance must be an object")]
 
-    values = provenance_values(payload)
-    failures = [key for key, value in values.items() if not value.strip()]
+    top_values = top_level_provenance_values(payload)
+    nested_values = nested_provenance_values(provenance)
+    failures = [key for key, value in top_values.items() if not value.strip()]
+    failures.extend(f"provenance.{key}" for key, value in nested_values.items() if not value.strip())
     mismatches = []
     for key in ("source_run_id", "source_artifact_path", "source_artifact_sha256"):
-        top_value = payload.get(key)
-        provenance_value = provenance.get(key) or provenance.get("source_hash")
-        if top_value is not None and provenance_value is not None and str(top_value) != str(provenance_value):
+        top_value = top_values[key]
+        provenance_value = nested_values[key]
+        if top_value and provenance_value and top_value != provenance_value:
             mismatches.append(key)
+    values = top_values
     if not valid_hash(values["source_artifact_sha256"]):
         failures.append("source_artifact_sha256")
+    if nested_values["source_artifact_sha256"] and not valid_hash(nested_values["source_artifact_sha256"]):
+        failures.append("provenance.source_artifact_sha256")
     if values["source_artifact_path"] and claim_scan.forbidden_path(values["source_artifact_path"]):
         failures.append("source_artifact_path_forbidden")
+    if nested_values["source_artifact_path"] and claim_scan.forbidden_path(nested_values["source_artifact_path"]):
+        failures.append("provenance.source_artifact_path_forbidden")
     local_path = Path(values["source_artifact_path"]).expanduser()
     if local_path.exists() and local_path.is_file():
         if sha256_file(local_path) != values["source_artifact_sha256"].lower():
@@ -367,6 +397,18 @@ def future_data_blockers(payload: dict[str, Any], path: str) -> list[dict[str, A
     if count is not None and count < 0:
         return [blocker(path, "invalid_future_data_violation_count", "future-data count cannot be negative")]
     return []
+
+
+def disallowed_field_has_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value is True
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
 
 
 def claim_sources_for_payload(payload: dict[str, Any], path: str) -> list[claim_scan.ScanSource]:
@@ -393,7 +435,7 @@ def overclaim_blockers(payload: dict[str, Any], path: str) -> list[dict[str, Any
     if payload.get("winner_emitted") is True:
         blockers.append(blocker(path, "winner_emitted_not_allowed", "winner emission is not allowed"))
     for field in DISALLOWED_ESTIMATE_FIELDS:
-        if field in payload and payload.get(field) not in (None, "", False, [], {}):
+        if field in payload and disallowed_field_has_value(payload.get(field)):
             blockers.append(blocker(path, f"{field}_not_allowed", "verdict estimate fields are not allowed"))
     scan = claim_scan.scan_sources(claim_sources_for_payload(payload, path))
     blockers.extend(scan["overclaim"])
@@ -517,6 +559,8 @@ def choose_status(summary: dict[str, Any], config: PreflightConfig) -> str:
     if summary["sample_count"] == 0:
         return STATUS_DATA_INSUFFICIENT
     if summary["sample_count"] < config.min_sample_count:
+        return STATUS_INSUFFICIENT_SAMPLE
+    if summary["paired_clean_count"] < config.min_paired_clean_count:
         return STATUS_INSUFFICIENT_SAMPLE
     if not summary["cluster_eligible"]:
         return STATUS_INSUFFICIENT_CLUSTER
@@ -667,7 +711,7 @@ def config_from_args(args: argparse.Namespace) -> PreflightConfig:
 
 def main(argv: list[str] | None = None) -> int:
     summary = run_preflight(config_from_args(parse_args(argv)))
-    return 2 if summary["preflight_status"] in BLOCKED_STATUSES else 0
+    return 0 if summary["preflight_status"] in CLI_SUCCESS_STATUSES else 2
 
 
 if __name__ == "__main__":

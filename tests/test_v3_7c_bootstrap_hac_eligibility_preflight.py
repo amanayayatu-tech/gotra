@@ -112,6 +112,17 @@ def test_future_data_violation_blocks_preflight(tmp_path: Path) -> None:
     assert summary["future_data_violation_count"] == 1
 
 
+def test_missing_future_data_violation_count_blocks_schema(tmp_path: Path) -> None:
+    rows = _paired_rows()
+    rows[0].pop("future_data_violation_count")
+
+    summary = preflight.run_preflight(_config(tmp_path, rows))
+
+    assert summary["preflight_status"] == preflight.STATUS_BLOCKED_SCHEMA
+    assert summary["schema_blocker_count"] >= 1
+    assert any("future_data_violation_count" in item["reason"] for item in summary["blocked_items"])
+
+
 def test_provenance_run_id_mismatch_blocks_preflight(tmp_path: Path) -> None:
     rows = _paired_rows()
     rows[1]["provenance"] = dict(rows[1]["provenance"], source_run_id="wrong-run")
@@ -121,6 +132,17 @@ def test_provenance_run_id_mismatch_blocks_preflight(tmp_path: Path) -> None:
     assert summary["preflight_status"] == preflight.STATUS_BLOCKED_PROVENANCE
     assert summary["provenance_blocker_count"] >= 1
     assert "missing_or_invalid_provenance" in summary["blocker_reasons"]
+
+
+def test_missing_nested_provenance_fields_block_even_with_top_level_values(tmp_path: Path) -> None:
+    rows = _paired_rows()
+    rows[1]["provenance"] = {}
+
+    summary = preflight.run_preflight(_config(tmp_path, rows))
+
+    assert summary["preflight_status"] == preflight.STATUS_BLOCKED_PROVENANCE
+    assert summary["provenance_blocker_count"] >= 1
+    assert any("provenance.source_run_id" in item["reason"] for item in summary["blocked_items"])
 
 
 def test_forbidden_source_artifact_path_blocks_provenance(tmp_path: Path) -> None:
@@ -134,6 +156,16 @@ def test_forbidden_source_artifact_path_blocks_provenance(tmp_path: Path) -> Non
     assert summary["provenance_blocker_count"] >= 1
 
 
+def test_non_30d_horizon_blocks_schema(tmp_path: Path) -> None:
+    rows = _paired_rows()
+    rows[0]["horizon_days"] = 1
+
+    summary = preflight.run_preflight(_config(tmp_path, rows))
+
+    assert summary["preflight_status"] == preflight.STATUS_BLOCKED_SCHEMA
+    assert any("horizon_days_must_be_30" in item["reason"] for item in summary["blocked_items"])
+
+
 def test_malformed_row_or_negative_count_blocks_schema(tmp_path: Path) -> None:
     rows = _paired_rows()
     rows[0]["future_data_violation_count"] = -1
@@ -143,6 +175,34 @@ def test_malformed_row_or_negative_count_blocks_schema(tmp_path: Path) -> None:
 
     assert summary["preflight_status"] == preflight.STATUS_BLOCKED_SCHEMA
     assert summary["schema_blocker_count"] >= 1
+
+
+def test_path_only_manifest_entries_load_relative_fixture_files(tmp_path: Path) -> None:
+    fixture_path = tmp_path / "fixture_rows.json"
+    fixture_path.write_text(
+        json.dumps(
+            {
+                "fixtures": [
+                    {"path": f"tests/fixtures/v3_7c/{index}.json", "payload": row}
+                    for index, row in enumerate(_paired_rows())
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"fixtures": [{"path": "fixture_rows.json"}]}), encoding="utf-8")
+
+    summary = preflight.run_preflight(
+        preflight.PreflightConfig(
+            preflight_run_id=f"{preflight.RUN_ID_PREFIX}path_only",
+            output_dir=tmp_path / "runs",
+            fixture_manifest=manifest,
+        )
+    )
+
+    assert summary["preflight_status"] == preflight.STATUS_READY
+    assert summary["paired_clean_count"] == 4
 
 
 def test_non_object_fixture_entry_blocks_schema(tmp_path: Path) -> None:
@@ -174,6 +234,66 @@ def test_overclaim_winner_pvalue_or_trading_wording_blocks(tmp_path: Path) -> No
     assert summary["winner_emitted"] is False
 
 
+def test_rationale_and_statement_fields_are_scanned_for_overclaim(tmp_path: Path) -> None:
+    rows = _paired_rows()
+    rows[0]["rationale"] = "This fixture is public science proof."
+    rows[1]["statement"] = "This fixture is trading advice."
+
+    summary = preflight.run_preflight(_config(tmp_path, rows))
+
+    assert summary["preflight_status"] == preflight.STATUS_BLOCKED_OVERCLAIM
+    assert summary["overclaim_blocker_count"] >= 1
+
+
+def test_zero_valued_pvalue_and_estimate_fields_block_by_presence(tmp_path: Path) -> None:
+    rows = _paired_rows()
+    rows[0]["p_value"] = 0.0
+    rows[1]["bootstrap_estimate"] = 0
+    rows[2]["hac_estimate"] = 0.0
+
+    summary = preflight.run_preflight(_config(tmp_path, rows))
+
+    assert summary["preflight_status"] == preflight.STATUS_BLOCKED_OVERCLAIM
+    assert "p_value_not_allowed" in summary["blocker_reasons"]
+    assert "bootstrap_estimate_not_allowed" in summary["blocker_reasons"]
+    assert "hac_estimate_not_allowed" in summary["blocker_reasons"]
+
+
+def test_paired_clean_threshold_is_enforced_before_ready(tmp_path: Path) -> None:
+    summary = preflight.run_preflight(
+        _config(
+            tmp_path,
+            _paired_rows(),
+            min_paired_clean_count=5,
+        )
+    )
+
+    assert summary["preflight_status"] == preflight.STATUS_INSUFFICIENT_SAMPLE
+    assert summary["paired_clean_count"] == 4
+    assert summary["bootstrap_eligible"] is False
+    assert summary["hac_eligible"] is False
+
+
+def test_cli_returns_nonzero_for_non_ready_status(tmp_path: Path) -> None:
+    manifest = _write_manifest(tmp_path, _paired_rows(keys=(("AAPL", "2026-06-01"),)))
+    run_id = f"{preflight.RUN_ID_PREFIX}cli_non_ready"
+    exit_code = preflight.main(
+        [
+            "--fixture-manifest",
+            str(manifest),
+            "--preflight-run-id",
+            run_id,
+            "--output-dir",
+            str(tmp_path / "runs"),
+        ]
+    )
+
+    summary_path = tmp_path / "runs" / run_id / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert exit_code == 2
+    assert summary["preflight_status"] == preflight.STATUS_INSUFFICIENT_SAMPLE
+
+
 def test_manifest_records_verifiable_summary_digest(tmp_path: Path) -> None:
     summary = preflight.run_preflight(_config(tmp_path, _paired_rows()))
     summary_path = Path(summary["summary_path"])
@@ -195,6 +315,21 @@ def _config(
     min_date_coverage: int = preflight.DEFAULT_MIN_DATE_COVERAGE,
     min_ticker_coverage: int = preflight.DEFAULT_MIN_TICKER_COVERAGE,
 ) -> preflight.PreflightConfig:
+    manifest = _write_manifest(tmp_path, rows)
+    return preflight.PreflightConfig(
+        preflight_run_id=f"{preflight.RUN_ID_PREFIX}test_{len(list(tmp_path.iterdir()))}",
+        output_dir=tmp_path / "runs",
+        fixture_manifest=manifest,
+        min_sample_count=min_sample_count,
+        min_paired_clean_count=min_paired_clean_count,
+        min_ticker_clusters=min_ticker_clusters,
+        min_date_clusters=min_date_clusters,
+        min_date_coverage=min_date_coverage,
+        min_ticker_coverage=min_ticker_coverage,
+    )
+
+
+def _write_manifest(tmp_path: Path, rows: list[dict[str, object]]) -> Path:
     manifest = tmp_path / f"fixtures_{len(list(tmp_path.iterdir()))}.json"
     manifest.write_text(
         json.dumps(
@@ -207,17 +342,7 @@ def _config(
         ),
         encoding="utf-8",
     )
-    return preflight.PreflightConfig(
-        preflight_run_id=f"{preflight.RUN_ID_PREFIX}test_{len(list(tmp_path.iterdir()))}",
-        output_dir=tmp_path / "runs",
-        fixture_manifest=manifest,
-        min_sample_count=min_sample_count,
-        min_paired_clean_count=min_paired_clean_count,
-        min_ticker_clusters=min_ticker_clusters,
-        min_date_clusters=min_date_clusters,
-        min_date_coverage=min_date_coverage,
-        min_ticker_coverage=min_ticker_coverage,
-    )
+    return manifest
 
 
 def _paired_rows(

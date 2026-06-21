@@ -47,31 +47,54 @@ The preflight verifies:
 
 - deterministic reference and `full_gotra` rows are paired by ticker, decision
   date, and horizon
+- horizon is exactly 30 days
 - duplicate pair keys and unpaired rows are blockers
 - source run id, source artifact path, and source artifact sha256 are present
-  and consistent with provenance
+  in both top-level fields and nested provenance, and are consistent
 - forbidden source artifact paths are blocked
-- future-data violation count is zero
+- future-data violation count is explicitly present and zero
 - schema count fields are non-negative integers
+- path-only manifest entries load referenced local fixture files relative to
+  the manifest
 - sample, ticker, date, and cluster coverage meet prereg thresholds
 - no winner/verdict/OOS/science/public/trading overclaim wording is present
+
+CLI behavior: only `V3_7_BOOTSTRAP_HAC_PREFLIGHT_READY` exits `0`. Any
+insufficient or blocked status exits non-zero.
+
+## Review Hardening
+
+This repair hardens the active P2 review items:
+
+- nested `provenance.source_*` fields are required and cannot be satisfied by
+  top-level fallback fields
+- non-ready eligibility statuses return non-zero CLI exit codes
+- `rationale`, `reasoning`, and `statement` fields are scanned for claim-boundary
+  overclaim text
+- `--min-paired-clean-count` is enforced before READY
+- non-30D horizons are `BLOCKED_SCHEMA`
+- missing `future_data_violation_count` is `BLOCKED_SCHEMA`
+- zero-valued p-values and HAC/bootstrap estimate fields block by field
+  presence
+- path-only manifest entries load referenced fixture JSON files relative to the
+  manifest path
 
 ## Local Mock Validation
 
 Run id:
-`baseline_v3_7c_bootstrap_hac_eligibility_preflight_validation_20260621T154845Z`
+`baseline_v3_7c_bootstrap_hac_eligibility_preflight_repair_validation_20260621T161319Z`
 
 Summary path:
-`/tmp/gotra_v3_7c_bootstrap_hac_eligibility_preflight_20260621T154845Z/runs/baseline_v3_7c_bootstrap_hac_eligibility_preflight_validation_20260621T154845Z/summary.json`
+`/tmp/gotra_v3_7c_bootstrap_hac_eligibility_preflight_repair_20260621T161319Z/runs/baseline_v3_7c_bootstrap_hac_eligibility_preflight_repair_validation_20260621T161319Z/summary.json`
 
 Summary sha256:
-`4eac6b1dc0a5ea4975457b4bab970cb057018ca6c5b9ceeeb6f43b63e804deb9`
+`7b1c244aafd32118e943c57486a943ff3c25a19304054c3f907afdcbe756c49d`
 
 Digest manifest path:
-`/tmp/gotra_v3_7c_bootstrap_hac_eligibility_preflight_20260621T154845Z/runs/baseline_v3_7c_bootstrap_hac_eligibility_preflight_validation_20260621T154845Z/manifest.json`
+`/tmp/gotra_v3_7c_bootstrap_hac_eligibility_preflight_repair_20260621T161319Z/runs/baseline_v3_7c_bootstrap_hac_eligibility_preflight_repair_validation_20260621T161319Z/manifest.json`
 
 Digest manifest sha256:
-`a9e9782ebfc3858d68e3509415fb05e4780f7a4dbe9daa58a40d37e5a1321f28`
+`7ec57c2a51abc9250a6eefdc216052600fc13f0b915ab6634fedc16564545482`
 
 Summary status:
 
@@ -116,11 +139,19 @@ Focused tests cover:
 - missing `full_gotra` arm -> `BLOCKED_PAIRING`
 - duplicate pair key -> `BLOCKED_PAIRING`
 - future-data violation -> `BLOCKED_FUTURE_DATA`
+- missing future-data count -> `BLOCKED_SCHEMA`
 - provenance run id mismatch -> `BLOCKED_PROVENANCE`
+- missing nested provenance fields -> `BLOCKED_PROVENANCE`
 - forbidden source artifact path -> `BLOCKED_PROVENANCE`
+- non-30D horizon -> `BLOCKED_SCHEMA`
 - malformed row and negative count -> `BLOCKED_SCHEMA`
+- path-only manifest entries load relative fixture files
 - non-object fixture row -> `BLOCKED_SCHEMA`
-- winner / p-value / overclaim wording -> `BLOCKED_OVERCLAIM`
+- rationale/statement overclaim wording -> `BLOCKED_OVERCLAIM`
+- winner / zero-valued p-value / estimate / overclaim wording ->
+  `BLOCKED_OVERCLAIM`
+- paired-clean threshold insufficiency -> `INSUFFICIENT_SAMPLE_COUNT`
+- CLI non-ready statuses exit non-zero
 - final `summary.json` digest is verifiable through `manifest.json`
 - no provider, no Codex CLI, no formal-lite, no winner, and no actual 30D
   verdict execution
@@ -135,8 +166,8 @@ uv run ruff check --no-cache scripts/baseline_v3_7c_bootstrap_hac_eligibility_pr
 uv run pytest -q tests/test_v3_7c_bootstrap_hac_eligibility_preflight.py
 uv run pytest -q tests/test_v3_7a_fixture_verdict_harness_dry_run.py tests/test_v3_7b_verdict_report_schema_validator.py tests/test_forward_live_v3_7_entry_decision.py tests/test_forward_live_verdict_readiness_gate.py tests/test_evidence_claim_boundary_scanner.py tests/test_ksana_packet_v2_front_half_optimization.py
 uv run python scripts/baseline_v3_6ab_evidence_claim_boundary_scanner.py \
-  --scan-run-id baseline_v3_6ab_evidence_claim_boundary_scan_v3_7c_docs_20260621T155106Z \
-  --output-dir /tmp/gotra_v3_7c_claim_scan_20260621T155106Z/runs \
+  --scan-run-id baseline_v3_6ab_evidence_claim_boundary_scan_v3_7c_docs_repair_20260621T161410Z \
+  --output-dir /tmp/gotra_v3_7c_claim_scan_repair_20260621T161410Z/runs \
   --file docs/GOTRA_V3_7C_BOOTSTRAP_HAC_ELIGIBILITY_PREFLIGHT_PREREG_20260621.md \
   --file docs/GOTRA_V3_7C_BOOTSTRAP_HAC_ELIGIBILITY_PREFLIGHT_RESULT_20260621.md \
   --allow-overwrite
@@ -147,15 +178,15 @@ Results:
 
 - py_compile: pass
 - Ruff: pass
-- Focused v3.7C bootstrap/HAC eligibility preflight tests: `14 passed`
+- Focused v3.7C bootstrap/HAC eligibility preflight tests: `22 passed`
 - Relevant v3.7A / v3.7B / v3.7 entry / v3.6 readiness /
   claim-boundary / v3.7K regression tests: `94 passed`
 - v3.7C docs claim-boundary scan: `CLAIM_BOUNDARY_CLEAN`
   - summary path:
-    `/tmp/gotra_v3_7c_claim_scan_20260621T155106Z/runs/baseline_v3_6ab_evidence_claim_boundary_scan_v3_7c_docs_20260621T155106Z/summary.json`
+    `/tmp/gotra_v3_7c_claim_scan_repair_20260621T161410Z/runs/baseline_v3_6ab_evidence_claim_boundary_scan_v3_7c_docs_repair_20260621T161410Z/summary.json`
   - summary sha256:
-    `9affb4fdc8dee74862fa42503bd51d09c9d9f90ce6e6697b4714aa34e0beea00`
-- Full test suite: `667 passed`
+    `2834c7f6c2b796ba4a1f385913d0ff28be5a2a44668996ce5aaaf4ae950da44c`
+- Full test suite: `675 passed`
 
 ## Boundary
 
