@@ -129,6 +129,19 @@ FUTURE_DATA_METADATA_FIELDS = {
     "decision_date_scope",
     "decision_date_max",
 }
+CLAIM_SCAN_SKIP_FIELDS = {
+    "schema",
+    "source_run_id",
+    "source_artifact_path",
+    "ticker",
+    "decision_date",
+    "non_claims",
+    "evidence_layer",
+    "provider_or_backend_called",
+    "codex_cli_new_call",
+    "formal_lite_entered",
+    "provenance",
+}
 
 
 @dataclass(frozen=True)
@@ -245,9 +258,35 @@ def collect_artifacts(config: AuditConfig) -> tuple[list[AuditArtifact], list[di
             )
         else:
             manifest = load_json(config.manifest)
-            entries = manifest.get("artifacts", []) if isinstance(manifest, dict) else []
-            if isinstance(entries, list):
+            if not isinstance(manifest, dict):
+                load_errors.append(
+                    make_blocker(
+                        manifest_path,
+                        "malformed_manifest_root",
+                        "manifest must be a JSON object",
+                    )
+                )
+            else:
+                entries = manifest.get("artifacts", [])
+                if not isinstance(entries, list):
+                    load_errors.append(
+                        make_blocker(
+                            manifest_path,
+                            "malformed_manifest_artifacts",
+                            "manifest artifacts must be a list",
+                        )
+                    )
+                    entries = []
                 for entry in entries:
+                    if not isinstance(entry, dict):
+                        load_errors.append(
+                            make_blocker(
+                                manifest_path,
+                                "malformed_manifest_artifact_entry",
+                                "manifest artifact entry must be an object",
+                            )
+                        )
+                        continue
                     try:
                         artifacts.extend(artifact_from_manifest_entry(entry))
                     except (OSError, json.JSONDecodeError, ValueError) as exc:
@@ -295,14 +334,66 @@ def iter_hypotheses(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+def is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def nested_list_count(payload: dict[str, Any], key: str, hypotheses: list[dict[str, Any]]) -> int:
     total = list_count(payload.get(key))
     total += sum(list_count(item.get(key)) for item in hypotheses)
     return total
 
 
-def text_for_claim_scan(artifact: AuditArtifact) -> str:
-    return json.dumps(artifact.payload, ensure_ascii=False, sort_keys=True, default=str)
+def claim_text_sources_from_value(
+    *,
+    artifact: AuditArtifact,
+    field_path: str,
+    value: Any,
+) -> list[claim_scan.ScanSource]:
+    if isinstance(value, str):
+        return [
+            claim_scan.ScanSource(
+                path=f"{artifact.path}:{field_path}",
+                text=value,
+                origin=artifact.origin,
+            )
+        ]
+    if isinstance(value, list):
+        sources: list[claim_scan.ScanSource] = []
+        for index, item in enumerate(value):
+            sources.extend(
+                claim_text_sources_from_value(
+                    artifact=artifact,
+                    field_path=f"{field_path}[{index}]",
+                    value=item,
+                )
+            )
+        return sources
+    if isinstance(value, dict):
+        sources = []
+        for key, item in value.items():
+            if str(key) in CLAIM_SCAN_SKIP_FIELDS:
+                continue
+            sources.extend(
+                claim_text_sources_from_value(
+                    artifact=artifact,
+                    field_path=f"{field_path}.{key}",
+                    value=item,
+                )
+            )
+        return sources
+    return []
+
+
+def claim_scan_sources_for_artifact(artifact: AuditArtifact) -> list[claim_scan.ScanSource]:
+    sources: list[claim_scan.ScanSource] = []
+    for key, value in artifact.payload.items():
+        if key in CLAIM_SCAN_SKIP_FIELDS:
+            continue
+        sources.extend(
+            claim_text_sources_from_value(artifact=artifact, field_path=key, value=value)
+        )
+    return sources
 
 
 def text_for_caution_scan(payload: dict[str, Any]) -> str:
@@ -332,6 +423,14 @@ def validate_schema(artifact: AuditArtifact) -> list[dict[str, Any]]:
     type_errors: list[str] = []
     if "hypotheses" in payload and not isinstance(payload["hypotheses"], list):
         type_errors.append("hypotheses")
+    if "hypotheses" in payload and isinstance(payload["hypotheses"], list):
+        for index, item in enumerate(payload["hypotheses"]):
+            if not isinstance(item, dict):
+                type_errors.append(f"hypotheses[{index}]")
+    if "disagreement_with_price_only" in payload and not isinstance(
+        payload["disagreement_with_price_only"], (list, dict)
+    ):
+        type_errors.append("disagreement_with_price_only")
     for key in (
         "counterfactuals",
         "evidence_gaps",
@@ -351,6 +450,19 @@ def validate_schema(artifact: AuditArtifact) -> list[dict[str, Any]]:
         missing_keys = sorted(REQUIRED_HYPOTHESIS_FIELDS - set(item))
         if missing_keys:
             hypothesis_missing.append(f"hypotheses[{index}]:{','.join(missing_keys)}")
+        if "rank" in item and not is_number(item["rank"]):
+            type_errors.append(f"hypotheses[{index}].rank")
+        if "confidence" in item:
+            confidence = item["confidence"]
+            if not is_number(confidence) or not 0 <= float(confidence) <= 1:
+                type_errors.append(f"hypotheses[{index}].confidence")
+        if "why_it_matters" in item and not isinstance(item["why_it_matters"], str):
+            type_errors.append(f"hypotheses[{index}].why_it_matters")
+        for key in ("falsification_triggers", "expected_observable_evidence"):
+            if key in item and not isinstance(item[key], list):
+                type_errors.append(f"hypotheses[{index}].{key}")
+        if "counterfactuals" in item and not isinstance(item["counterfactuals"], list):
+            type_errors.append(f"hypotheses[{index}].counterfactuals")
     failures = missing + sorted(set(type_errors)) + hypothesis_missing
     if failures:
         return [
@@ -378,6 +490,14 @@ def validate_provenance(artifact: AuditArtifact) -> list[dict[str, Any]]:
         key for key in PROVENANCE_REQUIRED_FIELDS if not str(payload.get(key) or "").strip()
     ]
     failures = missing + mismatches + empty_top_level
+    forbidden_paths = []
+    for key in ("source_artifact_path",):
+        top_path = str(payload.get(key) or "")
+        provenance_path = str(provenance.get(key) or "") if isinstance(provenance, dict) else ""
+        if top_path and claim_scan.forbidden_path(top_path):
+            forbidden_paths.append(key)
+        if provenance_path and claim_scan.forbidden_path(provenance_path):
+            forbidden_paths.append(f"provenance.{key}")
     if failures:
         return [
             make_blocker(
@@ -386,14 +506,19 @@ def validate_provenance(artifact: AuditArtifact) -> list[dict[str, Any]]:
                 ",".join(sorted(set(failures))),
             )
         ]
+    if forbidden_paths:
+        return [
+            make_blocker(
+                artifact.path,
+                "forbidden_source_artifact_path",
+                ",".join(sorted(set(forbidden_paths))),
+            )
+        ]
     return []
 
 
 def scan_overclaim(artifacts: list[AuditArtifact]) -> list[dict[str, Any]]:
-    sources = [
-        claim_scan.ScanSource(path=artifact.path, text=text_for_claim_scan(artifact), origin=artifact.origin)
-        for artifact in artifacts
-    ]
+    sources = [source for artifact in artifacts for source in claim_scan_sources_for_artifact(artifact)]
     scan = claim_scan.scan_sources(sources)
     return (
         scan["overclaim"]
@@ -567,10 +692,15 @@ def write_outputs(config: AuditConfig, summary: dict[str, Any], *, run_root: Pat
     manifest_path = run_root / "manifest.json"
     summary["summary_path"] = str(summary_path)
     summary["manifest_path"] = str(manifest_path)
+    summary["summary_digest_target"] = "manifest.summary_sha256"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    summary_sha256 = sha256_file(summary_path)
     manifest = {
         "schema": MANIFEST_SCHEMA,
         "audit_run_id": config.audit_run_id,
+        "summary_path": str(summary_path),
+        "summary_sha256": summary_sha256,
+        "summary_digest_target": "summary.json final payload",
         "input_artifacts": [normalize_path(path) for path in config.input_artifacts],
         "manifest": normalize_path(config.manifest) if config.manifest else "",
         "provider_or_backend_called": False,
@@ -579,8 +709,6 @@ def write_outputs(config: AuditConfig, summary: dict[str, Any], *, run_root: Pat
         "v3_7_allowed": False,
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-    summary["summary_sha256"] = sha256_file(summary_path)
-    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def run_audit(config: AuditConfig) -> dict[str, Any]:

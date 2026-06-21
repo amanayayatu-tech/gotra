@@ -62,18 +62,40 @@ uv run python scripts/baseline_v3_6ai_ksana_cognitive_lift_audit.py \
 ```
 
 The analyzer writes structured `summary.json` and `manifest.json` under the
-requested output directory. Runtime output is not committed.
+requested output directory. Runtime output is not committed. The final
+`summary.json` digest is recorded in `manifest.json` as `summary_sha256`; the
+summary no longer stores a self-invalidating digest field.
+
+## Review Hardening
+
+This repair hardens the v3.6AI audit against the PR #50 P2 review blockers:
+
+- forbidden inline and provenance `source_artifact_path` values now block as
+  provenance failures
+- non-object `hypotheses` entries now block as schema failures
+- malformed manifest roots and non-list `artifacts` now block as schema failures
+- scalar `disagreement_with_price_only` now blocks as a schema failure
+- nested hypothesis field types are validated before metrics are counted
+- claim-bearing fields are scanned separately, so `non_claims` cannot negate a
+  real overclaim in another field
+- `manifest.json` records a verifiable digest for the final `summary.json`
 
 ## Local Mock Validation
 
 Run id:
-`baseline_v3_6ai_ksana_cognitive_lift_audit_mock_20260621T112931Z`
+`baseline_v3_6ai_ksana_cognitive_lift_audit_repair_20260621T115403Z`
 
 Summary path:
-`/tmp/gotra_v3_6ai_ksana_cognitive_lift_audit/runs/baseline_v3_6ai_ksana_cognitive_lift_audit_mock_20260621T112931Z/summary.json`
+`/tmp/gotra_v3_6ai_repair_validation_20260621T115403Z/runs/baseline_v3_6ai_ksana_cognitive_lift_audit_repair_20260621T115403Z/summary.json`
 
 Summary sha256:
-`f55540686450e2a1658b5a2761c29222004ba682aac64270647767f7cd67029f`
+`e6fa005c362527d82cd54e1c4bd4c9746d183ed78094e19fca8db6366e2d6b2f`
+
+Digest manifest path:
+`/tmp/gotra_v3_6ai_repair_validation_20260621T115403Z/runs/baseline_v3_6ai_ksana_cognitive_lift_audit_repair_20260621T115403Z/manifest.json`
+
+Digest manifest sha256:
+`cc2281374c744a59a25482f388e6d91c4e280cd789b5634a83ab5baf9e3f50e4`
 
 Summary status:
 
@@ -99,10 +121,17 @@ Focused tests cover:
 - conservative / generic caution-heavy report -> `LOW_INFORMATION_GAIN`
 - forced hypothesis and counterfactual schema fixture -> fixture comparison ready
 - missing provenance -> `BLOCKED_PROVENANCE`
+- forbidden inline or provenance source artifact path -> `BLOCKED_PROVENANCE`
 - missing or invalid required schema field -> `BLOCKED_SCHEMA`
+- non-object `hypotheses` entry -> `BLOCKED_SCHEMA`
+- scalar `disagreement_with_price_only` -> `BLOCKED_SCHEMA`
+- malformed manifest root / malformed `artifacts` -> `BLOCKED_SCHEMA`
+- malformed nested hypothesis value types -> `BLOCKED_SCHEMA`
 - boundary-overclaim wording -> `BLOCKED_OVERCLAIM`
+- `non_claims` cannot hide an overclaim in another claim-bearing field
 - `direct_llm_parametric_memory_control` clean-baseline misuse -> blocked
 - `direct_llm_parametric_memory_control` boundary -> accepted
+- manifest-side final `summary.json` digest is verifiable
 - no provider, no new Codex CLI, no formal-lite, and `v3_7_allowed=false`
 - READY status remains fixture-level and does not emit a verdict or winner field
 
