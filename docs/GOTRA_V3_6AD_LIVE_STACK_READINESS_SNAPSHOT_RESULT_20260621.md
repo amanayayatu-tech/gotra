@@ -31,18 +31,18 @@ Command:
 
 ```bash
 uv run python scripts/baseline_v3_6ad_live_stack_readiness_snapshot.py \
-  --snapshot-run-id baseline_v3_6ad_live_stack_readiness_snapshot_reviewfix_fixture_20260621T083817Z \
+  --snapshot-run-id baseline_v3_6ad_live_stack_readiness_snapshot_reviewfix_fixture_20260621T084444Z \
   --snapshot /tmp/gotra_v3_6ad_live_stack_readiness_snapshot_reviewfix_20260621T083401Z/fixture_snapshot.json \
-  --output-dir /tmp/gotra_v3_6ad_live_stack_readiness_snapshot_reviewfix_20260621T083817Z/runs
+  --output-dir /tmp/gotra_v3_6ad_live_stack_readiness_snapshot_reviewfix_20260621T084444Z/runs
 ```
 
 Output, not committed:
 
-`/tmp/gotra_v3_6ad_live_stack_readiness_snapshot_reviewfix_20260621T083817Z/runs/baseline_v3_6ad_live_stack_readiness_snapshot_reviewfix_fixture_20260621T083817Z/summary.json`
+`/tmp/gotra_v3_6ad_live_stack_readiness_snapshot_reviewfix_20260621T084444Z/runs/baseline_v3_6ad_live_stack_readiness_snapshot_reviewfix_fixture_20260621T084444Z/summary.json`
 
 Summary sha256:
 
-`6691195cf15f872da5f8b08ca69161e90950422378566626dca2df864b50495a`
+`e00a9145d5271926fa6805c57766740abe9fdae64f349323a25673b7ffebc92e`
 
 Result:
 
@@ -109,9 +109,9 @@ Result:
 
 - py_compile: pass
 - Ruff: pass
-- Focused v3.6AD tests: `25 passed`
-- v3.6AA/v3.6AB/v3.6AC/v3.6AD regression tests: `74 passed`
-- Full test suite: `494 passed`
+- Focused v3.6AD tests: `27 passed`
+- v3.6AA/v3.6AB/v3.6AC/v3.6AD regression tests: `76 passed`
+- Full test suite: `496 passed`
 
 ## Covered Behavior
 
@@ -130,7 +130,8 @@ Result:
 - PR state must be `OPEN`; closed, merged, or missing state blocks readiness
 - fixture PR records must cover the requested `--pr-range`
 - v3.7 positive claims with nearby `false` wording still block; explicit
-  `v3_7_allowed=false`, `v3.7 verdict allowed: false`, and
+  `v3_7_allowed=false`, `v3.7 allowed: false`,
+  `v3.7 30D verdict allowed: false`, `v3.7 verdict allowed: false`, and
   `v3.7 not allowed` remain clean
 - 30D `DATA_NOT_MATURED` remains `v3_7_allowed=false` and does not block
   engineering stack review

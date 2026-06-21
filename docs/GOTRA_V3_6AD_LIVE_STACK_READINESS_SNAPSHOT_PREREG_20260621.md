@@ -58,7 +58,9 @@ The live PR-body claim scan may ignore explicit negative-boundary or test
 coverage wording, such as "Cannot say", `v3_7_allowed=false`, and
 `non-claim` boundary descriptions. False v3.7 lines must be unambiguously
 negative: positive forms such as `v3_7_allowed=true (was false before)` and
-`v3.7 is allowed, not false anymore` still block.
+`v3.7 is allowed, not false anymore` still block. Explicit false forms such as
+`v3.7 allowed: false` and `v3.7 30D verdict allowed: false` remain clean
+boundary statements.
 
 Fixture snapshots are checked against the requested `--pr-range`; a partial
 fixture cannot declare a clean stack by omitting PRs from the requested range.

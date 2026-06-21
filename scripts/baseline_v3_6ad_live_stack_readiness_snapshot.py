@@ -384,6 +384,8 @@ def negative_boundary_heading(lowered: str) -> bool:
 def safe_false_v3_7_line(lowered: str) -> bool:
     if "v3.7" not in lowered and "v3_7" not in lowered and "v37" not in lowered:
         return False
+    if re.search(r"['\"]?\bv3[_ .-]?7[_ .-]?allowed['\"]?\s*[:=]\s*true\b", lowered):
+        return False
     explicit_false = (
         re.search(r"['\"]?\bv3[_ .-]?7[_ .-]?allowed['\"]?\s*[:=]\s*(false|no)\b", lowered)
         or re.search(r"\bv(?:3[._-]?7|37)\b.{0,40}\ballowed\s*:\s*(false|no)\b", lowered)
@@ -392,12 +394,19 @@ def safe_false_v3_7_line(lowered: str) -> bool:
     )
     if not explicit_false:
         return False
-    positive_override = re.search(
-        r"['\"]?\bv3[_ .-]?7[_ .-]?allowed['\"]?\s*[:=]\s*true\b"
-        r"|\bv(?:3[._-]?7|37)\b.{0,40}\b(?:is\s+)?(allowed|ready|pass)\b",
+    positive_matches = re.finditer(
+        r"\bv(?:3[._-]?7|37)\b.{0,60}\b(?:is\s+)?(?:allowed|ready|pass)\b",
         lowered,
     )
-    return positive_override is None
+    for match in positive_matches:
+        phrase = match.group(0)
+        after = lowered[match.end() : match.end() + 20]
+        if re.search(r"\b(?:not\s+allowed|disallowed|forbidden|blocked)\b", phrase):
+            continue
+        if re.match(r"\s*[:=]\s*(false|no)\b", after):
+            continue
+        return False
+    return True
 
 
 def test_coverage_boundary_line(lowered: str) -> bool:
