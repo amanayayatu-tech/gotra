@@ -80,6 +80,25 @@ The contract is intentionally stricter than the current public adapter. Legacy
 adapter fixtures without these fields are not automatically treated as clean
 cognitive-lift packets.
 
+Review-hardening contract details:
+
+- `--manifest` must be a JSON object; if present, `artifacts` must be a list.
+- Top-level and `provenance.source_artifact_path` values are checked against
+  forbidden artifact paths before a packet can be considered provenance-clean.
+- Every `hypotheses` entry must be an object; malformed entries are
+  `BLOCKED_SCHEMA`, not silently ignored.
+- Hypothesis `rank` and `confidence` must be numeric, `confidence` must be in
+  `[0, 1]`, and nested `falsification_triggers`,
+  `expected_observable_evidence`, and optional hypothesis-level
+  `counterfactuals` must be lists.
+- `disagreement_with_price_only` must be structured as a list or object; scalar
+  text is `BLOCKED_SCHEMA`.
+- Boundary claim scanning is field-scoped. `non_claims` documents the boundary
+  but cannot negate an overclaim in `summary`, `hypotheses`, `claims`, or other
+  claim-bearing fields.
+- The verifiable digest for the final `summary.json` is recorded in
+  `manifest.json` as `summary_sha256`.
+
 ## Metrics
 
 The analyzer must output at least:
@@ -124,7 +143,9 @@ comparison. It is not a GOTRA/ksana/alaya winner conclusion.
 The analyzer must block:
 
 - missing or inconsistent provenance
+- forbidden inline or provenance source artifact paths
 - missing or invalid required schema fields
+- malformed manifest shape
 - boundary-overclaim wording caught by the v3.6AB scanner
 - `direct_llm_parametric_memory_control` clean-baseline misuse
 - any provider/backend/formal-lite boundary violation

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -103,6 +104,116 @@ def test_direct_llm_parametric_boundary_is_accepted(tmp_path: Path) -> None:
     assert summary["direct_llm_interpretation"] == audit.DIRECT_LLM_INTERPRETATION
 
 
+def test_forbidden_top_level_source_artifact_path_blocks_provenance(tmp_path: Path) -> None:
+    artifact = _artifact()
+    forbidden = "data/backtest/runs/raw.json"
+    artifact["source_artifact_path"] = forbidden
+    artifact["provenance"]["source_artifact_path"] = forbidden
+
+    summary = audit.run_audit(_config(tmp_path, [artifact]))
+
+    assert summary["overall_status"] == audit.STATUS_BLOCKED_PROVENANCE
+    assert any(item["rule_id"] == "forbidden_source_artifact_path" for item in summary["blocked_items"])
+
+
+def test_forbidden_provenance_source_artifact_path_blocks_provenance(tmp_path: Path) -> None:
+    artifact = _artifact()
+    forbidden = "raw_outputs/ksana_packet.json"
+    artifact["source_artifact_path"] = forbidden
+    artifact["provenance"]["source_artifact_path"] = forbidden
+
+    summary = audit.run_audit(_config(tmp_path, [artifact]))
+
+    assert summary["overall_status"] == audit.STATUS_BLOCKED_PROVENANCE
+    assert any(
+        "source_artifact_path" in item["reason"]
+        for item in summary["blocked_items"]
+        if item["rule_id"] == "forbidden_source_artifact_path"
+    )
+
+
+def test_non_object_hypothesis_entry_blocks_schema(tmp_path: Path) -> None:
+    artifact = _artifact()
+    artifact["hypotheses"].append("malformed hypothesis")
+
+    summary = audit.run_audit(_config(tmp_path, [artifact]))
+
+    assert summary["overall_status"] == audit.STATUS_BLOCKED_SCHEMA
+    assert any("hypotheses[2]" in item["reason"] for item in summary["blocked_items"])
+
+
+def test_scalar_disagreement_with_price_only_blocks_schema(tmp_path: Path) -> None:
+    artifact = _artifact()
+    artifact["disagreement_with_price_only"] = "price-only disagrees"
+
+    summary = audit.run_audit(_config(tmp_path, [artifact]))
+
+    assert summary["overall_status"] == audit.STATUS_BLOCKED_SCHEMA
+    assert any(
+        "disagreement_with_price_only" in item["reason"]
+        for item in summary["blocked_items"]
+    )
+
+
+def test_malformed_manifest_root_blocks_schema(tmp_path: Path) -> None:
+    summary = audit.run_audit(_config_from_manifest_payload(tmp_path, ["not", "object"]))
+
+    assert summary["overall_status"] == audit.STATUS_BLOCKED_SCHEMA
+    assert any(item["rule_id"] == "malformed_manifest_root" for item in summary["blocked_items"])
+
+
+def test_malformed_manifest_artifacts_blocks_schema(tmp_path: Path) -> None:
+    summary = audit.run_audit(_config_from_manifest_payload(tmp_path, {"artifacts": "not-list"}))
+
+    assert summary["overall_status"] == audit.STATUS_BLOCKED_SCHEMA
+    assert any(
+        item["rule_id"] == "malformed_manifest_artifacts"
+        for item in summary["blocked_items"]
+    )
+
+
+def test_nested_hypothesis_type_errors_block_schema(tmp_path: Path) -> None:
+    artifact = _artifact()
+    artifact["hypotheses"][0].update(
+        {
+            "rank": "first",
+            "confidence": "high",
+            "why_it_matters": ["not text"],
+            "falsification_triggers": "none",
+            "expected_observable_evidence": "none",
+            "counterfactuals": "none",
+        }
+    )
+
+    summary = audit.run_audit(_config(tmp_path, [artifact]))
+
+    assert summary["overall_status"] == audit.STATUS_BLOCKED_SCHEMA
+    reason = ",".join(item["reason"] for item in summary["blocked_items"])
+    assert "hypotheses[0].rank" in reason
+    assert "hypotheses[0].confidence" in reason
+    assert "hypotheses[0].falsification_triggers" in reason
+
+
+def test_non_claims_do_not_negate_summary_overclaim(tmp_path: Path) -> None:
+    artifact = _artifact(summary="This packet is OOS evidence and trading advice.")
+    artifact["non_claims"] = ["not OOS/science/public/trading claim", "not investment advice"]
+
+    summary = audit.run_audit(_config(tmp_path, [artifact]))
+
+    assert summary["overall_status"] == audit.STATUS_BLOCKED_OVERCLAIM
+    assert any(item["rule_id"] == "oos_science_public_trading_claim" for item in summary["blocked_items"])
+
+
+def test_manifest_records_verifiable_summary_digest(tmp_path: Path) -> None:
+    summary = audit.run_audit(_config(tmp_path, [_artifact()]))
+    summary_path = Path(summary["summary_path"])
+    manifest_path = Path(summary["manifest_path"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert manifest["summary_sha256"] == _sha256(summary_path)
+    assert summary["summary_digest_target"] == "manifest.summary_sha256"
+
+
 def test_empty_manifest_is_data_insufficient(tmp_path: Path) -> None:
     summary = audit.run_audit(_config(tmp_path, []))
 
@@ -142,6 +253,24 @@ def _config(tmp_path: Path, artifacts: list[dict[str, object]]) -> audit.AuditCo
         output_dir=tmp_path / "runs",
         manifest=manifest,
     )
+
+
+def _config_from_manifest_payload(tmp_path: Path, payload: object) -> audit.AuditConfig:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    return audit.AuditConfig(
+        audit_run_id=f"{audit.RUN_ID_PREFIX}manifest_{len(list(tmp_path.iterdir()))}",
+        output_dir=tmp_path / "runs",
+        manifest=manifest,
+    )
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _artifact(
