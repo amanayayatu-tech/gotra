@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts import baseline_v3_6x_evidence_package_dashboard as dashboard
 
 
@@ -112,11 +114,133 @@ def test_dashboard_cli_returns_nonzero_for_blocked_run_id(tmp_path: Path) -> Non
     assert rc == 1
 
 
+def test_source_doc_override_preserves_default_set_and_required_snippets(
+    tmp_path: Path,
+) -> None:
+    docs = _write_required_docs(tmp_path)
+    replacement = tmp_path / "replacement_v3_6s.md"
+    replacement.write_text(
+        "\n".join(docs[0].required_snippets) + "\nextra\n",
+        encoding="utf-8",
+    )
+
+    merged = dashboard.source_docs_with_overrides(
+        docs,
+        (
+            dashboard.SourceDocOverride(
+                doc_id=docs[0].doc_id,
+                path=replacement,
+            ),
+        ),
+    )
+
+    assert len(merged) == 4
+    assert merged[0].path == replacement
+    assert merged[0].required_snippets == docs[0].required_snippets
+    assert [doc.doc_id for doc in merged[1:]] == [doc.doc_id for doc in docs[1:]]
+
+
+def test_dashboard_cli_override_bad_doc_keeps_boundary_checks_and_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docs = _write_required_docs(tmp_path)
+    monkeypatch.setattr(dashboard, "DEFAULT_SOURCE_DOCS", docs)
+    bad_doc = tmp_path / "bad_v3_6s.md"
+    bad_doc.write_text("arbitrary file without required boundaries\n", encoding="utf-8")
+    run_id = "baseline_v3_6x_evidence_package_dashboard_bad_override"
+
+    rc = dashboard.main(
+        [
+            "--package-run-id",
+            run_id,
+            "--output-dir",
+            str(tmp_path / "runs"),
+            "--source-doc",
+            f"v3_6s={bad_doc}",
+        ]
+    )
+
+    assert rc == 1
+    summary = json.loads(
+        (tmp_path / "runs" / run_id / "summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["status"] == dashboard.STATUS_BLOCKED_SOURCE_DOCS
+    assert summary["source_document_count"] == 4
+    assert summary["source_document_missing_count"] == 0
+    assert summary["source_document_required_snippet_missing_count"] == len(
+        docs[0].required_snippets
+    )
+    overridden = [
+        doc
+        for doc in summary["source_documents"]
+        if doc["doc_id"] == "v3_6s_actual_maturity_monitor_result"
+    ][0]
+    assert overridden["path"] == str(bad_doc)
+    assert overridden["required_snippet_count"] == len(docs[0].required_snippets)
+
+
+def test_dashboard_cli_override_valid_doc_still_validates_other_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docs = _write_required_docs(tmp_path)
+    monkeypatch.setattr(dashboard, "DEFAULT_SOURCE_DOCS", docs)
+    replacement = tmp_path / "replacement_v3_6s.md"
+    replacement.write_text(
+        "\n".join(docs[0].required_snippets) + "\nreplacement\n",
+        encoding="utf-8",
+    )
+    run_id = "baseline_v3_6x_evidence_package_dashboard_valid_override"
+
+    rc = dashboard.main(
+        [
+            "--package-run-id",
+            run_id,
+            "--output-dir",
+            str(tmp_path / "runs"),
+            "--source-doc",
+            f"v3_6s={replacement}",
+        ]
+    )
+
+    assert rc == 0
+    summary = json.loads(
+        (tmp_path / "runs" / run_id / "summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["status"] == dashboard.STATUS_READY
+    assert summary["source_document_count"] == 4
+    assert {doc["doc_id"] for doc in summary["source_documents"]} == {
+        doc.doc_id for doc in docs
+    }
+    assert all(
+        int(doc["required_snippet_count"]) > 0
+        for doc in summary["source_documents"]
+    )
+
+
+def test_dashboard_rejects_unknown_source_doc_id(tmp_path: Path) -> None:
+    rc = dashboard.main(
+        [
+            "--package-run-id",
+            "baseline_v3_6x_evidence_package_dashboard_unknown_doc",
+            "--output-dir",
+            str(tmp_path / "runs"),
+            "--source-doc",
+            f"unknown_doc={tmp_path / 'x.md'}",
+        ]
+    )
+
+    assert rc == 2
+    assert not (tmp_path / "runs").exists()
+
+
 def _write_required_docs(tmp_path: Path) -> tuple[dashboard.SourceDocConfig, ...]:
     direct = dashboard.DIRECT_LLM_INTERPRETATION
     return (
         _write_doc(
             tmp_path,
+            "v3_6s_actual_maturity_monitor_result",
             "v3_6s.md",
             (
                 "DATA_NOT_MATURED",
@@ -129,6 +253,7 @@ def _write_required_docs(tmp_path: Path) -> tuple[dashboard.SourceDocConfig, ...
         ),
         _write_doc(
             tmp_path,
+            "v3_6t_monitor_ops_result",
             "v3_6t.md",
             (
                 "DATA_NOT_MATURED",
@@ -139,6 +264,7 @@ def _write_required_docs(tmp_path: Path) -> tuple[dashboard.SourceDocConfig, ...
         ),
         _write_doc(
             tmp_path,
+            "v3_6u_historical_internal_verdict",
             "v3_6u.md",
             (
                 "FULL_GOTRA_BETTER",
@@ -149,6 +275,7 @@ def _write_required_docs(tmp_path: Path) -> tuple[dashboard.SourceDocConfig, ...
         ),
         _write_doc(
             tmp_path,
+            "v3_6v_short_horizon_prereg",
             "v3_6v.md",
             (
                 "SHORT_HORIZON_COHORT_PLAN_READY",
@@ -163,13 +290,14 @@ def _write_required_docs(tmp_path: Path) -> tuple[dashboard.SourceDocConfig, ...
 
 def _write_doc(
     tmp_path: Path,
+    doc_id: str,
     filename: str,
     snippets: tuple[str, ...],
 ) -> dashboard.SourceDocConfig:
     path = tmp_path / filename
     path.write_text("\n".join(snippets) + "\n", encoding="utf-8")
     return dashboard.SourceDocConfig(
-        doc_id=filename.removesuffix(".md"),
+        doc_id=doc_id,
         path=path,
         required_snippets=snippets,
     )

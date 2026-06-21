@@ -36,6 +36,16 @@ The builder reads the existing v3.6S/v3.6T/v3.6U/v3.6V docs, verifies that
 required evidence-boundary snippets are present, and writes a structured JSON
 dashboard summary. Runtime output is local only and is not committed.
 
+Review hardening added after PR #39 self-audit:
+
+- `--source-doc` now overrides by known `doc_id` instead of replacing the
+  entire default source document set.
+- Single-document overrides keep the other default source docs and preserve the
+  default required boundary snippets.
+- Unknown source doc ids are rejected.
+- Any overridden source doc that lacks required boundary snippets blocks
+  `EVIDENCE_PACKAGE_READY`.
+
 Required dashboard fields include:
 
 - `thirty_day_forward_live_maturity_status`
@@ -70,17 +80,17 @@ Command:
 
 ```bash
 uv run python scripts/baseline_v3_6x_evidence_package_dashboard.py \
-  --package-run-id baseline_v3_6x_evidence_package_dashboard_20260621T041731Z \
-  --output-dir /tmp/gotra_v3_6x_evidence_package_dashboard_20260621T041731Z/runs
+  --package-run-id baseline_v3_6x_evidence_package_dashboard_reviewfix_20260621T043048Z \
+  --output-dir /tmp/gotra_v3_6x_evidence_package_dashboard_reviewfix_20260621T043048Z/runs
 ```
 
 Output, not committed:
 
-`/tmp/gotra_v3_6x_evidence_package_dashboard_20260621T041731Z/runs/baseline_v3_6x_evidence_package_dashboard_20260621T041731Z/summary.json`
+`/tmp/gotra_v3_6x_evidence_package_dashboard_reviewfix_20260621T043048Z/runs/baseline_v3_6x_evidence_package_dashboard_reviewfix_20260621T043048Z/summary.json`
 
 Summary sha256:
 
-`37d313001dc5f585eaaf8589c41a3da76a6b1a6bc5ea8959c4391e3cf7a88a4f`
+`9548b0b3d5b38b1c0ced19146d84876252c8511f0cf03179d0a28d39f1f6a9c5`
 
 Summary status:
 
@@ -195,7 +205,7 @@ Results:
 
 - py_compile: pass
 - Ruff: pass
-- Focused tests: `4 passed`
+- Focused tests: `8 passed`
 - Related v3.6T/v3.6V regression set: `24 passed`
 - Full test suite: `390 passed`
 - `git diff --check`: pass

@@ -35,6 +35,12 @@ class SourceDocConfig:
 
 
 @dataclass(frozen=True)
+class SourceDocOverride:
+    doc_id: str
+    path: Path
+
+
+@dataclass(frozen=True)
 class DashboardConfig:
     package_run_id: str
     output_dir: Path
@@ -87,6 +93,13 @@ DEFAULT_SOURCE_DOCS = (
         ),
     ),
 )
+
+SOURCE_DOC_ALIASES = {
+    "v3_6s": "v3_6s_actual_maturity_monitor_result",
+    "v3_6t": "v3_6t_monitor_ops_result",
+    "v3_6u": "v3_6u_historical_internal_verdict",
+    "v3_6v": "v3_6v_short_horizon_prereg",
+}
 
 
 def parse_timestamp(value: str | None = None) -> datetime:
@@ -145,6 +158,38 @@ def source_doc_summary(doc: SourceDocConfig) -> dict[str, Any]:
         "missing_required_snippets": missing_snippets,
         "missing_required_snippet_count": len(missing_snippets),
     }
+
+
+def default_source_doc_by_id() -> dict[str, SourceDocConfig]:
+    return {doc.doc_id: doc for doc in DEFAULT_SOURCE_DOCS}
+
+
+def canonical_source_doc_id(doc_id: str) -> str:
+    return SOURCE_DOC_ALIASES.get(doc_id, doc_id)
+
+
+def source_docs_with_overrides(
+    defaults: tuple[SourceDocConfig, ...],
+    overrides: tuple[SourceDocOverride, ...],
+) -> tuple[SourceDocConfig, ...]:
+    by_id = {doc.doc_id: doc for doc in defaults}
+    override_by_id: dict[str, SourceDocOverride] = {}
+    for override in overrides:
+        if override.doc_id not in by_id:
+            raise ValueError(f"unknown source doc id: {override.doc_id}")
+        if override.doc_id in override_by_id:
+            raise ValueError(f"duplicate source doc override: {override.doc_id}")
+        override_by_id[override.doc_id] = override
+    return tuple(
+        SourceDocConfig(
+            doc_id=doc.doc_id,
+            path=override_by_id[doc.doc_id].path
+            if doc.doc_id in override_by_id
+            else doc.path,
+            required_snippets=doc.required_snippets,
+        )
+        for doc in defaults
+    )
 
 
 def can_say() -> list[str]:
@@ -299,14 +344,16 @@ def run_dashboard(config: DashboardConfig) -> dict[str, Any]:
     return summary
 
 
-def parse_source_doc_arg(value: str) -> SourceDocConfig:
+def parse_source_doc_arg(value: str) -> SourceDocOverride:
     if "=" not in value:
         raise argparse.ArgumentTypeError("--source-doc must be doc_id=path")
     doc_id, path = value.split("=", 1)
-    doc_id = doc_id.strip()
+    doc_id = canonical_source_doc_id(doc_id.strip())
     if not doc_id:
         raise argparse.ArgumentTypeError("source doc_id must not be empty")
-    return SourceDocConfig(doc_id=doc_id, path=Path(path))
+    if doc_id not in default_source_doc_by_id():
+        raise argparse.ArgumentTypeError(f"unknown source doc_id: {doc_id}")
+    return SourceDocOverride(doc_id=doc_id, path=Path(path))
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -328,15 +375,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-    source_docs = tuple(args.source_doc) if args.source_doc else DEFAULT_SOURCE_DOCS
-    config = DashboardConfig(
-        package_run_id=args.package_run_id,
-        output_dir=args.output_dir,
-        source_docs=source_docs,
-        allow_overwrite=args.allow_overwrite,
-    )
     try:
+        args = parse_args(argv)
+    except SystemExit as exc:
+        return int(exc.code) if isinstance(exc.code, int) else 2
+    try:
+        source_docs = source_docs_with_overrides(
+            DEFAULT_SOURCE_DOCS,
+            tuple(args.source_doc or ()),
+        )
+        config = DashboardConfig(
+            package_run_id=args.package_run_id,
+            output_dir=args.output_dir,
+            source_docs=source_docs,
+            allow_overwrite=args.allow_overwrite,
+        )
         summary = run_dashboard(config)
     except Exception as exc:
         print(f"evidence package dashboard failed: {exc}", file=sys.stderr)
