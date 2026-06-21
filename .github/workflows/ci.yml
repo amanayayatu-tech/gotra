@@ -18,6 +18,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           submodules: recursive
 
       - name: Set up Python
@@ -32,6 +33,18 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --frozen
+
+      - name: GOTRA changed-file boundary preflight
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
+          uv run python scripts/baseline_v3_6ag_ci_changed_files_preflight.py \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA" \
+            --output-root "$RUNNER_TEMP/gotra_v3_6ag_ci_changed_files_preflight"
 
       - name: Ruff
         run: uv run ruff check . --force-exclude
