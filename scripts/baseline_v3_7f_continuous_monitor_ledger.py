@@ -106,6 +106,7 @@ TEXT_SCAN_KEYS = {
     "verdict",
     "winner",
 }
+TEXT_SCAN_KEYS.update(STATUS_FIELDS)
 PATH_KEYS = {
     "path",
     "paths",
@@ -203,6 +204,21 @@ def int_value(value: Any) -> int | None:
     return None
 
 
+def parse_generated_at(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
 def extract_entries(payload: dict[str, Any], *, path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
     if "ledger_entries" in payload:
         raw_entries = payload.get("ledger_entries")
@@ -217,22 +233,30 @@ def extract_entries(payload: dict[str, Any], *, path: Path) -> tuple[list[dict[s
                 blockers.append(blocker(path, "ledger_entry_not_object", f"ledger_entries[{index}] must be an object"))
                 continue
             entries.append(dict(entry))
-        selected_index = select_latest_entry_index(entries)
+        selected_index = select_latest_entry_index(entries, path=path, blockers=blockers)
         return entries, blockers, selected_index
     if isinstance(payload.get("ledger"), dict):
-        return [dict(payload["ledger"])], [], 0
-    return [dict(payload)], [], 0
+        entries = [dict(payload["ledger"])]
+        blockers: list[dict[str, Any]] = []
+        return entries, blockers, select_latest_entry_index(entries, path=path, blockers=blockers)
+    entries = [dict(payload)]
+    blockers: list[dict[str, Any]] = []
+    return entries, blockers, select_latest_entry_index(entries, path=path, blockers=blockers)
 
 
-def select_latest_entry_index(entries: list[dict[str, Any]]) -> int:
+def select_latest_entry_index(entries: list[dict[str, Any]], *, path: Path, blockers: list[dict[str, Any]]) -> int:
     if not entries:
         return -1
-    candidates: list[tuple[tuple[str, str, str, int], int]] = []
+    candidates: list[tuple[tuple[datetime, str, str, int], int]] = []
     for index, entry in enumerate(entries):
+        generated_at = parse_generated_at(entry.get("generated_at"))
+        if generated_at is None:
+            blockers.append(blocker(f"{path}#ledger_entries[{index}]", "generated_at_invalid", "generated_at must be an ISO timestamp"))
+            continue
         candidates.append(
             (
                 (
-                    str(entry.get("generated_at", "")),
+                    generated_at,
                     str(entry.get("main_commit", "")),
                     str(entry.get("latest_merged_pr_commit", "")),
                     -index,
@@ -240,6 +264,8 @@ def select_latest_entry_index(entries: list[dict[str, Any]]) -> int:
                 index,
             )
         )
+    if not candidates:
+        return -1
     return max(candidates, key=lambda item: item[0])[1]
 
 
@@ -297,11 +323,13 @@ def list_value(entry: dict[str, Any], key: str, *, path: Path) -> list[Any] | No
     return value
 
 
-def validate_selected_entry(entry: dict[str, Any], *, path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def validate_ledger_entry(entry: dict[str, Any], *, path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     schema_blockers: list[dict[str, Any]] = []
     for key in REQUIRED_STRING_FIELDS:
         if not is_non_empty_string(entry.get(key)):
             schema_blockers.append(blocker(path, f"missing_{key}", f"{key} is required"))
+    if parse_generated_at(entry.get("generated_at")) is None:
+        schema_blockers.append(blocker(path, "generated_at_invalid", "generated_at must be an ISO timestamp"))
     for key in REQUIRED_INT_FIELDS:
         value = int_value(entry.get(key))
         if value is None or value < 0:
@@ -310,6 +338,7 @@ def validate_selected_entry(entry: dict[str, Any], *, path: Path) -> tuple[dict[
         if list_value(entry, key, path=path) is None:
             schema_blockers.append(blocker(path, f"{key}_not_list", f"{key} must be a list"))
 
+    source_refs: list[str] = []
     source_documents = entry.get("source_documents")
     source_summaries = entry.get("source_summaries")
     if not isinstance(source_documents, list) and not isinstance(source_summaries, list):
@@ -321,8 +350,22 @@ def validate_selected_entry(entry: dict[str, Any], *, path: Path) -> tuple[dict[
             )
         )
     for key in ("source_documents", "source_summaries"):
-        if key in entry and not all(is_non_empty_string(item) for item in entry.get(key, [])):
-            schema_blockers.append(blocker(path, f"{key}_invalid", f"{key} entries must be non-empty strings"))
+        if key in entry:
+            value = entry.get(key)
+            if not isinstance(value, list):
+                schema_blockers.append(blocker(path, f"{key}_not_list", f"{key} must be a list"))
+                continue
+            if not all(is_non_empty_string(item) for item in value):
+                schema_blockers.append(blocker(path, f"{key}_invalid", f"{key} entries must be non-empty strings"))
+            source_refs.extend(str(item) for item in value if is_non_empty_string(item))
+    if not source_refs:
+        schema_blockers.append(
+            blocker(
+                path,
+                "missing_non_empty_source_reference",
+                "ledger must include at least one non-empty source document or source summary reference",
+            )
+        )
 
     for flag in FALSE_FLAGS:
         if entry.get(flag) is not False:
@@ -438,8 +481,14 @@ def build_summary(config: LedgerConfig) -> dict[str, Any]:
         artifacts = path_blockers(payload, path=config.ledger_fixture)
         entries, entry_schema_blockers, selected_index = extract_entries(payload, path=config.ledger_fixture)
         selected_entry = entries[selected_index] if 0 <= selected_index < len(entries) else {}
-        ledger, selected_schema_blockers = validate_selected_entry(selected_entry, path=config.ledger_fixture) if selected_entry else ({}, [])
-        schemas = entry_schema_blockers + selected_schema_blockers
+        normalized_entries: list[dict[str, Any]] = []
+        all_entry_schema_blockers: list[dict[str, Any]] = []
+        for index, entry in enumerate(entries):
+            normalized_entry, schema_blockers = validate_ledger_entry(entry, path=Path(f"{config.ledger_fixture}#ledger_entries[{index}]"))
+            normalized_entries.append(normalized_entry)
+            all_entry_schema_blockers.extend(schema_blockers)
+        ledger = normalized_entries[selected_index] if 0 <= selected_index < len(normalized_entries) else {}
+        schemas = entry_schema_blockers + all_entry_schema_blockers
         if not selected_entry and not entry_schema_blockers:
             schemas.append(blocker(config.ledger_fixture, "missing_selected_ledger_entry", "no ledger entry was available for selection"))
         overclaims = claim_blockers(payload, path=config.ledger_fixture) if not artifacts else []

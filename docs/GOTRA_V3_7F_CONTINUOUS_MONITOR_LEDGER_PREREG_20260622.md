@@ -105,6 +105,7 @@ runtime artifact paths are blocked by the path guard.
 The command blocks:
 
 - malformed fixture roots or malformed `ledger_entries`
+- malformed or non-ISO `generated_at` timestamps
 - missing required ledger fields
 - non-negative integer fields with invalid values
 - provider, Codex CLI new-call, formal-lite, actual executable, or actual
@@ -113,10 +114,17 @@ The command blocks:
 - actual 30D `next_check_after` mismatch
 - evidence layer mismatch
 - missing source documents/summaries
+- empty source document/summary lists
 - forbidden source, raw, transcript, or artifact paths
 - claim-boundary overreach in ledger text
+- claim-boundary overreach in status fields
 - direct-LLM clean-baseline wording
 - wording that presents short-horizon/dashboard status as actual 30D verdict
+
+Append/index ledgers validate every object entry before the index is considered
+clean. A malformed historical entry, disallowed runtime flag, forbidden path, or
+claim-boundary issue anywhere in the index blocks the ledger. Latest entry
+selection uses parsed timestamps, not string ordering.
 
 ## Status Values
 

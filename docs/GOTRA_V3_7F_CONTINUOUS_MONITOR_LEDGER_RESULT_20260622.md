@@ -77,22 +77,35 @@ Short-horizon/canary/dashboard information can appear only as
 engineering/internal status. It cannot set `v3_7_actual_verdict_executable=true`
 while actual 30D readiness is `DATA_NOT_MATURED`.
 
+## Review Hardening
+
+This repair hardens the active P2 review items:
+
+- required status fields are included in claim-boundary scanning, so status
+  wording cannot present short-horizon status as actual 30D verdict readiness
+- `source_documents` or `source_summaries` must contain at least one non-empty
+  reference
+- append/index ledgers validate every object entry before returning a clean
+  summary, including historical entries that are not selected as latest
+- `generated_at` is parsed as an ISO timestamp before latest selection; malformed
+  timestamps are `BLOCKED_SCHEMA`
+
 ## Local Mock Validation
 
 Run id:
-`baseline_v3_7f_continuous_monitor_ledger_validation_20260621T174526Z`
+`baseline_v3_7f_continuous_monitor_ledger_repair_validation_20260622T001907Z`
 
 Summary path:
-`/tmp/gotra_v3_7f_continuous_monitor_ledger_validation_20260621T174526Z/runs/baseline_v3_7f_continuous_monitor_ledger_validation_20260621T174526Z/summary.json`
+`/tmp/gotra_v3_7f_continuous_monitor_ledger_repair_20260622T001907Z/runs/baseline_v3_7f_continuous_monitor_ledger_repair_validation_20260622T001907Z/summary.json`
 
 Summary sha256:
-`c15bec178ca06032284d9477832b26f5ba45e5c8abc7bf363c6a972bada698cf`
+`78fde94e14e9e706a2bec737db51ca8061f5b1439a5a32f5c769d952797a5d4e`
 
 Digest manifest path:
-`/tmp/gotra_v3_7f_continuous_monitor_ledger_validation_20260621T174526Z/runs/baseline_v3_7f_continuous_monitor_ledger_validation_20260621T174526Z/manifest.json`
+`/tmp/gotra_v3_7f_continuous_monitor_ledger_repair_20260622T001907Z/runs/baseline_v3_7f_continuous_monitor_ledger_repair_validation_20260622T001907Z/manifest.json`
 
 Digest manifest sha256:
-`d65a3dfc0da2aa986bbab8e994dda3b4cf8abd8cb1cce89681a998d5d4ae8733`
+`97f2e75a90cac891e2022b952bff1ac3876912743bb447204a5d2a9daf4001a4`
 
 Summary status:
 
@@ -131,6 +144,10 @@ Focused tests cover:
 - final `summary.json` digest is verifiable through `manifest.json`
 - append/index `ledger_entries` latest selection is deterministic
 - non-object ledger entries -> `BLOCKED_SCHEMA`
+- status-field maturity overclaim wording -> `BLOCKED_OVERCLAIM`
+- empty source references -> `BLOCKED_SCHEMA`
+- invalid historical ledger entry in an index -> `BLOCKED_SCHEMA`
+- malformed `generated_at` timestamp -> `BLOCKED_SCHEMA`
 - blocked ledgers exit nonzero
 
 ## Local Validation
@@ -143,8 +160,8 @@ uv run ruff check --no-cache scripts/baseline_v3_7f_continuous_monitor_ledger.py
 uv run pytest -q tests/test_v3_7f_continuous_monitor_ledger.py
 uv run pytest -q tests/test_v3_7a_fixture_verdict_harness_dry_run.py tests/test_v3_7b_verdict_report_schema_validator.py tests/test_v3_7c_bootstrap_hac_eligibility_preflight.py tests/test_v3_7d_short_horizon_canary_maturity_recheck.py tests/test_v3_7e_evidence_dashboard_hardening.py tests/test_v3_7f_continuous_monitor_ledger.py tests/test_ksana_packet_v2_front_half_optimization.py tests/test_forward_live_v3_7_entry_decision.py tests/test_forward_live_verdict_readiness_gate.py tests/test_evidence_claim_boundary_scanner.py
 uv run python scripts/baseline_v3_6ab_evidence_claim_boundary_scanner.py \
-  --scan-run-id baseline_v3_6ab_evidence_claim_boundary_scan_v3_7f_docs_20260621T174658Z \
-  --output-dir /tmp/gotra_v3_7f_claim_scan_20260621T174658Z/runs \
+  --scan-run-id baseline_v3_6ab_evidence_claim_boundary_scan_v3_7f_docs_repair_20260622T002013Z \
+  --output-dir /tmp/gotra_v3_7f_claim_scan_repair_20260622T002013Z/runs \
   --file docs/GOTRA_V3_7F_CONTINUOUS_MONITOR_LEDGER_PREREG_20260622.md \
   --file docs/GOTRA_V3_7F_CONTINUOUS_MONITOR_LEDGER_RESULT_20260622.md \
   --allow-overwrite
@@ -155,17 +172,17 @@ Results:
 
 - py_compile: pass
 - Ruff: pass
-- Focused v3.7F tests: `12 passed`
+- Focused v3.7F tests: `16 passed`
 - Relevant v3.7A / v3.7B / v3.7C / v3.7D / v3.7E / v3.7K /
-  v3.7 entry / v3.6 readiness / claim-boundary regression tests: `153 passed`
+  v3.7 entry / v3.6 readiness / claim-boundary regression tests: `157 passed`
 - v3.7F docs claim-boundary scan: `CLAIM_BOUNDARY_CLEAN`
   - summary path:
-    `/tmp/gotra_v3_7f_claim_scan_20260621T174658Z/runs/baseline_v3_6ab_evidence_claim_boundary_scan_v3_7f_docs_20260621T174658Z/summary.json`
+    `/tmp/gotra_v3_7f_claim_scan_repair_20260622T002013Z/runs/baseline_v3_6ab_evidence_claim_boundary_scan_v3_7f_docs_repair_20260622T002013Z/summary.json`
   - summary sha256:
-    `0054ff8629926580b91c4bbde243d0a4334eacf50cea4c563ae55964f01f72d0`
+    `bfbd691320534bc6aa8510bda657419f66d9c547670a45d5104819bcfc25a468`
   - manifest sha256:
-    `4a1522d734ac55a0329b474f8bec08bfa856216ce7c03afea874366bc1e5312c`
-- Full test suite: `712 passed`
+    `b82449907451213c6943d0f3b072ad43abf7b1d356d7e8679bbf9438666bfb8c`
+- Full test suite: `716 passed`
 
 ## Artifact Boundary
 

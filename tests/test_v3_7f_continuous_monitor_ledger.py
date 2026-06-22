@@ -55,6 +55,28 @@ def test_short_horizon_and_dashboard_status_do_not_authorize_actual_verdict(tmp_
     assert summary["v3_7_actual_verdict_executable"] is False
 
 
+def test_status_fields_are_scanned_for_maturity_gate_overclaim(tmp_path: Path) -> None:
+    payload = _valid_ledger(
+        short_horizon_status="short-horizon is equivalent to v3.7 30D verdict ready",
+    )
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = ledger.build_summary(_config(tmp_path, fixture))
+
+    assert summary["ledger_status"] == ledger.STATUS_BLOCKED_OVERCLAIM
+    assert summary["overclaim_blocker_count"] > 0
+
+
+def test_empty_source_document_list_blocks_schema(tmp_path: Path) -> None:
+    payload = _valid_ledger(source_documents=[])
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = ledger.build_summary(_config(tmp_path, fixture))
+
+    assert summary["ledger_status"] == ledger.STATUS_BLOCKED_SCHEMA
+    assert "missing_non_empty_source_reference" in summary["blocker_reasons"]
+
+
 def test_provider_codex_formal_true_flags_block_schema(tmp_path: Path) -> None:
     for flag in ("provider_or_backend_called", "codex_cli_new_call", "formal_lite_entered"):
         payload = _valid_ledger(**{flag: True})
@@ -116,6 +138,29 @@ def test_ledger_entries_select_latest_deterministically(tmp_path: Path) -> None:
     assert summary["main_commit"] == "newer"
     assert summary["selected_ledger_entry_index"] == 0
     assert summary["ledger_entry_count"] == 2
+
+
+def test_ledger_entries_validate_older_entries_too(tmp_path: Path) -> None:
+    older = _valid_ledger(generated_at="2026-06-21T00:00:00Z", provider_or_backend_called=True)
+    newer = _valid_ledger(generated_at="2026-06-22T00:00:00Z")
+    fixture = _write_fixture(tmp_path, {"ledger_entries": [newer, older]})
+
+    summary = ledger.build_summary(_config(tmp_path, fixture))
+
+    assert summary["ledger_status"] == ledger.STATUS_BLOCKED_SCHEMA
+    assert "provider_or_backend_called_not_false" in summary["blocker_reasons"]
+
+
+def test_ledger_entries_reject_invalid_generated_at_before_latest_selection(tmp_path: Path) -> None:
+    valid = _valid_ledger(generated_at="2026-06-22T00:00:00Z", main_commit="valid")
+    invalid = _valid_ledger(generated_at="zzzz", main_commit="invalid")
+    fixture = _write_fixture(tmp_path, {"ledger_entries": [valid, invalid]})
+
+    summary = ledger.build_summary(_config(tmp_path, fixture))
+
+    assert summary["ledger_status"] == ledger.STATUS_BLOCKED_SCHEMA
+    assert "generated_at_invalid" in summary["blocker_reasons"]
+    assert summary["main_commit"] == "valid"
 
 
 def test_ledger_entries_reject_non_object_entries(tmp_path: Path) -> None:
