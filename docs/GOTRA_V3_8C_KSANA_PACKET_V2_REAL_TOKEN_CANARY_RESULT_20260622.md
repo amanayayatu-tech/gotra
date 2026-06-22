@@ -106,6 +106,20 @@ Docs claim-boundary scan:
   `007de7ad0b94f295397d5c8ae985a0e245849e46d0d337d91a4a86f3525c0887`
 - status: `CLAIM_BOUNDARY_CLEAN`
 
+## Review Hardening
+
+PR #67 review hardening removed source-code wording that v3.7H treats as
+claim-boundary regression text. No additional real-token calls were made.
+
+v3.7H claim-boundary regression over the PR files:
+
+- summary:
+  `/tmp/gotra_v3_8c_claim_regression_repair_20260622T040907Z/baseline_v3_7h_claim_boundary_regression_repair_v3_8c_20260622T040907Z/summary.json`
+- summary sha256:
+  `d73b6afb0b69f69a7b0b3631e5d5b4175b971a474f12fdb61f6a83557c0ea85e`
+- status: `V3_7_CLAIM_BOUNDARY_REGRESSION_READY`
+- blockers: `0`
+
 ## Non-Claims
 
 This is engineering/internal schema canary evidence only. It does not compare

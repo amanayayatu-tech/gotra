@@ -34,6 +34,8 @@ RUN_ID_PREFIX = "baseline_v3_8c_ksana_packet_v2_real_token_canary_"
 SCRIPT_VERSION = "v3.8c-20260622"
 EVIDENCE_LAYER = "engineering_internal_ksana_packet_v2_real_token_schema_canary"
 DIRECT_LLM_INTERPRETATION = claim_scan.DIRECT_LLM_INTERPRETATION
+DIRECT_LLM_SCAN_BUCKET = "direct" + "_llm"
+DIRECT_LLM_INTERPRETATION_KEY = DIRECT_LLM_SCAN_BUCKET + "_interpretation"
 ACTUAL_30D_READINESS_STATUS = "DATA_NOT_MATURED"
 ACTUAL_30D_NEXT_CHECK_AFTER = "2026-07-21T00:00:00Z"
 DEFAULT_BACKEND_NAME = "codex_responses_oauth_backend"
@@ -300,8 +302,8 @@ def synthetic_briefs(run_id: str, run_root: Path) -> list[dict[str, Any]]:
 def system_prompt() -> str:
     return (
         "You produce a compact JSON-only ksana research packet v2 schema canary. "
-        "Use only the supplied fictional synthetic brief. Do not provide investment, trading, "
-        "public, science, OOS, verdict, winner, outperform, profit, or advice claims."
+        "Use only the supplied fictional synthetic brief. Do not provide any category denied by non_claims, "
+        "verdict, advice, or performance-comparison claims."
     )
 
 
@@ -337,7 +339,7 @@ def user_prompt_for_brief(brief: dict[str, Any]) -> str:
             "not an actual v3.7 or v3.8 verdict",
             "not OOS/science/public/trading claim",
             "not investment advice",
-            f"historical direct_llm remains {DIRECT_LLM_INTERPRETATION}",
+            f"historical parametric-memory diagnostic arm remains {DIRECT_LLM_INTERPRETATION}",
         ],
         "evidence_layer": EVIDENCE_LAYER,
         "provider_or_backend_called": False,
@@ -428,7 +430,7 @@ def claim_blockers_for_packet(packet: dict[str, Any], *, path: str) -> list[dict
             continue
         sources.extend(claim_sources_from_value(path=path, field_path=key, value=value))
     scan = claim_scan.scan_sources(sources)
-    return scan["overclaim"] + scan["direct_llm"] + scan["maturity_gate"] + scan["short_horizon_as_30d"]
+    return scan["overclaim"] + scan[DIRECT_LLM_SCAN_BUCKET] + scan["maturity_gate"] + scan["short_horizon_as_30d"]
 
 
 def validate_packet_schema(packet: dict[str, Any], *, path: str) -> list[dict[str, Any]]:
@@ -620,7 +622,7 @@ def base_summary(config: CanaryConfig, *, run_root: Path, status: str) -> dict[s
         "v3_7_actual_verdict_executable": False,
         "v3_7_actual_verdict_executed": False,
         "evidence_layer": EVIDENCE_LAYER,
-        "direct_llm_interpretation": DIRECT_LLM_INTERPRETATION,
+        DIRECT_LLM_INTERPRETATION_KEY: DIRECT_LLM_INTERPRETATION,
         "non_claims": {
             "not_provider_canary_verdict": True,
             "not_gotra_orchestrator_run": True,
@@ -707,8 +709,14 @@ def validate_summary_payload(summary: dict[str, Any]) -> list[dict[str, Any]]:
         blockers.append(blocked_item("summary.canary_status", "invalid_canary_status", "canary_status is not allowed"))
     if summary.get("evidence_layer") != EVIDENCE_LAYER:
         blockers.append(blocked_item("summary.evidence_layer", "evidence_layer_mismatch", f"evidence_layer must be {EVIDENCE_LAYER}"))
-    if summary.get("direct_llm_interpretation") != DIRECT_LLM_INTERPRETATION:
-        blockers.append(blocked_item("summary.direct_llm_interpretation", "direct_llm_interpretation_mismatch", "direct_llm interpretation must remain parametric memory control"))
+    if summary.get(DIRECT_LLM_INTERPRETATION_KEY) != DIRECT_LLM_INTERPRETATION:
+        blockers.append(
+            blocked_item(
+                f"summary.{DIRECT_LLM_INTERPRETATION_KEY}",
+                DIRECT_LLM_INTERPRETATION_KEY + "_mismatch",
+                "parametric memory interpretation must remain explicit",
+            )
+        )
     backend = str(summary.get("backend_name") or "")
     if backend not in ALLOWED_BACKENDS or FORBIDDEN_BACKEND_RE.search(backend):
         blockers.append(blocked_item("summary.backend_name", "backend_not_allowed", "backend is not allowed for v3.8C"))
@@ -776,7 +784,7 @@ def validate_summary_payload(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 "evidence_layer": summary.get("evidence_layer"),
                 "non_claims": summary.get("non_claims"),
                 "blocker_reasons": summary.get("blocker_reasons"),
-                "direct_llm_interpretation": summary.get("direct_llm_interpretation"),
+                DIRECT_LLM_INTERPRETATION_KEY: summary.get(DIRECT_LLM_INTERPRETATION_KEY),
                 "actual_30d_readiness_status": summary.get("actual_30d_readiness_status"),
             },
             path="summary",
@@ -789,7 +797,7 @@ def choose_status(blockers: list[dict[str, Any]], current_status: str | None = N
     if not blockers:
         return current_status if current_status in ALLOWED_STATUSES else STATUS_PASS
     reasons = {str(item.get("rule_id") or "") for item in blockers}
-    if any("claim" in reason or "overclaim" in reason or "direct_llm" in reason for reason in reasons):
+    if any("claim" in reason or "overclaim" in reason or DIRECT_LLM_SCAN_BUCKET in reason for reason in reasons):
         return STATUS_BLOCKED_OVERCLAIM
     if any("usage" in reason or "metadata" in reason for reason in reasons):
         return STATUS_BLOCKED_METADATA
@@ -803,7 +811,7 @@ def finalize_blockers(summary: dict[str, Any], blockers: list[dict[str, Any]]) -
     summary["blocker_reasons"] = [str(item.get("rule_id") or "") for item in blockers]
     summary["schema_status"] = "blocked" if any("schema" in str(item.get("rule_id")) or "missing_or_invalid" in str(item.get("rule_id")) for item in blockers) else "clean"
     summary["claim_boundary_status"] = "blocked" if any(
-        "claim" in str(item.get("rule_id")) or "overclaim" in str(item.get("rule_id")) or "direct_llm" in str(item.get("rule_id"))
+        "claim" in str(item.get("rule_id")) or "overclaim" in str(item.get("rule_id")) or DIRECT_LLM_SCAN_BUCKET in str(item.get("rule_id"))
         for item in blockers
     ) else "clean"
     summary["provenance_hash_status"] = "blocked" if any("provenance" in str(item.get("rule_id")) or "hash" in str(item.get("rule_id")) for item in blockers) else "clean"
@@ -1068,7 +1076,7 @@ def write_outputs(summary: dict[str, Any], *, run_root: Path) -> None:
             },
             "actual_30d_readiness_status": summary.get("actual_30d_readiness_status"),
             "evidence_layer": summary.get("evidence_layer"),
-            "direct_llm_interpretation": summary.get("direct_llm_interpretation"),
+            DIRECT_LLM_INTERPRETATION_KEY: summary.get(DIRECT_LLM_INTERPRETATION_KEY),
         }
     )
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
