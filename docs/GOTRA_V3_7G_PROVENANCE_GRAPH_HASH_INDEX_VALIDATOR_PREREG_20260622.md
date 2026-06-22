@@ -35,6 +35,7 @@ Graph root fields include:
 - `actual_30d_next_check_after`
 - `v3_7_actual_verdict_executable=false`
 - `v3_7_actual_verdict_executed=false`
+- `actual_30d_verdict_executed=false`
 - `provider_or_backend_called=false`
 - `codex_cli_new_call=false`
 - `codex_cli_called=false`
@@ -58,6 +59,17 @@ Each node must include:
 - nested `provenance.source_artifact_path`
 - nested `provenance.source_sha256` or `provenance.summary_sha256`
 - runtime flags set to false
+- verdict executable/executed flags set to false
+
+Nested provenance objects must also explicitly include these boundary fields:
+
+- `provider_or_backend_called=false`
+- `codex_cli_new_call=false`
+- `codex_cli_called=false`
+- `formal_lite_entered=false`
+- `v3_7_actual_verdict_executable=false`
+- `v3_7_actual_verdict_executed=false`
+- `actual_30d_verdict_executed=false`
 
 Each edge must include:
 
@@ -85,7 +97,9 @@ The validator blocks on:
 - missing artifact hash
 - hash mismatch against readable local fixture bytes
 - forbidden or raw source paths
+- forbidden source paths are blocked before any hash read
 - missing nested provenance
+- missing explicit boundary flags at root, node, or provenance object level
 - invalid `generated_at`
 - duplicate `node_id`
 - edge references to missing nodes
@@ -93,13 +107,16 @@ The validator blocks on:
 - required source nodes that cannot reach a terminal derived node
 - evidence layer outside the allowed engineering/internal set
 - runtime flags set to true
+- status-like fields containing actual verdict or readiness wording
 - claim-boundary overreach
 - short-horizon/canary evidence being upgraded to 30D verdict
 - actual verdict executable or executed flags set to true
 
 ## Digest Convention
 
-The final `summary.json` is written first. Its sha256 is stored in `manifest.json` as `summary_sha256`. The summary also includes a stable `graph_content_sha256` over the normalized graph content; that digest is independent of output directory and run id.
+The final `summary.json` is written first. Its sha256 is stored in `manifest.json` as `summary_sha256`. The summary also includes a stable `graph_content_sha256` over the full fixture graph content, including boundary-critical root fields such as runtime flags, verdict flags, and `direct_llm_interpretation`; that digest is independent of output directory and run id.
+
+Path-boundary scanning includes common graph path fields such as `source_path`, `source_artifact_path`, `artifact_path`, `artifact_paths`, `input_artifact_path`, `input_artifact_paths`, `output_artifact_path`, `raw_artifact_path`, `transcript_path`, and manifest/summary path fields.
 
 ## Evidence Layer
 

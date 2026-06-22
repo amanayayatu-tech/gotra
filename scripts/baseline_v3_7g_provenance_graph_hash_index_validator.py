@@ -87,7 +87,15 @@ TEXT_SCAN_KEYS = {
     "winner",
 }
 PATH_KEYS = {
+    "artifact_manifest_path",
+    "artifact_path",
+    "artifact_paths",
+    "hash_index_path",
+    "input_artifact_path",
+    "input_artifact_paths",
     "manifest_path",
+    "output_artifact_path",
+    "output_artifact_paths",
     "path",
     "paths",
     "raw_artifact_path",
@@ -102,6 +110,16 @@ PATH_KEYS = {
     "summary_path",
     "transcript_path",
 }
+STATUS_OVERCLAIM_PATTERNS = (
+    (
+        "ready_for_forward_live_verdict_status",
+        re.compile(r"\bREADY_FOR_FORWARD_LIVE_VERDICT\b", re.IGNORECASE),
+    ),
+    (
+        "actual_verdict_executable_status",
+        re.compile(r"\b(actual\s+)?(?:30D\s+)?(?:v3[._-]?7\s+)?verdict\b.{0,50}\b(executable|executed|ready|allowed|pass)\b", re.IGNORECASE),
+    ),
+)
 REQUIRED_NODE_FIELDS = (
     "node_id",
     "source_path",
@@ -233,7 +251,7 @@ def resolve_source_file(path_value: str, *, fixture_path: Path) -> Path:
 def recursive_sources(value: Any, *, path: str, key_hint: str = "") -> list[claim_scan.ScanSource]:
     sources: list[claim_scan.ScanSource] = []
     if isinstance(value, str):
-        if key_hint in TEXT_SCAN_KEYS or not key_hint:
+        if is_claim_scan_key(key_hint) or not key_hint:
             sources.append(claim_scan.ScanSource(path=path, text=value, origin="v3_7g_graph"))
     elif isinstance(value, dict):
         for key, item in sorted(value.items()):
@@ -242,6 +260,21 @@ def recursive_sources(value: Any, *, path: str, key_hint: str = "") -> list[clai
         for index, item in enumerate(value):
             sources.extend(recursive_sources(item, path=f"{path}[{index}]", key_hint=key_hint))
     return sources
+
+
+def is_claim_scan_key(key: str) -> bool:
+    return (
+        key in TEXT_SCAN_KEYS
+        or key.endswith("_status")
+        or key
+        in {
+            "actual_30d_readiness_status",
+            "readiness_status",
+            "status",
+            "verdict_status",
+            "v3_7_actual_verdict_status",
+        }
+    )
 
 
 def recursive_paths(value: Any, *, key_hint: str = "") -> list[str]:
@@ -259,7 +292,36 @@ def recursive_paths(value: Any, *, key_hint: str = "") -> list[str]:
 
 def claim_blockers(payload: dict[str, Any], *, path: Path) -> list[dict[str, Any]]:
     scan = claim_scan.scan_sources(recursive_sources(payload, path=normalize_path(path)))
-    return scan["overclaim"] + scan["direct_llm"] + scan["maturity_gate"] + scan["short_horizon_as_30d"]
+    return (
+        scan["overclaim"]
+        + scan["direct_llm"]
+        + scan["maturity_gate"]
+        + scan["short_horizon_as_30d"]
+        + status_text_blockers(payload, path=normalize_path(path))
+    )
+
+
+def status_text_blockers(value: Any, *, path: str, key_hint: str = "") -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    if isinstance(value, str):
+        if is_claim_scan_key(key_hint):
+            for rule_id, pattern in STATUS_OVERCLAIM_PATTERNS:
+                if pattern.search(value):
+                    blockers.append(
+                        {
+                            "path": path,
+                            "line_number": 0,
+                            "rule_id": rule_id,
+                            "reason": "status-like field cannot assert readiness or actual verdict execution",
+                        }
+                    )
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            blockers.extend(status_text_blockers(item, path=f"{path}.{key}", key_hint=key))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            blockers.extend(status_text_blockers(item, path=f"{path}[{index}]", key_hint=key_hint))
+    return blockers
 
 
 def path_blockers(payload: dict[str, Any], *, path: Path) -> list[dict[str, Any]]:
@@ -288,8 +350,19 @@ def runtime_and_verdict_flag_blockers(value: Any, *, path: str = "$") -> list[di
     return blockers
 
 
+def required_false_flag_blockers(value: dict[str, Any], *, path: Path | str, required_flags: tuple[str, ...]) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    for flag in required_flags:
+        if flag not in value:
+            blockers.append(blocker(path, f"missing_{flag}", f"{flag} must be explicitly present and false"))
+        elif value.get(flag) is not False:
+            blockers.append(blocker(path, f"{flag}_not_false", f"{flag} must be false"))
+    return blockers
+
+
 def validate_root(payload: dict[str, Any], *, path: Path) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
+    blockers.extend(required_false_flag_blockers(payload, path=path, required_flags=FALSE_RUNTIME_FLAGS + FALSE_VERDICT_FLAGS))
     if payload.get("graph_schema_version") != GRAPH_SCHEMA_VERSION:
         blockers.append(blocker(path, "graph_schema_version_mismatch", f"graph_schema_version must be {GRAPH_SCHEMA_VERSION}"))
     if parse_generated_at(payload.get("generated_at")) is None:
@@ -346,7 +419,9 @@ def validate_node(
         schema_blockers.append(blocker(path, "node_evidence_layer_not_allowed", "node evidence_layer is not allowed for v3.7G graph validation"))
 
     provenance = node.get("provenance") if isinstance(node.get("provenance"), dict) else {}
+    schema_blockers.extend(required_false_flag_blockers(node, path=path, required_flags=FALSE_RUNTIME_FLAGS + FALSE_VERDICT_FLAGS))
     if provenance:
+        provenance_blockers.extend(required_false_flag_blockers(provenance, path=f"{path}.provenance", required_flags=FALSE_RUNTIME_FLAGS + FALSE_VERDICT_FLAGS))
         if not is_non_empty_string(provenance.get("source_run_id")):
             provenance_blockers.append(blocker(path, "missing_provenance_source_run_id", "provenance.source_run_id is required"))
         if not is_non_empty_string(provenance.get("source_artifact_path")):
@@ -361,7 +436,17 @@ def validate_node(
         if is_non_empty_string(node.get("source_path")) and provenance.get("source_artifact_path") != node.get("source_path"):
             provenance_blockers.append(blocker(path, "node_source_path_provenance_mismatch", "node source_path must match provenance.source_artifact_path"))
 
-    if is_non_empty_string(node.get("source_path")) and hash_is_valid(node_hash_value):
+    source_path_forbidden = bool(is_non_empty_string(node.get("source_path")) and claim_scan.forbidden_path(str(node.get("source_path"))))
+    provenance_path_forbidden = bool(
+        is_non_empty_string(provenance.get("source_artifact_path"))
+        and claim_scan.forbidden_path(str(provenance.get("source_artifact_path")))
+    )
+    if (
+        is_non_empty_string(node.get("source_path"))
+        and hash_is_valid(node_hash_value)
+        and not source_path_forbidden
+        and not provenance_path_forbidden
+    ):
         source_file = resolve_source_file(str(node["source_path"]), fixture_path=fixture_path)
         if not source_file.exists() or not source_file.is_file():
             provenance_blockers.append(blocker(path, "source_path_not_readable", "node source_path must point to a readable file for hash validation"))
@@ -636,17 +721,7 @@ def build_summary(config: GraphConfig) -> dict[str, Any]:
             unreachable = unreachable_source_blockers(payload, nodes=nodes, edges=edges, fixture_path=config.graph_fixture)
             provenance_blockers.extend(unreachable)
             reachable_required_source_count = max(0, required_source_count - len(unreachable))
-        graph_content_sha256 = stable_sha256_json(
-            {
-                "graph_schema_version": payload.get("graph_schema_version"),
-                "required_source_node_ids": payload.get("required_source_node_ids", []),
-                "nodes": raw_nodes,
-                "edges": raw_edges,
-                "actual_30d_readiness_status": payload.get("actual_30d_readiness_status"),
-                "actual_30d_next_check_after": payload.get("actual_30d_next_check_after"),
-                "evidence_layer": payload.get("evidence_layer"),
-            }
-        )
+        graph_content_sha256 = stable_sha256_json(payload)
     except GraphError as exc:
         if exc.status == STATUS_BLOCKED_ARTIFACT_BOUNDARY:
             artifact_blockers = [blocker(exc.path or config.graph_fixture, exc.rule_id, exc.reason)]

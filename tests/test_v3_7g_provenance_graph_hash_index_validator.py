@@ -62,6 +62,29 @@ def test_forbidden_raw_path_blocks_artifact_boundary(tmp_path: Path) -> None:
     assert "forbidden_graph_artifact_path" in summary["blocker_reasons"]
 
 
+def test_forbidden_existing_source_path_blocks_without_hash_read(tmp_path: Path, monkeypatch) -> None:
+    payload = _valid_graph(tmp_path)
+    forbidden = tmp_path / "data" / "backtest" / "runs" / "raw_summary.json"
+    forbidden.parent.mkdir(parents=True)
+    forbidden.write_text("raw provider output should not be read\n", encoding="utf-8")
+    payload["nodes"][0]["source_path"] = "data/backtest/runs/raw_summary.json"
+    payload["nodes"][0]["source_sha256"] = "0" * 64
+    payload["nodes"][0]["provenance"]["source_artifact_path"] = "data/backtest/runs/raw_summary.json"
+    payload["nodes"][0]["provenance"]["source_sha256"] = "0" * 64
+    fixture = _write_graph_fixture(tmp_path, payload)
+
+    def fail_on_hash_read(path: Path) -> str:
+        if "data/backtest/runs" in str(path):
+            raise AssertionError("forbidden source path was read for hashing")
+        return "1" * 64
+
+    monkeypatch.setattr(graph, "sha256_file", fail_on_hash_read)
+    summary = graph.build_summary(_config(tmp_path, fixture))
+
+    assert summary["validator_status"] == graph.STATUS_BLOCKED_ARTIFACT_BOUNDARY
+    assert "forbidden_graph_artifact_path" in summary["blocker_reasons"]
+
+
 def test_invalid_generated_at_blocks_schema(tmp_path: Path) -> None:
     payload = _valid_graph(tmp_path, generated_at="zzzz")
     fixture = _write_graph_fixture(tmp_path, payload)
@@ -123,6 +146,39 @@ def test_runtime_flags_true_block_boundary(tmp_path: Path) -> None:
     assert "provider_or_backend_called_not_false" in summary["blocker_reasons"]
 
 
+def test_missing_root_runtime_flag_blocks_schema(tmp_path: Path) -> None:
+    payload = _valid_graph(tmp_path)
+    payload.pop("provider_or_backend_called")
+    fixture = _write_graph_fixture(tmp_path, payload)
+
+    summary = graph.build_summary(_config(tmp_path, fixture))
+
+    assert summary["validator_status"] == graph.STATUS_BLOCKED_SCHEMA
+    assert "missing_provider_or_backend_called" in summary["blocker_reasons"]
+
+
+def test_missing_node_runtime_flag_blocks_schema(tmp_path: Path) -> None:
+    payload = _valid_graph(tmp_path)
+    payload["nodes"][0].pop("formal_lite_entered")
+    fixture = _write_graph_fixture(tmp_path, payload)
+
+    summary = graph.build_summary(_config(tmp_path, fixture))
+
+    assert summary["validator_status"] == graph.STATUS_BLOCKED_SCHEMA
+    assert "missing_formal_lite_entered" in summary["blocker_reasons"]
+
+
+def test_missing_provenance_runtime_flag_blocks_provenance(tmp_path: Path) -> None:
+    payload = _valid_graph(tmp_path)
+    payload["nodes"][0]["provenance"].pop("codex_cli_new_call")
+    fixture = _write_graph_fixture(tmp_path, payload)
+
+    summary = graph.build_summary(_config(tmp_path, fixture))
+
+    assert summary["validator_status"] == graph.STATUS_BLOCKED_PROVENANCE
+    assert "missing_codex_cli_new_call" in summary["blocker_reasons"]
+
+
 def test_claim_overreach_blocks_graph(tmp_path: Path) -> None:
     payload = _valid_graph(tmp_path)
     payload["nodes"][0]["statement"] = "This is public science proof and trading advice."
@@ -132,6 +188,17 @@ def test_claim_overreach_blocks_graph(tmp_path: Path) -> None:
 
     assert summary["validator_status"] == graph.STATUS_BLOCKED_OVERCLAIM
     assert summary["overclaim_blocker_count"] > 0
+
+
+def test_status_like_verdict_claim_blocks_overclaim(tmp_path: Path) -> None:
+    payload = _valid_graph(tmp_path)
+    payload["nodes"][0]["readiness_status"] = "READY_FOR_FORWARD_LIVE_VERDICT"
+    fixture = _write_graph_fixture(tmp_path, payload)
+
+    summary = graph.build_summary(_config(tmp_path, fixture))
+
+    assert summary["validator_status"] == graph.STATUS_BLOCKED_OVERCLAIM
+    assert "ready_for_forward_live_verdict_status" in summary["blocker_reasons"]
 
 
 def test_short_horizon_cannot_enable_actual_30d_verdict(tmp_path: Path) -> None:
@@ -159,6 +226,32 @@ def test_deterministic_graph_digest_and_manifest_are_verifiable(tmp_path: Path) 
     assert manifest["v3_7_actual_verdict_executable"] is False
 
 
+def test_boundary_field_change_changes_graph_digest(tmp_path: Path) -> None:
+    clean_fixture = _write_graph_fixture(tmp_path / "clean", _valid_graph(tmp_path / "clean"))
+    dirty_payload = _valid_graph(tmp_path / "dirty")
+    dirty_payload["provider_or_backend_called"] = True
+    dirty_fixture = _write_graph_fixture(tmp_path / "dirty", dirty_payload)
+
+    clean = graph.build_summary(_config(tmp_path / "clean_runs", clean_fixture))
+    dirty = graph.build_summary(_config(tmp_path / "dirty_runs", dirty_fixture))
+
+    assert clean["validator_status"] == graph.STATUS_READY
+    assert dirty["validator_status"] == graph.STATUS_BLOCKED_SCHEMA
+    assert clean["graph_content_sha256"] != dirty["graph_content_sha256"]
+
+
+def test_generic_artifact_path_fields_block_forbidden_paths(tmp_path: Path) -> None:
+    payload = _valid_graph(tmp_path)
+    payload["nodes"][0]["artifact_path"] = "data/backtest/runs/raw_summary.json"
+    payload["nodes"][1]["input_artifact_path"] = "raw_outputs/provider.json"
+    fixture = _write_graph_fixture(tmp_path, payload)
+
+    summary = graph.build_summary(_config(tmp_path, fixture))
+
+    assert summary["validator_status"] == graph.STATUS_BLOCKED_ARTIFACT_BOUNDARY
+    assert "forbidden_graph_artifact_path" in summary["blocker_reasons"]
+
+
 def test_data_insufficient_when_graph_has_no_edges(tmp_path: Path) -> None:
     payload = _valid_graph(tmp_path)
     payload["edges"] = []
@@ -170,6 +263,7 @@ def test_data_insufficient_when_graph_has_no_edges(tmp_path: Path) -> None:
 
 
 def _valid_graph(tmp_path: Path, **updates: object) -> dict[str, object]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     dashboard_path = tmp_path / "source_v3_7e_dashboard.json"
     ledger_path = tmp_path / "source_v3_7f_ledger.json"
     dashboard_path.write_text("dashboard fixture evidence\n", encoding="utf-8")
@@ -183,6 +277,7 @@ def _valid_graph(tmp_path: Path, **updates: object) -> dict[str, object]:
         "actual_30d_next_check_after": graph.ACTUAL_30D_NEXT_CHECK_AFTER,
         "v3_7_actual_verdict_executable": False,
         "v3_7_actual_verdict_executed": False,
+        "actual_30d_verdict_executed": False,
         "provider_or_backend_called": False,
         "codex_cli_new_call": False,
         "codex_cli_called": False,
@@ -203,10 +298,20 @@ def _valid_graph(tmp_path: Path, **updates: object) -> dict[str, object]:
                 "codex_cli_new_call": False,
                 "codex_cli_called": False,
                 "formal_lite_entered": False,
+                "v3_7_actual_verdict_executable": False,
+                "v3_7_actual_verdict_executed": False,
+                "actual_30d_verdict_executed": False,
                 "provenance": {
                     "source_run_id": "baseline_v3_7e_evidence_dashboard_hardening_unit",
                     "source_artifact_path": dashboard_path.name,
                     "source_sha256": dashboard_hash,
+                    "provider_or_backend_called": False,
+                    "codex_cli_new_call": False,
+                    "codex_cli_called": False,
+                    "formal_lite_entered": False,
+                    "v3_7_actual_verdict_executable": False,
+                    "v3_7_actual_verdict_executed": False,
+                    "actual_30d_verdict_executed": False,
                 },
             },
             {
@@ -221,10 +326,20 @@ def _valid_graph(tmp_path: Path, **updates: object) -> dict[str, object]:
                 "codex_cli_new_call": False,
                 "codex_cli_called": False,
                 "formal_lite_entered": False,
+                "v3_7_actual_verdict_executable": False,
+                "v3_7_actual_verdict_executed": False,
+                "actual_30d_verdict_executed": False,
                 "provenance": {
                     "source_run_id": "baseline_v3_7f_continuous_monitor_ledger_unit",
                     "source_artifact_path": ledger_path.name,
                     "source_sha256": ledger_hash,
+                    "provider_or_backend_called": False,
+                    "codex_cli_new_call": False,
+                    "codex_cli_called": False,
+                    "formal_lite_entered": False,
+                    "v3_7_actual_verdict_executable": False,
+                    "v3_7_actual_verdict_executed": False,
+                    "actual_30d_verdict_executed": False,
                 },
             },
         ],

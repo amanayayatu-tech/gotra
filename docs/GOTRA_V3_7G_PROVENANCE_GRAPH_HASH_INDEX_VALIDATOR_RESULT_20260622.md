@@ -32,6 +32,11 @@ The validator checks:
 - required source reachability
 - allowed evidence layers
 - runtime flags false
+- explicit runtime and verdict boundary flags at root, node, and provenance object level
+- forbidden source paths short-circuited before hash reads
+- status-like fields scanned for actual verdict/readiness wording
+- generic graph artifact path fields included in path-boundary scan
+- graph content digest includes boundary-critical fields
 - `direct_llm_interpretation=direct_llm_parametric_memory_control`
 - claim-boundary overreach
 - short-horizon/canary evidence not upgraded to 30D verdict
@@ -43,7 +48,7 @@ Focused v3.7G unit validation:
 
 - `uv run python -m py_compile scripts/baseline_v3_7g_provenance_graph_hash_index_validator.py`
 - `uv run pytest -q tests/test_v3_7g_provenance_graph_hash_index_validator.py`
-- Result: `13 passed`
+- Result after review hardening: `20 passed`
 
 Formatting and regression validation:
 
@@ -58,12 +63,12 @@ The final local/mock validation summary path and manifest hash are recorded duri
 
 Local/mock v3.7G CLI validation:
 
-- Run id: `baseline_v3_7g_provenance_graph_hash_index_validator_local_20260622T000000Z`
+- Run id: `baseline_v3_7g_provenance_graph_hash_index_validator_repair_20260622T010000Z`
 - Status: `V3_7_PROVENANCE_GRAPH_HASH_INDEX_READY`
-- Summary path: `/tmp/gotra_v3_7g_local_validation_20260622T000000Z/runs/baseline_v3_7g_provenance_graph_hash_index_validator_local_20260622T000000Z/summary.json`
-- Manifest path: `/tmp/gotra_v3_7g_local_validation_20260622T000000Z/runs/baseline_v3_7g_provenance_graph_hash_index_validator_local_20260622T000000Z/manifest.json`
-- Summary sha256: `dd18c886333561d566a6d024d442d256d05592763d91c1d30d33d6ad1cb7259e`
-- Graph content sha256: `c1582c9107380ef54ed9f814340a5b8fe3d382d9a52d52a529904fd4ec7be82c`
+- Summary path: `/tmp/gotra_v3_7g_repair_validation_20260622T010000Z/runs/baseline_v3_7g_provenance_graph_hash_index_validator_repair_20260622T010000Z/summary.json`
+- Manifest path: `/tmp/gotra_v3_7g_repair_validation_20260622T010000Z/runs/baseline_v3_7g_provenance_graph_hash_index_validator_repair_20260622T010000Z/manifest.json`
+- Summary sha256: `848651f240819c75dba52d169e7934141ad4462029c5536a67df6a7abfe8560b`
+- Graph content sha256: `f8eb91757e1ccc68fe7fdb34106b35f3aa35f4c61b873b418763c740b85518f2`
 - `provider_or_backend_called=false`
 - `codex_cli_new_call=false`
 - `formal_lite_entered=false`
