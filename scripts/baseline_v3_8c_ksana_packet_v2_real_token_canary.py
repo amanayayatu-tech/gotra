@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 import hashlib
 import json
+import os
 from pathlib import Path
 import platform
 import re
@@ -22,7 +23,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from gotra.backtest.codex_responses_client import CodexResponsesCompletionClient  # noqa: E402
+from gotra.backtest.codex_responses_client import (  # noqa: E402
+    DEFAULT_CODEX_RESPONSES_BASE_URL,
+    CodexResponsesCompletionClient,
+)
 from scripts import baseline_v3_6ab_evidence_claim_boundary_scanner as claim_scan  # noqa: E402
 from scripts import baseline_v3_7h_claim_boundary_regression as claim_regression  # noqa: E402
 
@@ -63,6 +67,7 @@ ALLOWED_STATUSES = {
 }
 CLI_SUCCESS_STATUSES = {STATUS_PASS}
 ALLOWED_BACKENDS = {DEFAULT_BACKEND_NAME}
+ALLOWED_BASE_URLS = {DEFAULT_CODEX_RESPONSES_BASE_URL}
 FORBIDDEN_BACKEND_RE = re.compile(r"\b(kimi|glm|deepseek)\b", re.IGNORECASE)
 SECRET_RE = re.compile(
     r"(sk-[A-Za-z0-9_-]{20,}|Bearer\s+[A-Za-z0-9._~+/=-]{12,}|"
@@ -290,6 +295,24 @@ def synthetic_briefs(run_id: str, run_root: Path) -> list[dict[str, Any]]:
                 "The brief includes slower QA review, better release notes, and an unresolved integration checklist."
             ),
         },
+        {
+            "call_id": "call_004",
+            "synthetic_company_id": "SYN-DELTA-TRAINING",
+            "ticker": "SYNDEL",
+            "brief": (
+                "Fictional internal schema canary: Delta Training maintains a mock certification queue. "
+                "Recent notes mention inconsistent checklist labels, fewer repeat questions, and one stale template."
+            ),
+        },
+        {
+            "call_id": "call_005",
+            "synthetic_company_id": "SYN-ECHO-INVENTORY",
+            "ticker": "SYNECH",
+            "brief": (
+                "Fictional internal schema canary: Echo Inventory audits demo spare-part workflows. "
+                "The brief includes mismatched item tags, a new exception log, and stable mock intake volume."
+            ),
+        },
     ]
     for item in base:
         item["source_run_id"] = run_id
@@ -348,7 +371,7 @@ def user_prompt_for_brief(brief: dict[str, Any]) -> str:
         "provenance": {
             "source_run_id": brief["source_run_id"],
             "source_artifact_path": brief["source_artifact_path"],
-            "input_fixture_hash": "<provided below>",
+            "input_fixture_hash": str(brief.get("input_fixture_hash") or "<input_fixture_hash_required>"),
             "backend": DEFAULT_BACKEND_NAME,
             "model": DEFAULT_MODEL,
             "call_id": brief["call_id"],
@@ -662,6 +685,7 @@ def validate_call_result(call_result: Any, *, index: int, status: str) -> list[d
         "input_fixture_hash",
         "raw_response_tmp_path",
         "raw_response_sha256",
+        "parsed_packet_tmp_path",
         "parsed_packet_sha256",
         "schema_status",
         "claim_boundary_status",
@@ -722,6 +746,8 @@ def validate_summary_payload(summary: dict[str, Any]) -> list[dict[str, Any]]:
         blockers.append(blocked_item("summary.backend_name", "backend_not_allowed", "backend is not allowed for v3.8C"))
     if summary.get("model") != DEFAULT_MODEL:
         blockers.append(blocked_item("summary.model", "model_not_allowed", "model is not allowed for v3.8C"))
+    if summary.get("reasoning_effort") != DEFAULT_REASONING_EFFORT:
+        blockers.append(blocked_item("summary.reasoning_effort", "reasoning_effort_not_allowed", "reasoning_effort must remain xhigh"))
     if summary.get("actual_30d_readiness_status") != ACTUAL_30D_READINESS_STATUS:
         blockers.append(blocked_item("summary.actual_30d_readiness_status", "actual_30d_readiness_status_invalid", "actual 30D readiness must remain DATA_NOT_MATURED"))
     for flag in RUNTIME_FALSE_FLAGS:
@@ -734,6 +760,11 @@ def validate_summary_payload(summary: dict[str, Any]) -> list[dict[str, Any]]:
         call_count = 0
     elif call_count > MAX_CALL_COUNT:
         blockers.append(blocked_item("summary.real_calls_count", "call_count_over_budget", "real call count exceeds v3.8C max"))
+    requested_call_count = summary.get("requested_call_count")
+    if not isinstance(requested_call_count, int) or requested_call_count < 1 or requested_call_count > MAX_CALL_COUNT:
+        blockers.append(blocked_item("summary.requested_call_count", "requested_call_count_invalid", "requested_call_count must be 1..5"))
+    elif status == STATUS_PASS and call_count != requested_call_count:
+        blockers.append(blocked_item("summary.real_calls_count", "requested_call_count_not_fulfilled", "PASS requires fulfilling requested_call_count"))
     token_usage_total = summary.get("token_usage_total")
     if not isinstance(token_usage_total, int) or token_usage_total < 0:
         blockers.append(blocked_item("summary.token_usage_total", "token_usage_total_invalid", "token_usage_total must be a non-negative integer"))
@@ -801,7 +832,14 @@ def choose_status(blockers: list[dict[str, Any]], current_status: str | None = N
         return STATUS_BLOCKED_OVERCLAIM
     if any("usage" in reason or "metadata" in reason for reason in reasons):
         return STATUS_BLOCKED_METADATA
-    if any("schema" in reason or "missing_or_invalid" in reason or "parse" in reason for reason in reasons):
+    if any(
+        "schema" in reason
+        or "missing_or_invalid" in reason
+        or "parse" in reason
+        or "provenance" in reason
+        or "hash" in reason
+        for reason in reasons
+    ):
         return STATUS_BLOCKED_SCHEMA
     return STATUS_BLOCKED_RUNTIME_BOUNDARY
 
@@ -850,17 +888,32 @@ def build_from_fixture(config: CanaryConfig, *, run_root: Path) -> dict[str, Any
     return summary
 
 
-def pre_http_blockers(config: CanaryConfig) -> list[dict[str, Any]]:
+def resolved_auth_json_path(config: CanaryConfig) -> Path:
+    if config.auth_json_path is not None:
+        return config.auth_json_path.expanduser()
+    env_path = os.environ.get("CODEX_AUTH_JSON", "").strip()
+    if env_path:
+        return Path(env_path).expanduser()
+    return Path("~/.codex/auth.json").expanduser()
+
+
+def pre_http_blockers(config: CanaryConfig, *, run_root: Path) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
     if config.backend_name not in ALLOWED_BACKENDS or FORBIDDEN_BACKEND_RE.search(config.backend_name):
         blockers.append(blocked_item("config.backend_name", "backend_not_allowed", "backend is not allowed for v3.8C"))
     if config.model != DEFAULT_MODEL:
         blockers.append(blocked_item("config.model", "model_not_allowed", "model is not allowed for v3.8C"))
+    if config.reasoning_effort != DEFAULT_REASONING_EFFORT:
+        blockers.append(blocked_item("config.reasoning_effort", "reasoning_effort_not_allowed", "reasoning_effort must remain xhigh"))
+    if config.base_url and config.base_url.strip() not in ALLOWED_BASE_URLS:
+        blockers.append(blocked_item("config.base_url", "base_url_not_allowed", "base_url must be the Codex Responses endpoint"))
     if config.call_count < 1 or config.call_count > MAX_CALL_COUNT:
         blockers.append(blocked_item("config.call_count", "call_count_over_budget", "call count must be between 1 and 5"))
     if config.token_budget > HARD_TOKEN_BUDGET:
         blockers.append(blocked_item("config.token_budget", "token_budget_over_hard_limit", "token budget exceeds hard limit"))
-    auth_path = (config.auth_json_path or Path("~/.codex/auth.json")).expanduser()
+    if not under_tmp(run_root):
+        blockers.append(blocked_item(run_root, "real_output_dir_not_tmp", "real-token raw output directory must be under /tmp"))
+    auth_path = resolved_auth_json_path(config)
     if not auth_path.exists():
         blockers.append(blocked_item("auth", "auth_json_not_found", "Codex OAuth auth file is not available"))
     elif claim_scan.forbidden_path(normalize_path(auth_path)):
@@ -898,13 +951,14 @@ def record_call_result(
 
 def real_token_canary(config: CanaryConfig, *, run_root: Path) -> dict[str, Any]:
     summary = base_summary(config, run_root=run_root, status=STATUS_BLOCKED_RUNTIME_BOUNDARY)
-    pre_blockers = pre_http_blockers(config)
+    pre_blockers = pre_http_blockers(config, run_root=run_root)
     if pre_blockers:
         finalize_blockers(summary, pre_blockers)
         return summary
 
+    auth_path = resolved_auth_json_path(config)
     client = CodexResponsesCompletionClient(
-        auth_json_path=config.auth_json_path,
+        auth_json_path=auth_path,
         model=config.model,
         reasoning_effort=config.reasoning_effort,
         base_url=config.base_url,
@@ -964,10 +1018,6 @@ def real_token_canary(config: CanaryConfig, *, run_root: Path) -> dict[str, Any]
             parsed_packet_path.write_text("{}", encoding="utf-8")
             parsed_packet_hash = sha256_file(parsed_packet_path)
         else:
-            # The model may not know the input hash unless it copies it from the brief.
-            provenance = packet.get("provenance")
-            if isinstance(provenance, dict) and not HEX64_RE.match(str(provenance.get("input_fixture_hash") or "")):
-                provenance["input_fixture_hash"] = input_hash
             parsed_packet_path.write_text(json.dumps(packet, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
             parsed_packet_hash = sha256_file(parsed_packet_path)
             schema_blockers, provenance_blockers, overclaim_blockers = validate_packet(
@@ -1035,7 +1085,6 @@ def build_summary(config: CanaryConfig) -> dict[str, Any]:
     if run_root.exists() and any(run_root.iterdir()) and not config.allow_overwrite:
         summary = base_summary(config, run_root=run_root, status=STATUS_RUN_ID_EXISTS)
         finalize_blockers(summary, [blocked_item(run_root, "output_run_id_exists", "output run id exists")])
-        print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
         return summary
     if run_root.exists() and config.allow_overwrite:
         shutil.rmtree(run_root)

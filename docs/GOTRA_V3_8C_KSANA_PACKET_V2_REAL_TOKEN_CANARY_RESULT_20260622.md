@@ -109,14 +109,17 @@ Docs claim-boundary scan:
 ## Review Hardening
 
 PR #67 review hardening removed source-code wording that v3.7H treats as
-claim-boundary regression text. No additional real-token calls were made.
+claim-boundary regression text, then tightened runtime/provenance boundaries
+for base URL allowlisting, output directory placement, requested call count,
+reasoning effort, auth path resolution, run-id reuse output, and per-call parsed
+packet metadata. No additional real-token calls were made.
 
 v3.7H claim-boundary regression over the PR files:
 
 - summary:
-  `/tmp/gotra_v3_8c_claim_regression_repair_20260622T040907Z/baseline_v3_7h_claim_boundary_regression_repair_v3_8c_20260622T040907Z/summary.json`
+  `/tmp/gotra_v3_8c_claim_regression_repair_20260622T041528Z/baseline_v3_7h_claim_boundary_regression_repair_v3_8c_20260622T041528Z/summary.json`
 - summary sha256:
-  `d73b6afb0b69f69a7b0b3631e5d5b4175b971a474f12fdb61f6a83557c0ea85e`
+  `b124078874bc30012ffe92e93326e9964cf12cde5434a7d1f241f3362b22dac5`
 - status: `V3_7_CLAIM_BOUNDARY_REGRESSION_READY`
 - blockers: `0`
 

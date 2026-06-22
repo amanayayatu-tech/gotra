@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 from scripts import baseline_v3_8c_ksana_packet_v2_real_token_canary as canary
@@ -31,6 +32,19 @@ def test_missing_required_packet_v2_field_blocks_schema(tmp_path: Path, monkeypa
 
     assert summary["canary_status"] == canary.STATUS_BLOCKED_SCHEMA
     assert "missing_or_invalid_packet_v2_schema_field" in summary["blocker_reasons"]
+
+
+def test_missing_input_fixture_hash_blocks_provenance(tmp_path: Path, monkeypatch) -> None:
+    _install_fake_client(
+        monkeypatch,
+        [{"content": json.dumps(_packet()), "usage": _usage()}],
+        autofill_input_hash=False,
+    )
+
+    summary = canary.build_summary(_real_config(tmp_path, call_count=1))
+
+    assert summary["canary_status"] == canary.STATUS_BLOCKED_SCHEMA
+    assert "missing_or_inconsistent_provenance" in summary["blocker_reasons"]
 
 
 def test_overclaim_packet_blocks(tmp_path: Path, monkeypatch) -> None:
@@ -63,6 +77,28 @@ def test_call_count_over_budget_blocks_runtime_boundary(tmp_path: Path) -> None:
     assert "call_count_over_budget" in summary["blocker_reasons"]
 
 
+def test_requested_call_count_must_be_fulfilled(tmp_path: Path) -> None:
+    fixture = _write_summary_fixture(tmp_path, _ready_summary(real_calls_count=3, requested_call_count=4, call_count=3))
+
+    summary = canary.build_summary(_config(tmp_path, summary_fixture=fixture))
+
+    assert summary["canary_status"] == canary.STATUS_BLOCKED_RUNTIME_BOUNDARY
+    assert "requested_call_count_not_fulfilled" in summary["blocker_reasons"]
+
+
+def test_fake_real_call_count_four_can_pass(tmp_path: Path, monkeypatch) -> None:
+    _install_fake_client(
+        monkeypatch,
+        [{"content": json.dumps(_packet()), "usage": _usage()} for _ in range(4)],
+    )
+
+    summary = canary.build_summary(_real_config(tmp_path, call_count=4))
+
+    assert summary["canary_status"] == canary.STATUS_PASS
+    assert summary["real_calls_count"] == 4
+    assert summary["requested_call_count"] == 4
+
+
 def test_unsafe_runtime_flag_blocks(tmp_path: Path) -> None:
     fixture = _write_summary_fixture(tmp_path, _ready_summary(formal_lite_entered=True))
 
@@ -72,6 +108,57 @@ def test_unsafe_runtime_flag_blocks(tmp_path: Path) -> None:
     assert "formal_lite_entered_not_false" in summary["blocker_reasons"]
 
 
+def test_reasoning_effort_must_remain_xhigh(tmp_path: Path) -> None:
+    fixture = _write_summary_fixture(tmp_path, _ready_summary(reasoning_effort="low"))
+
+    summary = canary.build_summary(_config(tmp_path, summary_fixture=fixture))
+
+    assert summary["canary_status"] == canary.STATUS_BLOCKED_RUNTIME_BOUNDARY
+    assert "reasoning_effort_not_allowed" in summary["blocker_reasons"]
+
+
+def test_base_url_must_be_allowlisted_before_client_creation(tmp_path: Path, monkeypatch) -> None:
+    class FailIfConstructed:
+        def __init__(self, **_kwargs: object) -> None:
+            raise AssertionError("client should not be constructed for disallowed base_url")
+
+    monkeypatch.setattr(canary, "CodexResponsesCompletionClient", FailIfConstructed)
+
+    summary = canary.build_summary(
+        _real_config_with_options(tmp_path, call_count=1, base_url="https://example.invalid/capture")
+    )
+
+    assert summary["canary_status"] == canary.STATUS_BLOCKED_RUNTIME_BOUNDARY
+    assert "base_url_not_allowed" in summary["blocker_reasons"]
+    assert summary["provider_or_backend_called"] is False
+
+
+def test_real_output_dir_must_be_under_tmp_before_client_creation(tmp_path: Path, monkeypatch) -> None:
+    class FailIfConstructed:
+        def __init__(self, **_kwargs: object) -> None:
+            raise AssertionError("client should not be constructed for non-/tmp output dir")
+
+    monkeypatch.setattr(canary, "CodexResponsesCompletionClient", FailIfConstructed)
+    config = _real_config_with_options(tmp_path, call_count=1, output_dir=tmp_path / "repo_like_runs")
+
+    summary = canary.build_summary(config)
+
+    assert summary["canary_status"] == canary.STATUS_BLOCKED_RUNTIME_BOUNDARY
+    assert "real_output_dir_not_tmp" in summary["blocker_reasons"]
+    assert summary["provider_or_backend_called"] is False
+
+
+def test_env_auth_path_is_validated_when_no_arg_is_supplied(tmp_path: Path, monkeypatch) -> None:
+    missing_env_auth = tmp_path / "missing-auth.json"
+    monkeypatch.setenv("CODEX_AUTH_JSON", str(missing_env_auth))
+
+    summary = canary.build_summary(_real_config_with_options(tmp_path, call_count=1, auth_json_path=None))
+
+    assert summary["canary_status"] == canary.STATUS_BLOCKED_RUNTIME_BOUNDARY
+    assert "auth_json_not_found" in summary["blocker_reasons"]
+    assert summary["provider_or_backend_called"] is False
+
+
 def test_raw_response_path_outside_tmp_blocks(tmp_path: Path) -> None:
     fixture = _write_summary_fixture(tmp_path, _ready_summary(raw_response_tmp_path="/Users/peachy/raw.json"))
 
@@ -79,6 +166,22 @@ def test_raw_response_path_outside_tmp_blocks(tmp_path: Path) -> None:
 
     assert summary["canary_status"] == canary.STATUS_BLOCKED_RUNTIME_BOUNDARY
     assert "raw_or_packet_path_not_tmp" in summary["blocker_reasons"]
+
+
+def test_parsed_packet_path_is_required_in_call_result(tmp_path: Path) -> None:
+    fixture_payload = _ready_summary()
+    call_results = list(fixture_payload["call_results"])  # type: ignore[index]
+    dict(call_results[0]).pop("parsed_packet_tmp_path", None)
+    call_result = dict(call_results[0])
+    call_result.pop("parsed_packet_tmp_path", None)
+    call_results[0] = call_result
+    fixture_payload["call_results"] = call_results
+    fixture = _write_summary_fixture(tmp_path, fixture_payload)
+
+    summary = canary.build_summary(_config(tmp_path, summary_fixture=fixture))
+
+    assert summary["canary_status"] == canary.STATUS_BLOCKED_RUNTIME_BOUNDARY
+    assert "call_result_missing_field" in summary["blocker_reasons"]
 
 
 def test_malformed_response_blocks_schema(tmp_path: Path, monkeypatch) -> None:
@@ -131,7 +234,42 @@ def test_valid_fake_real_call_path_passes(tmp_path: Path, monkeypatch) -> None:
     assert summary["parsed_packet_sha256s"][0]
 
 
-def _install_fake_client(monkeypatch, responses: list[dict[str, Any]]) -> None:
+def test_run_id_reuse_cli_prints_single_json_summary(tmp_path: Path, capsys) -> None:
+    run_id = "baseline_v3_8c_ksana_packet_v2_real_token_canary_collision"
+    output_dir = tmp_path / "runs"
+    fixture = _write_summary_fixture(tmp_path, _ready_summary(real_calls_count=1, call_count=1))
+
+    first = canary.main(
+        [
+            "--canary-run-id",
+            run_id,
+            "--summary-fixture",
+            str(fixture),
+            "--output-dir",
+            str(output_dir),
+            "--allow-overwrite",
+        ]
+    )
+    capsys.readouterr()
+    second = canary.main(
+        [
+            "--canary-run-id",
+            run_id,
+            "--summary-fixture",
+            str(fixture),
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+    captured = capsys.readouterr().out
+
+    assert first == 0
+    assert second == 1
+    parsed = json.loads(captured)
+    assert parsed["canary_status"] == canary.STATUS_RUN_ID_EXISTS
+
+
+def _install_fake_client(monkeypatch, responses: list[dict[str, Any]], *, autofill_input_hash: bool = True) -> None:
     class FakeClient:
         def __init__(self, **_kwargs: object) -> None:
             self._responses = list(responses)
@@ -139,9 +277,29 @@ def _install_fake_client(monkeypatch, responses: list[dict[str, Any]]) -> None:
         def complete(self, **_kwargs: object) -> dict[str, object]:
             if not self._responses:
                 raise RuntimeError("no fake response configured")
-            return self._responses.pop(0)
+            response = dict(self._responses.pop(0))
+            if autofill_input_hash and isinstance(response.get("content"), str):
+                response["content"] = _packet_content_with_prompt_hash(
+                    str(response["content"]),
+                    str(_kwargs.get("user_prompt") or ""),
+                )
+            return response
 
     monkeypatch.setattr(canary, "CodexResponsesCompletionClient", FakeClient)
+
+
+def _packet_content_with_prompt_hash(content: str, user_prompt: str) -> str:
+    digest_match = re.search(r"\b[0-9a-f]{64}\b", user_prompt)
+    if not digest_match:
+        return content
+    try:
+        packet = json.loads(content)
+    except json.JSONDecodeError:
+        return content
+    if isinstance(packet, dict) and isinstance(packet.get("provenance"), dict):
+        packet["provenance"]["input_fixture_hash"] = digest_match.group(0)
+        return json.dumps(packet)
+    return content
 
 
 def _ready_summary(**updates: object) -> dict[str, object]:
@@ -297,12 +455,25 @@ def _config(tmp_path: Path, *, summary_fixture: Path | None = None) -> canary.Ca
 
 
 def _real_config(tmp_path: Path, *, call_count: int) -> canary.CanaryConfig:
+    return _real_config_with_options(tmp_path, call_count=call_count)
+
+
+def _real_config_with_options(
+    tmp_path: Path,
+    *,
+    call_count: int,
+    output_dir: Path | None = None,
+    base_url: str | None = None,
+    auth_json_path: Path | None | object = ...,
+) -> canary.CanaryConfig:
+    resolved_auth_path = _write_auth(tmp_path) if auth_json_path is ... else auth_json_path
     return canary.CanaryConfig(
         canary_run_id="baseline_v3_8c_ksana_packet_v2_real_token_canary_unit",
-        output_dir=_tmp_output_dir(tmp_path),
+        output_dir=output_dir or _tmp_output_dir(tmp_path),
         allow_overwrite=True,
         real_token_canary=True,
-        auth_json_path=_write_auth(tmp_path),
+        auth_json_path=resolved_auth_path,  # type: ignore[arg-type]
+        base_url=base_url,
         call_count=call_count,
     )
 
