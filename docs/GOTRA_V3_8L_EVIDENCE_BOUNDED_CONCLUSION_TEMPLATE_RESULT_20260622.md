@@ -15,8 +15,15 @@
 - Summary path: `/tmp/gotra_v3_8l_evidence_bounded_conclusion_template_local_validation/baseline_v3_8l_evidence_bounded_conclusion_template_local_validation_20260622T000000Z/summary.json`
 - Manifest path: `/tmp/gotra_v3_8l_evidence_bounded_conclusion_template_local_validation/baseline_v3_8l_evidence_bounded_conclusion_template_local_validation_20260622T000000Z/manifest.json`
 - Manifest `summary_sha256`: `48c3c7aca7b6ba7b267333d84f0fec8a1e08ed32970f9e553118c415a69f6249`
+- Repair summary path: `/tmp/gotra_v3_8l_evidence_bounded_conclusion_template_repair_validation/baseline_v3_8l_evidence_bounded_conclusion_template_repair_validation_20260622T000000Z/summary.json`
+- Repair manifest path: `/tmp/gotra_v3_8l_evidence_bounded_conclusion_template_repair_validation/baseline_v3_8l_evidence_bounded_conclusion_template_repair_validation_20260622T000000Z/manifest.json`
+- Repair manifest `summary_sha256`: `f109cfb0b7bbd44471f7d8fb560cb0b3e4cf77d9afcfc6c3689ebdb7092ad3ed`
 - Source-stage totals: 7 calls / 13369 tokens from #66-#70 recorded metadata.
 - v3.8L itself: 0 calls / 0 tokens.
+
+## Repair Hardening
+
+The repair pass binds source-stage hashes to canonical #66-#75 payloads, scopes negation to the matched claim window, preserves existing `/tmp` run directories on id collision, scans generic raw path fields, blocks action-guidance wording, requires integer-zero call/token counters, and rejects textual provider-canary execution claims.
 
 ## Canonical Evidence Binding
 

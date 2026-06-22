@@ -107,6 +107,52 @@ def test_wrong_canonical_pr_or_merge_commit_blocks(tmp_path: Path) -> None:
     assert "source_stage_merge_commit_mismatch" in summary["blocker_reasons"]
 
 
+def test_tampered_source_stage_cannot_self_certify_digest(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["source_stages"][3]["claim_boundary_status"] = "blocked"
+    payload["source_stages"][3]["failure_cases_handled"] = 11
+    payload = _refresh_digests(payload)
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = template.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["template_status"] == template.STATUS_BLOCKED_MISSING_EVIDENCE
+    assert "source_stage_claim_boundary_status_canonical_mismatch" in summary["blocker_reasons"]
+    assert "source_stage_failure_cases_handled_canonical_mismatch" in summary["blocker_reasons"]
+    assert "source_metadata_sha256_mismatch" in summary["blocker_reasons"]
+
+
+def test_negation_is_local_to_matched_claim(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["allowed_conclusion_text"].append(
+        "Actual 30D verdict is not ready yet, but the actual superiority verdict is proved."
+    )
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = template.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["template_status"] in {
+        template.STATUS_BLOCKED_VERDICT_OVERREACH,
+        template.STATUS_BLOCKED_CLAIM_BOUNDARY,
+    }
+    assert "actual_or_superiority_verdict_claim" in summary["blocker_reasons"]
+
+
+def test_run_collision_preserves_existing_artifacts(tmp_path: Path) -> None:
+    output_dir = Path("/tmp") / f"gotra_v3_8l_collision_{tmp_path.name}"
+    template_id = "baseline_v3_8l_evidence_bounded_conclusion_template_collision"
+    run_root = output_dir / template_id
+    run_root.mkdir(parents=True, exist_ok=True)
+    sentinel = run_root / "summary.json"
+    sentinel.write_text("do-not-overwrite", encoding="utf-8")
+    config = template.TemplateConfig(template_id=template_id, output_dir=output_dir, allow_overwrite=False)
+
+    summary = template.build_summary(config)
+
+    assert summary["template_status"] == template.STATUS_RUN_ID_EXISTS
+    assert sentinel.read_text(encoding="utf-8") == "do-not-overwrite"
+
+
 def test_unexpected_overclaim_field_is_scanned(tmp_path: Path) -> None:
     payload = _ready_fixture()
     payload["unexpected"] = {"marketing": "public science proof with investment advice"}
@@ -119,6 +165,31 @@ def test_unexpected_overclaim_field_is_scanned(tmp_path: Path) -> None:
         template.STATUS_BLOCKED_CLAIM_BOUNDARY,
     }
     assert summary["claim_boundary_status"] == "blocked"
+
+
+def test_action_guidance_wording_blocks(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["allowed_conclusion_text"].append("This is investment guidance and trading guidance.")
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = template.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["template_status"] in {
+        template.STATUS_BLOCKED_VERDICT_OVERREACH,
+        template.STATUS_BLOCKED_CLAIM_BOUNDARY,
+    }
+    assert "comparative_or_action_guidance_claim" in summary["blocker_reasons"]
+
+
+def test_provider_canary_execution_text_blocks(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["allowed_conclusion_text"].append("Provider canary was executed in v3.8L.")
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = template.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["template_status"] == template.STATUS_BLOCKED_RUNTIME_BOUNDARY
+    assert "provider_canary_execution_text_claim" in summary["blocker_reasons"]
 
 
 def test_unexpected_raw_or_forbidden_path_blocks(tmp_path: Path) -> None:
@@ -136,6 +207,17 @@ def test_unexpected_raw_or_forbidden_path_blocks(tmp_path: Path) -> None:
     assert "raw_reference_not_tmp" in summary["blocker_reasons"]
 
 
+def test_generic_path_with_raw_filename_blocks(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["unexpected"] = {"path": "/home/me/raw.json"}
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = template.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["template_status"] == template.STATUS_BLOCKED_ARTIFACT_BOUNDARY
+    assert "raw_reference_not_tmp" in summary["blocker_reasons"]
+
+
 def test_raw_full_transcript_or_non_tmp_path_blocks(tmp_path: Path) -> None:
     payload = _ready_fixture()
     payload["transcript_path"] = "/var/tmp/full_transcript.txt"
@@ -145,6 +227,20 @@ def test_raw_full_transcript_or_non_tmp_path_blocks(tmp_path: Path) -> None:
 
     assert summary["template_status"] == template.STATUS_BLOCKED_ARTIFACT_BOUNDARY
     assert "raw_reference_not_tmp" in summary["blocker_reasons"]
+
+
+def test_boolean_call_and_token_totals_do_not_count_as_zero(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["real_calls_count"] = False
+    payload["token_usage_total"] = False
+    payload["conclusion_template_sha256"] = template.conclusion_template_digest(payload)
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = template.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["template_status"] == template.STATUS_BLOCKED_RUNTIME_BOUNDARY
+    assert "real_calls_count_not_numeric_zero" in summary["blocker_reasons"]
+    assert "token_usage_total_not_numeric_zero" in summary["blocker_reasons"]
 
 
 def test_malformed_status_calls_tokens_return_structured_schema_block(tmp_path: Path) -> None:

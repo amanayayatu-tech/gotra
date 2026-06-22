@@ -190,7 +190,15 @@ STATUS_CLAIM_RE = re.compile(
     re.IGNORECASE,
 )
 COMPARATIVE_CLAIM_RE = re.compile(
-    rf"\b(?:{COMPARATIVE_RESULT_WORD}|out" + r"perform|pro" + r"fit|al" + r"pha|trading adv" + r"ice|investment adv" + r"ice)\b",
+    rf"\b(?:{COMPARATIVE_RESULT_WORD}|out"
+    + r"perform|pro"
+    + r"fit|al"
+    + r"pha|trading adv"
+    + r"ice|investment adv"
+    + r"ice|trading guid"
+    + r"ance|investment guid"
+    + r"ance|action guid"
+    + r"ance)\b",
     re.IGNORECASE,
 )
 VERDICT_OVERREACH_RE = re.compile(
@@ -198,6 +206,15 @@ VERDICT_OVERREACH_RE = re.compile(
     r"(?:ready|proved|confirmed|passed|executed|wins)",
     re.IGNORECASE,
 )
+AFFIRMATIVE_STATUS_TOKEN_RE = re.compile(
+    rf"\b(?:ready|pass|allowed|true|executed|proved|validated|confirmed|{COMPARATIVE_RESULT_WORD}|wins)\b",
+    re.IGNORECASE,
+)
+PROVIDER_EXECUTION_CLAIM_RE = re.compile(
+    r"\b(?:provider|backend|canary).{0,80}\b(?:called|executed|ran|used|completed)\b",
+    re.IGNORECASE,
+)
+RAW_PATH_RE = re.compile(r"(?:^|[/. _-])raw(?:[/. _-]|$)", re.IGNORECASE)
 DIRECT_UNSAFE_RE = re.compile(
     r"(?:direct_llm|direct_llm_parametric_memory_control).{0,80}"
     r"(?:clean|no[-_ ]future|no[-_ ]memory|primary comparator|primary baseline)",
@@ -366,6 +383,10 @@ def safe_nonnegative_int(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
+def is_numeric_zero(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value == 0
+
+
 def stage_hash_payload(stage: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in stage.items() if key != "metadata_sha256"}
 
@@ -377,6 +398,10 @@ def enrich_stage_hashes(stages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         item["metadata_sha256"] = stable_sha256_json(stage_hash_payload(item))
         enriched.append(item)
     return enriched
+
+
+def canonical_stage_map() -> dict[str, dict[str, Any]]:
+    return {stage["stage_id"]: stage for stage in canonical_source_stages()}
 
 
 def canonical_source_stages() -> list[dict[str, Any]]:
@@ -608,9 +633,11 @@ def recursive_paths(value: Any, *, key_hint: str = "") -> list[tuple[str, str]]:
         "source_artifact_paths",
         "transcript_path",
         "transcript_paths",
+        "path",
+        "paths",
     }
     if isinstance(value, str):
-        if key_hint in path_keys or claim_scan.forbidden_path(value) or "raw_" in value.lower() or "transcript" in value.lower():
+        if key_hint in path_keys or claim_scan.forbidden_path(value) or RAW_PATH_RE.search(value) or "transcript" in value.lower():
             paths.append((key_hint, value))
     elif isinstance(value, dict):
         for key, item in value.items():
@@ -631,14 +658,41 @@ def claim_blockers(payload: dict[str, Any]) -> list[dict[str, Any]]:
     blockers = scan["overclaim"] + scan[DIRECT_PREFIX] + scan["maturity_gate"] + scan["short_horizon_as_30d"]
     blockers.extend(claim_regression.extra_text_blockers(sources))
     for path, text in text_items:
-        if STATUS_CLAIM_RE.search(text) and not claim_regression.FALSE_LINE_RE.search(text):
-            blockers.append(blocked_item(path, "actual_or_superiority_verdict_claim", "status-like text cannot assert current actual or comparative conclusion readiness"))
-        if VERDICT_OVERREACH_RE.search(text) and not claim_regression.FALSE_LINE_RE.search(text):
-            blockers.append(blocked_item(path, "verdict_overreach_wording", "text exceeds evidence-bounded conclusion template boundary"))
-        match = COMPARATIVE_CLAIM_RE.search(text)
-        if match and not claim_scan.is_negated(text, match.start()):
-            blockers.append(blocked_item(path, "comparative_or_action_guidance_claim", "comparative or action-guidance wording exceeds this template boundary"))
+        for status_match in STATUS_CLAIM_RE.finditer(text):
+            if _has_unnegated_affirmative_token(text, status_match):
+                blockers.append(blocked_item(path, "actual_or_superiority_verdict_claim", "status-like text cannot assert current actual or comparative conclusion readiness"))
+        for verdict_match in VERDICT_OVERREACH_RE.finditer(text):
+            if _has_unnegated_affirmative_token(text, verdict_match):
+                blockers.append(blocked_item(path, "verdict_overreach_wording", "text exceeds evidence-bounded conclusion template boundary"))
+        for provider_match in PROVIDER_EXECUTION_CLAIM_RE.finditer(text):
+            if not _is_locally_negated(text, provider_match.start()):
+                blockers.append(blocked_item(path, "provider_canary_execution_text_claim", "text cannot claim provider/backend/canary execution in v3.8L"))
+        for match in COMPARATIVE_CLAIM_RE.finditer(text):
+            if not claim_scan.is_negated(text, match.start()):
+                blockers.append(blocked_item(path, "comparative_or_action_guidance_claim", "comparative or action-guidance wording exceeds this template boundary"))
     return blockers
+
+
+def _has_unnegated_affirmative_token(text: str, match: re.Match[str]) -> bool:
+    for token in AFFIRMATIVE_STATUS_TOKEN_RE.finditer(match.group(0)):
+        if not _is_locally_negated(text, match.start() + token.start()):
+            return True
+    return False
+
+
+def _is_locally_negated(text: str, position: int) -> bool:
+    lowered = text.lower()
+    clause_start = 0
+    for separator in (".", ";", "\n"):
+        idx = lowered.rfind(separator, 0, position)
+        if idx >= 0:
+            clause_start = max(clause_start, idx + 1)
+    for separator in (" but ", " however ", " yet "):
+        idx = lowered.rfind(separator, 0, position)
+        if idx >= 0:
+            clause_start = max(clause_start, idx + len(separator))
+    window = lowered[clause_start : min(len(lowered), position + 40)]
+    return bool(re.search(r"\b(?:not|no|never|without|false|forbidden|blocked|remain(?:s)? not)\b.{0,40}$", window[: max(0, position - clause_start)]))
 
 
 def direct_boundary_blockers(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -661,7 +715,7 @@ def path_blockers(payload: dict[str, Any]) -> list[dict[str, Any]]:
     for key_hint, candidate in recursive_paths(payload):
         if claim_scan.forbidden_path(candidate):
             blockers.append(blocked_item(candidate, "forbidden_artifact_reference", "forbidden/raw artifact path reference"))
-        elif (key_hint.startswith("raw") or "raw" in candidate.lower() or "transcript" in candidate.lower()) and not under_tmp(candidate):
+        elif (key_hint.startswith("raw") or RAW_PATH_RE.search(candidate) or "transcript" in candidate.lower()) and not under_tmp(candidate):
             blockers.append(blocked_item(candidate, "raw_reference_not_tmp", "raw-like or transcript path references must stay under /tmp"))
     return blockers
 
@@ -675,10 +729,10 @@ def runtime_blockers(summary: dict[str, Any]) -> list[dict[str, Any]]:
             blockers.append(blocked_item(f"summary.{flag}", f"{flag}_not_false", f"{flag} must be false for v3.8L itself"))
     if summary.get("provider_canary_executed") is not False:
         blockers.append(blocked_item("summary.provider_canary_executed", "provider_canary_executed_not_false", "provider canary execution is not part of v3.8L"))
-    if summary.get("real_calls_count") != 0:
-        blockers.append(blocked_item("summary.real_calls_count", "real_calls_not_zero", "v3.8L must not make real calls"))
-    if summary.get("token_usage_total") != 0:
-        blockers.append(blocked_item("summary.token_usage_total", "token_usage_not_zero", "v3.8L must not consume tokens"))
+    if not is_numeric_zero(summary.get("real_calls_count")):
+        blockers.append(blocked_item("summary.real_calls_count", "real_calls_count_not_numeric_zero", "v3.8L real call count must be integer zero"))
+    if not is_numeric_zero(summary.get("token_usage_total")):
+        blockers.append(blocked_item("summary.token_usage_total", "token_usage_total_not_numeric_zero", "v3.8L token usage must be integer zero"))
     if summary.get("actual_30d_readiness_status") != ACTUAL_30D_READINESS_STATUS:
         blockers.append(blocked_item("summary.actual_30d_readiness_status", "actual_30d_readiness_status_invalid", "actual 30D readiness must remain DATA_NOT_MATURED"))
     if summary.get("next_check_after") != ACTUAL_30D_NEXT_CHECK_AFTER:
@@ -750,6 +804,7 @@ def source_stage_blockers(summary: dict[str, Any]) -> list[dict[str, Any]]:
     stages = summary.get("source_stages")
     if not isinstance(stages, list):
         return [blocked_item("summary.source_stages", "source_stages_not_list", "source_stages must be list")]
+    canonical_by_id = canonical_stage_map()
     stage_ids: list[str] = []
     for index, stage in enumerate(stages):
         stage_path = f"summary.source_stages[{index}]"
@@ -764,6 +819,18 @@ def source_stage_blockers(summary: dict[str, Any]) -> list[dict[str, Any]]:
         if expected is None:
             blockers.append(blocked_item(f"{stage_path}.stage_id", "source_stage_unexpected", "unexpected source stage id"))
             continue
+        canonical_stage = canonical_by_id[stage_id]
+        for canonical_key, canonical_value in canonical_stage.items():
+            if canonical_key == "metadata_sha256":
+                continue
+            if stage.get(canonical_key) != canonical_value:
+                blockers.append(
+                    blocked_item(
+                        f"{stage_path}.{canonical_key}",
+                        f"source_stage_{canonical_key}_canonical_mismatch",
+                        f"{canonical_key} must match canonical source-stage payload",
+                    )
+                )
         if stage.get("pr_number") != expected["pr_number"]:
             blockers.append(blocked_item(f"{stage_path}.pr_number", "source_stage_pr_mismatch", "source PR must match canonical stage"))
         if not is_hex(stage.get("head_sha"), 40):
@@ -801,10 +868,8 @@ def source_stage_blockers(summary: dict[str, Any]) -> list[dict[str, Any]]:
         if stage.get("repo_raw_committed") is not False:
             blockers.append(blocked_item(f"{stage_path}.repo_raw_committed", "source_repo_raw_committed", "source stage must not commit raw payloads"))
         _raw_metadata_blockers(blockers, stage, stage_path)
-        if stage.get("metadata_sha256"):
-            expected_hash = stable_sha256_json(stage_hash_payload(stage))
-            if stage.get("metadata_sha256") != expected_hash:
-                blockers.append(blocked_item(f"{stage_path}.metadata_sha256", "source_metadata_sha256_mismatch", "metadata hash must match source stage payload"))
+        if stage.get("metadata_sha256") != canonical_stage["metadata_sha256"]:
+            blockers.append(blocked_item(f"{stage_path}.metadata_sha256", "source_metadata_sha256_mismatch", "metadata hash must match canonical source-stage payload"))
     if stage_ids != list(STAGE_ORDER):
         blockers.append(blocked_item("summary.source_stages", "source_stage_order_mismatch", "source stages must be present in canonical order"))
     if sorted(stage_ids) != sorted(STAGE_ORDER):
@@ -831,20 +896,21 @@ def _raw_metadata_blockers(blockers: list[dict[str, Any]], stage: dict[str, Any]
 def evidence_digest_blockers(summary: dict[str, Any]) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
     stages = [stage for stage in summary.get("source_stages", []) if isinstance(stage, dict)]
+    canonical_stages = canonical_source_stages()
+    canonical_hashes = {stage["stage_id"]: stage.get("metadata_sha256") for stage in canonical_stages}
+    canonical_statuses = {stage["stage_id"]: stage.get("status") for stage in canonical_stages}
     if summary.get("source_real_calls_count_total") != sum(safe_nonnegative_int(stage.get("real_calls_count")) for stage in stages):
         blockers.append(blocked_item("summary.source_real_calls_count_total", "source_real_calls_total_mismatch", "source call total must equal stage totals"))
     if summary.get("source_token_usage_total") != sum(safe_nonnegative_int(stage.get("token_usage_total")) for stage in stages):
         blockers.append(blocked_item("summary.source_token_usage_total", "source_token_total_mismatch", "source token total must equal stage totals"))
-    expected_stage_hashes = {stage["stage_id"]: stage.get("metadata_sha256") for stage in stages if "stage_id" in stage}
-    if summary.get("source_stage_hashes") != expected_stage_hashes:
-        blockers.append(blocked_item("summary.source_stage_hashes", "source_stage_hashes_mismatch", "source stage hashes must match stage payloads"))
-    expected_statuses = {stage["stage_id"]: stage.get("status") for stage in stages if "stage_id" in stage}
-    if summary.get("source_stage_statuses") != expected_statuses:
-        blockers.append(blocked_item("summary.source_stage_statuses", "source_stage_statuses_mismatch", "source stage statuses must match stage payloads"))
+    if summary.get("source_stage_hashes") != canonical_hashes:
+        blockers.append(blocked_item("summary.source_stage_hashes", "source_stage_hashes_mismatch", "source stage hashes must match canonical source-stage payloads"))
+    if summary.get("source_stage_statuses") != canonical_statuses:
+        blockers.append(blocked_item("summary.source_stage_statuses", "source_stage_statuses_mismatch", "source stage statuses must match canonical evidence"))
     if not is_hex(summary.get("source_stage_metadata_sha256"), 64):
         blockers.append(blocked_item("summary.source_stage_metadata_sha256", "source_stage_metadata_sha256_invalid", "source metadata digest is required"))
-    elif summary.get("source_stage_metadata_sha256") != stable_sha256_json(stages):
-        blockers.append(blocked_item("summary.source_stage_metadata_sha256", "source_stage_metadata_sha256_mismatch", "source metadata digest must match source_stages"))
+    elif summary.get("source_stage_metadata_sha256") != stable_sha256_json(canonical_stages):
+        blockers.append(blocked_item("summary.source_stage_metadata_sha256", "source_stage_metadata_sha256_mismatch", "source metadata digest must match canonical source-stage payloads"))
     if not is_hex(summary.get("conclusion_template_sha256"), 64):
         blockers.append(blocked_item("summary.conclusion_template_sha256", "conclusion_template_sha256_invalid", "template digest is required"))
     elif summary.get("conclusion_template_sha256") != conclusion_template_digest(summary):
@@ -903,19 +969,25 @@ def choose_status(blockers: list[dict[str, Any]]) -> str:
         return STATUS_BLOCKED_ARTIFACT_BOUNDARY
     if any("verdict_overreach" in reason or "actual_or_superiority_verdict" in reason or "comparative_or_action" in reason for reason in reasons):
         return STATUS_BLOCKED_VERDICT_OVERREACH
-    if any("claim" in reason or "overclaim" in reason for reason in reasons):
-        return STATUS_BLOCKED_CLAIM_BOUNDARY
+    if any("provider_canary_execution_text_claim" in reason for reason in reasons):
+        return STATUS_BLOCKED_RUNTIME_BOUNDARY
     if any(
         reason.endswith("_not_false")
         or reason in {
             "real_calls_not_zero",
             "token_usage_not_zero",
+            "real_calls_count_not_numeric_zero",
+            "token_usage_total_not_numeric_zero",
             "output_dir_not_tmp",
             "run_id_exists",
         }
         for reason in reasons
     ):
         return STATUS_BLOCKED_RUNTIME_BOUNDARY
+    if any("source_stage" in reason or "source_" in reason or "metadata_sha256" in reason or "conclusion_template_sha256" in reason for reason in reasons):
+        return STATUS_BLOCKED_MISSING_EVIDENCE
+    if any("claim" in reason or "overclaim" in reason for reason in reasons):
+        return STATUS_BLOCKED_CLAIM_BOUNDARY
     if any(
         reason.endswith("_invalid")
         or reason.endswith("_not_list")
@@ -927,8 +999,6 @@ def choose_status(blockers: list[dict[str, Any]]) -> str:
         return STATUS_BLOCKED_SCHEMA
     if any("runtime" in reason or "flag" in reason or "provider" in reason or "backend" in reason or "executable" in reason or "canary" in reason or "output_dir" in reason for reason in reasons):
         return STATUS_BLOCKED_RUNTIME_BOUNDARY
-    if any("source_stage" in reason or "source_" in reason or "metadata_sha256" in reason or "conclusion_template_sha256" in reason for reason in reasons):
-        return STATUS_BLOCKED_MISSING_EVIDENCE
     if any("schema" in reason or "missing" in reason for reason in reasons):
         return STATUS_BLOCKED_SCHEMA
     return STATUS_BLOCKED_SCHEMA
@@ -1008,7 +1078,6 @@ def build_summary(config: TemplateConfig) -> dict[str, Any]:
         blockers = [blocked_item(run_root, "run_id_exists", "run id already exists; pass --allow-overwrite to replace")]
         summary["template_status"] = STATUS_RUN_ID_EXISTS
         finalize_blockers(summary, blockers)
-        write_outputs(summary, run_root=run_root, allow_overwrite=True)
         return summary
     summary = build_from_fixture(config, run_root=run_root) if config.summary_fixture else build_default_template(config, run_root=run_root)
     write_outputs(summary, run_root=run_root, allow_overwrite=config.allow_overwrite)
