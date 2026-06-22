@@ -67,6 +67,44 @@ EXPECTED_SOURCE_MERGE_COMMITS = {
     "68": "b92be9870db661dd27015f4e8dcccd5d7235541e",
     "69": "cce6cec18ba856d986e8144d8e7915c37d6c9822",
 }
+EXPECTED_STAGE_EVIDENCE = {
+    "v3.8B": {
+        "pr_number": 66,
+        "merge_commit": EXPECTED_SOURCE_MERGE_COMMITS["66"],
+        "status": EXPECTED_STAGE_STATUS["v3.8B"],
+        "real_calls_count": 1,
+        "token_usage_total": 86,
+        "latency_ms_values": [3680],
+        "provider_or_backend_called": True,
+    },
+    "v3.8C": {
+        "pr_number": 67,
+        "merge_commit": EXPECTED_SOURCE_MERGE_COMMITS["67"],
+        "status": EXPECTED_STAGE_STATUS["v3.8C"],
+        "real_calls_count": 3,
+        "token_usage_total": 6518,
+        "latency_ms_values": [24065, 26041, 24631],
+        "provider_or_backend_called": True,
+    },
+    "v3.8D": {
+        "pr_number": 68,
+        "merge_commit": EXPECTED_SOURCE_MERGE_COMMITS["68"],
+        "status": EXPECTED_STAGE_STATUS["v3.8D"],
+        "real_calls_count": 3,
+        "token_usage_total": 6765,
+        "latency_ms_values": [24152, 25517, 26395],
+        "provider_or_backend_called": True,
+    },
+    "v3.8E": {
+        "pr_number": 69,
+        "merge_commit": EXPECTED_SOURCE_MERGE_COMMITS["69"],
+        "status": EXPECTED_STAGE_STATUS["v3.8E"],
+        "real_calls_count": 0,
+        "token_usage_total": 0,
+        "latency_ms_values": [40, 47, 1000],
+        "provider_or_backend_called": False,
+    },
+}
 LEGACY_BACKEND_RE = re.compile(r"\b(?:ki" + "mi|g" + "lm|deep" + "seek)\b", re.IGNORECASE)
 HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -259,6 +297,10 @@ def median_value(values: list[int]) -> int | float | None:
     return statistics.median(values)
 
 
+def safe_nonnegative_int(value: Any) -> int:
+    return value if isinstance(value, int) and value >= 0 else 0
+
+
 def latency_summary(values: list[int]) -> dict[str, int | float | None]:
     return {"min": min(values) if values else None, "median": median_value(values), "max": max(values) if values else None}
 
@@ -383,7 +425,7 @@ def enrich_stage_hashes(stages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def source_latency_values(stages: list[dict[str, Any]], *, real_connection_only: bool) -> list[int]:
     values: list[int] = []
     for stage in stages:
-        if real_connection_only and int(stage.get("real_calls_count") or 0) <= 0:
+        if real_connection_only and safe_nonnegative_int(stage.get("real_calls_count")) <= 0:
             continue
         for item in stage.get("latency_ms_values") or []:
             if isinstance(item, int) and item >= 0:
@@ -508,7 +550,7 @@ def recursive_paths(value: Any, *, key_hint: str = "") -> list[str]:
         "source_artifact_path",
         "source_artifact_paths",
     }
-    if isinstance(value, str) and key_hint in path_keys:
+    if isinstance(value, str) and (key_hint in path_keys or claim_scan.forbidden_path(value)):
         paths.append(value)
     elif isinstance(value, dict):
         for key, item in value.items():
@@ -527,8 +569,7 @@ def should_scan_key(path: str) -> bool:
 def claim_blockers(payload: dict[str, Any]) -> list[dict[str, Any]]:
     sources: list[claim_scan.ScanSource] = []
     for path, text in recursive_strings(payload, path="dashboard"):
-        if should_scan_key(path):
-            sources.append(claim_scan.ScanSource(path=path, text=text, origin="v3_8f_dashboard"))
+        sources.append(claim_scan.ScanSource(path=path, text=text, origin="v3_8f_dashboard"))
     scan = claim_scan.scan_sources(sources)
     direct_key = "direct" + "_llm"
     blockers = scan["overclaim"] + scan[direct_key] + scan["maturity_gate"] + scan["short_horizon_as_30d"]
@@ -580,6 +621,10 @@ def schema_blockers(summary: dict[str, Any]) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
     if summary.get("schema") != SUMMARY_SCHEMA:
         blockers.append(blocked_item("summary.schema", "summary_schema_mismatch", f"schema must be {SUMMARY_SCHEMA}"))
+    if summary.get("backend_name") != DEFAULT_BACKEND_NAME or LEGACY_BACKEND_RE.search(str(summary.get("backend_name") or "")):
+        blockers.append(blocked_item("summary.backend_name", "top_level_backend_not_allowed", "top-level backend must match canonical source backend"))
+    if summary.get("model") != DEFAULT_MODEL:
+        blockers.append(blocked_item("summary.model", "top_level_model_not_allowed", "top-level model must match canonical source model"))
     status = str(summary.get("dashboard_status") or "")
     if status not in ALLOWED_STATUSES:
         blockers.append(blocked_item("summary.dashboard_status", "invalid_dashboard_status", "dashboard_status is not allowed"))
@@ -603,26 +648,37 @@ def schema_blockers(summary: dict[str, Any]) -> list[dict[str, Any]]:
             blockers.append(blocked_item(f"{stage_path}.stage_id", "source_stage_unexpected", "unexpected source stage id"))
         elif stage.get("status") != EXPECTED_STAGE_STATUS[stage_id]:
             blockers.append(blocked_item(f"{stage_path}.status", "source_stage_status_mismatch", "source stage status does not match expected evidence"))
+        expected_stage = EXPECTED_STAGE_EVIDENCE.get(stage_id)
         if not isinstance(stage.get("pr_number"), int) or stage.get("pr_number") not in EXPECTED_SOURCE_PRS:
             blockers.append(blocked_item(f"{stage_path}.pr_number", "source_stage_pr_invalid", "source stage PR number is invalid"))
-        expected_commit = EXPECTED_SOURCE_MERGE_COMMITS.get(str(stage.get("pr_number")))
+        elif expected_stage and stage.get("pr_number") != expected_stage["pr_number"]:
+            blockers.append(blocked_item(f"{stage_path}.pr_number", "source_stage_pr_mismatch", "source stage PR must match canonical stage id"))
         if not is_hex(stage.get("merge_commit"), 40):
             blockers.append(blocked_item(f"{stage_path}.merge_commit", "source_stage_merge_commit_invalid", "merge commit must be 40-char hex"))
-        elif expected_commit and stage.get("merge_commit") != expected_commit:
-            blockers.append(blocked_item(f"{stage_path}.merge_commit", "source_stage_merge_commit_mismatch", "merge commit does not match source evidence"))
+        elif expected_stage and stage.get("merge_commit") != expected_stage["merge_commit"]:
+            blockers.append(blocked_item(f"{stage_path}.merge_commit", "source_stage_merge_commit_mismatch", "merge commit does not match canonical stage id"))
         if stage.get("backend_name") != DEFAULT_BACKEND_NAME or LEGACY_BACKEND_RE.search(str(stage.get("backend_name") or "")):
             blockers.append(blocked_item(f"{stage_path}.backend_name", "source_stage_backend_not_allowed", "source backend is not allowed"))
         if stage.get("model") != DEFAULT_MODEL:
             blockers.append(blocked_item(f"{stage_path}.model", "source_stage_model_not_allowed", "source model is not allowed"))
+        call_count_for_flag: int | None = None
         for key in ("real_calls_count", "token_usage_total"):
             if not isinstance(stage.get(key), int) or stage.get(key) < 0:
                 blockers.append(blocked_item(f"{stage_path}.{key}", f"{key}_invalid", f"{key} must be non-negative integer"))
-        if stage.get("provider_or_backend_called") != (int(stage.get("real_calls_count") or 0) > 0):
+            elif expected_stage and stage.get(key) != expected_stage[key]:
+                blockers.append(blocked_item(f"{stage_path}.{key}", f"source_stage_{key}_mismatch", f"{key} must match canonical source evidence"))
+        if isinstance(stage.get("real_calls_count"), int):
+            call_count_for_flag = int(stage.get("real_calls_count") or 0)
+        if call_count_for_flag is not None and stage.get("provider_or_backend_called") != (call_count_for_flag > 0):
             blockers.append(blocked_item(f"{stage_path}.provider_or_backend_called", "source_provider_flag_mismatch", "source provider flag must match source call count"))
+        if expected_stage and stage.get("provider_or_backend_called") != expected_stage["provider_or_backend_called"]:
+            blockers.append(blocked_item(f"{stage_path}.provider_or_backend_called", "source_provider_flag_canonical_mismatch", "source provider flag must match canonical source evidence"))
         if stage.get("codex_cli_new_call") is not False or stage.get("formal_lite_entered") is not False:
             blockers.append(blocked_item(stage_path, "source_runtime_flag_not_false", "source runtime flags must remain false"))
         if not isinstance(stage.get("latency_ms_values"), list) or not all(isinstance(value, int) and value >= 0 for value in stage.get("latency_ms_values", [])):
             blockers.append(blocked_item(f"{stage_path}.latency_ms_values", "source_latency_values_invalid", "latency values must be non-negative integers"))
+        elif expected_stage and stage.get("latency_ms_values") != expected_stage["latency_ms_values"]:
+            blockers.append(blocked_item(f"{stage_path}.latency_ms_values", "source_latency_values_mismatch", "latency values must match canonical source evidence"))
         if stage.get("usage_metadata_available") is not True:
             blockers.append(blocked_item(f"{stage_path}.usage_metadata_available", "source_usage_metadata_unavailable", "source usage metadata must be available"))
         if stage.get("raw_tmp_boundary") != "tmp_only":
@@ -665,8 +721,8 @@ def schema_blockers(summary: dict[str, Any]) -> list[dict[str, Any]]:
 def provenance_blockers(summary: dict[str, Any]) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
     stages = [stage for stage in summary.get("source_stages", []) if isinstance(stage, dict)]
-    expected_calls = sum(int(stage.get("real_calls_count") or 0) for stage in stages)
-    expected_tokens = sum(int(stage.get("token_usage_total") or 0) for stage in stages)
+    expected_calls = sum(safe_nonnegative_int(stage.get("real_calls_count")) for stage in stages)
+    expected_tokens = sum(safe_nonnegative_int(stage.get("token_usage_total")) for stage in stages)
     if summary.get("source_real_calls_count_total") != expected_calls:
         blockers.append(blocked_item("summary.source_real_calls_count_total", "source_real_calls_total_mismatch", "source call total must equal stage totals"))
     if summary.get("source_token_usage_total") != expected_tokens:
@@ -674,6 +730,11 @@ def provenance_blockers(summary: dict[str, Any]) -> list[dict[str, Any]]:
     expected_by_stage = {stage["stage_id"]: latency_summary(list(stage["latency_ms_values"])) for stage in stages if "stage_id" in stage and isinstance(stage.get("latency_ms_values"), list)}
     if summary.get("latency_summary_by_stage") != expected_by_stage:
         blockers.append(blocked_item("summary.latency_summary_by_stage", "latency_summary_by_stage_mismatch", "latency summary by stage must match stage values"))
+    expected_real_latency = latency_summary(source_latency_values(stages, real_connection_only=True))
+    expected_all_latency = latency_summary(source_latency_values(stages, real_connection_only=False))
+    expected_source_latency = {"real_connection_ms": expected_real_latency, "all_recorded_ms": expected_all_latency}
+    if summary.get("source_latency_summary") != expected_source_latency:
+        blockers.append(blocked_item("summary.source_latency_summary", "source_latency_summary_mismatch", "aggregate latency summary must match stage values"))
     expected_usage = {stage["stage_id"]: stage.get("usage_metadata_available") for stage in stages if "stage_id" in stage}
     if summary.get("usage_availability_by_stage") != expected_usage:
         blockers.append(blocked_item("summary.usage_availability_by_stage", "usage_availability_by_stage_mismatch", "usage availability must match stage metadata"))
@@ -683,6 +744,8 @@ def provenance_blockers(summary: dict[str, Any]) -> list[dict[str, Any]]:
     else:
         if not is_hex(metadata_hashes.get("source_stage_metadata_sha256"), 64):
             blockers.append(blocked_item("summary.metadata_hashes.source_stage_metadata_sha256", "source_stage_metadata_sha256_invalid", "source metadata digest is required"))
+        elif metadata_hashes.get("source_stage_metadata_sha256") != stable_sha256_json(stages):
+            blockers.append(blocked_item("summary.metadata_hashes.source_stage_metadata_sha256", "source_stage_metadata_sha256_mismatch", "source metadata digest must match source_stages"))
         expected_stage_hashes = {stage["stage_id"]: stage.get("metadata_sha256") for stage in stages if "stage_id" in stage}
         if metadata_hashes.get("source_stage_hashes") != expected_stage_hashes:
             blockers.append(blocked_item("summary.metadata_hashes.source_stage_hashes", "source_stage_hashes_mismatch", "source stage hashes must match stage payloads"))
@@ -702,7 +765,7 @@ def finalize_blockers(summary: dict[str, Any], blockers: list[dict[str, Any]]) -
         "raw_outputs",
     )
     summary["artifact_boundary_status"] = "blocked" if any(any(token in str(item.get("rule_id")) for token in artifact_rules) for item in blockers) else "clean"
-    summary["runtime_boundary_status"] = "blocked" if any("runtime" in str(item.get("rule_id")) or "flag" in str(item.get("rule_id")) or "provider" in str(item.get("rule_id")) or "backend" in str(item.get("rule_id")) for item in blockers) else "clean"
+    summary["runtime_boundary_status"] = "blocked" if any("runtime" in str(item.get("rule_id")) or "flag" in str(item.get("rule_id")) or "provider" in str(item.get("rule_id")) or "backend" in str(item.get("rule_id")) or "output_dir" in str(item.get("rule_id")) for item in blockers) else "clean"
     summary["provenance_status"] = "blocked" if any("provenance" in str(item.get("rule_id")) or "mismatch" in str(item.get("rule_id")) or "hash" in str(item.get("rule_id")) for item in blockers) else "clean"
 
 

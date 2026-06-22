@@ -33,6 +33,8 @@ Raw provider/backend payloads remain `/tmp` only. The repo stores only code, tes
 
 The validator blocks malformed dashboard summaries, missing source stages, source merge/status mismatches, non-`/tmp` raw paths, legacy backend references, unsafe runtime flags, inconsistent source call/token totals, parametric-memory interpretation drift, and text that tries to upgrade engineering evidence into an actual 30D verdict or claim-boundary overreach.
 
+Repair hardening requires the validator to recompute aggregate source-stage metadata hashes, recompute aggregate latency summaries, bind each stage id to its canonical PR/merge/call/token evidence, reject malformed call/token types without crashing, scan all fixture strings for claim/path boundaries, validate top-level backend/model fields, and mark output-dir violations as runtime-boundary blockers without writing outside `/tmp`.
+
 Allowed statuses:
 
 - `REAL_CONNECTION_EVIDENCE_DASHBOARD_READY`

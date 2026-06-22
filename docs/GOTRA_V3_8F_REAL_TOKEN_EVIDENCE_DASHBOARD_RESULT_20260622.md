@@ -56,6 +56,21 @@ Cannot say:
 
 `direct_llm_interpretation=direct_llm_parametric_memory_control` remains the only historical direct LLM interpretation.
 
+## Repair Hardening
+
+The PR #70 repair hardens the dashboard validator against fixture tampering:
+
+- `metadata_hashes.source_stage_metadata_sha256` is recomputed from `source_stages`.
+- `source_latency_summary` is recomputed from all stage latency values.
+- each stage id is bound to the canonical PR number, merge commit, call count, token count, latency values, and provider-called flag.
+- malformed numeric evidence returns structured blockers instead of crashing.
+- every fixture string is scanned for claim-boundary text, including unexpected fields.
+- every fixture string is checked for forbidden/raw artifact paths.
+- top-level backend/model fields must match the canonical source backend/model.
+- output directories outside `/tmp` set `runtime_boundary_status=blocked` and do not write summary/manifest files.
+
+Focused repair coverage: `21` v3.8F tests.
+
 ## Local Validation Target
 
 The local dashboard validation writes only to `/tmp`:

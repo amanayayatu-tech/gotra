@@ -22,6 +22,7 @@ def test_valid_dashboard_fixture_is_ready(tmp_path: Path) -> None:
     assert summary["artifact_boundary_status"] == "clean"
     assert summary["claim_boundary_status"] == "clean"
     assert summary["evidence_layer"] == dashboard.EVIDENCE_LAYER
+    assert summary["metadata_hashes"]["source_stage_metadata_sha256"] == dashboard.stable_sha256_json(summary["source_stages"])
 
 
 def test_missing_source_stage_blocks_schema(tmp_path: Path) -> None:
@@ -31,7 +32,7 @@ def test_missing_source_stage_blocks_schema(tmp_path: Path) -> None:
 
     summary = dashboard.build_summary(_config(tmp_path, fixture=fixture))
 
-    assert summary["dashboard_status"] == dashboard.STATUS_BLOCKED_SCHEMA
+    assert summary["dashboard_status"] in {dashboard.STATUS_BLOCKED_SCHEMA, dashboard.STATUS_BLOCKED_PROVENANCE}
     assert "source_stage_set_mismatch" in summary["blocker_reasons"]
 
 
@@ -112,6 +113,95 @@ def test_inconsistent_total_calls_and_tokens_blocks_provenance(tmp_path: Path) -
     assert "source_token_total_mismatch" in summary["blocker_reasons"]
 
 
+def test_aggregate_metadata_sha_mismatch_blocks(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["metadata_hashes"]["source_stage_metadata_sha256"] = "0" * 64  # type: ignore[index]
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = dashboard.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["dashboard_status"] == dashboard.STATUS_BLOCKED_PROVENANCE
+    assert "source_stage_metadata_sha256_mismatch" in summary["blocker_reasons"]
+
+
+def test_aggregate_source_latency_summary_mismatch_blocks(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["source_latency_summary"] = {
+        "real_connection_ms": {"min": 1, "median": 1, "max": 1},
+        "all_recorded_ms": {"min": 1, "median": 1, "max": 1},
+    }
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = dashboard.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["dashboard_status"] == dashboard.STATUS_BLOCKED_PROVENANCE
+    assert "source_latency_summary_mismatch" in summary["blocker_reasons"]
+
+
+def test_changed_canonical_source_call_and_token_values_block(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["source_stages"][1]["real_calls_count"] = 4  # type: ignore[index]
+    payload["source_stages"][1]["token_usage_total"] = 999  # type: ignore[index]
+    payload["source_real_calls_count_total"] = 8
+    payload["source_token_usage_total"] = 7850
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = dashboard.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["dashboard_status"] in {dashboard.STATUS_BLOCKED_SCHEMA, dashboard.STATUS_BLOCKED_PROVENANCE}
+    assert "source_stage_real_calls_count_mismatch" in summary["blocker_reasons"]
+    assert "source_stage_token_usage_total_mismatch" in summary["blocker_reasons"]
+
+
+def test_swapped_stage_pr_merge_pair_blocks(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    b_stage = payload["source_stages"][0]  # type: ignore[index]
+    c_stage = payload["source_stages"][1]  # type: ignore[index]
+    b_stage["pr_number"], c_stage["pr_number"] = c_stage["pr_number"], b_stage["pr_number"]  # type: ignore[index]
+    b_stage["merge_commit"], c_stage["merge_commit"] = c_stage["merge_commit"], b_stage["merge_commit"]  # type: ignore[index]
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = dashboard.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["dashboard_status"] in {dashboard.STATUS_BLOCKED_SCHEMA, dashboard.STATUS_BLOCKED_PROVENANCE}
+    assert "source_stage_pr_mismatch" in summary["blocker_reasons"]
+    assert "source_stage_merge_commit_mismatch" in summary["blocker_reasons"]
+
+
+def test_malformed_real_calls_count_returns_structured_block(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["source_stages"][0]["real_calls_count"] = [1]  # type: ignore[index]
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = dashboard.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["dashboard_status"] == dashboard.STATUS_BLOCKED_SCHEMA
+    assert "real_calls_count_invalid" in summary["blocker_reasons"]
+    assert "source_real_calls_total_mismatch" in summary["blocker_reasons"]
+
+
+def test_unexpected_field_overclaim_blocks(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["marketing"] = "This internal dashboard is public science proof."
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = dashboard.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["dashboard_status"] == dashboard.STATUS_BLOCKED_OVERCLAIM
+    assert summary["claim_boundary_status"] == "blocked"
+
+
+def test_unexpected_field_forbidden_path_blocks(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["evidence"] = "data/backtest/" + "runs/raw.json"
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = dashboard.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["dashboard_status"] == dashboard.STATUS_BLOCKED_ARTIFACT_BOUNDARY
+    assert "forbidden_artifact_reference" in summary["blocker_reasons"]
+
+
 def test_legacy_backend_blocks_runtime(tmp_path: Path) -> None:
     payload = _ready_fixture()
     payload["source_stages"][0]["backend_name"] = "deepseek_legacy_backend"  # type: ignore[index]
@@ -121,6 +211,19 @@ def test_legacy_backend_blocks_runtime(tmp_path: Path) -> None:
 
     assert summary["dashboard_status"] == dashboard.STATUS_BLOCKED_RUNTIME_BOUNDARY
     assert "source_stage_backend_not_allowed" in summary["blocker_reasons"]
+
+
+def test_top_level_backend_and_model_override_blocks(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["backend_name"] = "deepseek_legacy_backend"
+    payload["model"] = "unexpected-model"
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = dashboard.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["dashboard_status"] == dashboard.STATUS_BLOCKED_RUNTIME_BOUNDARY
+    assert "top_level_backend_not_allowed" in summary["blocker_reasons"]
+    assert "top_level_model_not_allowed" in summary["blocker_reasons"]
 
 
 def test_direct_llm_mislabel_blocks(tmp_path: Path) -> None:
@@ -151,6 +254,7 @@ def test_output_dir_outside_tmp_does_not_write(tmp_path: Path) -> None:
     run_root = output_dir / run_id
     assert summary["dashboard_status"] == dashboard.STATUS_BLOCKED_RUNTIME_BOUNDARY
     assert "output_dir_not_tmp" in summary["blocker_reasons"]
+    assert summary["runtime_boundary_status"] == "blocked"
     assert not run_root.exists()
     assert not (run_root / "summary.json").exists()
 
