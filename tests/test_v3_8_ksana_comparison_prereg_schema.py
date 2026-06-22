@@ -88,19 +88,70 @@ def test_missing_or_wrong_source_hash_or_run_id_blocks_provenance(tmp_path: Path
     assert "source_run_id_mismatch" in summary["blocker_reasons"]
 
 
+def test_missing_primary_arm_provenance_blocks(tmp_path: Path) -> None:
+    payload = _valid_fixture()
+    payload["provenance"]["arms"].pop("full_gotra")
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = prereg.build_summary(_config(tmp_path, fixture))
+
+    assert summary["validator_status"] == prereg.STATUS_BLOCKED_PROVENANCE
+    assert "provenance_arm_missing" in summary["blocker_reasons"]
+
+
+def test_primary_comparator_baseline_or_treatment_roles_are_allowed(tmp_path: Path) -> None:
+    payload = _valid_fixture()
+    payload["arms"][0]["role"] = "treatment"
+    payload["arms"][1]["role"] = "baseline"
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = prereg.build_summary(_config(tmp_path, fixture))
+
+    assert summary["validator_status"] == prereg.STATUS_READY
+
+
+def test_duplicate_primary_arms_block_schema(tmp_path: Path) -> None:
+    payload = _valid_fixture()
+    payload["arms"].insert(1, dict(payload["arms"][0]))
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = prereg.build_summary(_config(tmp_path, fixture))
+
+    assert summary["validator_status"] == prereg.STATUS_BLOCKED_SCHEMA
+    assert "duplicate_arm_id" in summary["blocker_reasons"]
+
+
+def test_repo_relative_artifact_hash_uses_repo_root_fallback(tmp_path: Path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    artifact = repo_root / "fixtures" / "v3_8" / "ksana_real_research.json"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text('{"fixture": true}', encoding="utf-8")
+    payload = _valid_fixture()
+    payload["arms"][0]["source_artifact_sha256"] = "0" * 64
+    fixture = _write_fixture(tmp_path / "outside_repo", payload)
+    monkeypatch.setattr(prereg, "REPO_ROOT", repo_root)
+
+    summary = prereg.build_summary(_config(tmp_path, fixture))
+
+    assert summary["validator_status"] == prereg.STATUS_BLOCKED_PROVENANCE
+    assert "source_artifact_sha256_mismatch" in summary["blocker_reasons"]
+
+
 def test_forbidden_artifact_path_blocks_without_reading_content(tmp_path: Path, monkeypatch) -> None:
     payload = _valid_fixture()
     payload["arms"][0]["source_artifact_path"] = "data/backtest/runs/raw.json"
     payload["provenance"]["arms"]["ksana_real_research"]["source_artifact_path"] = "data/backtest/runs/raw.json"
+    forbidden = tmp_path / "data" / "backtest" / "runs" / "raw.json"
+    forbidden.parent.mkdir(parents=True)
+    forbidden.write_text('{"secret": "do not read"}', encoding="utf-8")
     fixture = _write_fixture(tmp_path, payload)
-    original_read_text = Path.read_text
 
-    def fail_read(path: Path, *args: object, **kwargs: object) -> str:
+    def fail_hash(path: Path) -> str:
         if "data/backtest/runs" in str(path):
             raise AssertionError("forbidden artifact content should not be read")
-        return original_read_text(path, *args, **kwargs)
+        return "0" * 64
 
-    monkeypatch.setattr(Path, "read_text", fail_read)
+    monkeypatch.setattr(prereg, "sha256_file", fail_hash)
     summary = prereg.build_summary(_config(tmp_path, fixture))
 
     assert summary["validator_status"] == prereg.STATUS_BLOCKED_ARTIFACT_BOUNDARY
@@ -150,6 +201,30 @@ def test_cli_returns_nonzero_for_blockers(tmp_path: Path) -> None:
     assert status == 1
 
 
+def test_malformed_non_claims_blocks_schema(tmp_path: Path) -> None:
+    fixture = _write_fixture(tmp_path, _valid_fixture(non_claims=False))
+
+    summary = prereg.build_summary(_config(tmp_path, fixture))
+
+    assert summary["validator_status"] == prereg.STATUS_BLOCKED_SCHEMA
+    assert "non_claims_invalid" in summary["blocker_reasons"]
+
+
+def test_legacy_codex_cli_called_true_or_missing_blocks_runtime(tmp_path: Path) -> None:
+    payload = _valid_fixture(codex_cli_called=True)
+    fixture_true = _write_fixture(tmp_path / "true", payload)
+    summary_true = prereg.build_summary(_config(tmp_path / "true", fixture_true))
+    missing = _valid_fixture()
+    missing.pop("codex_cli_called")
+    fixture_missing = _write_fixture(tmp_path / "missing", missing)
+    summary_missing = prereg.build_summary(_config(tmp_path / "missing", fixture_missing))
+
+    assert summary_true["validator_status"] == prereg.STATUS_BLOCKED_RUNTIME_BOUNDARY
+    assert "codex_cli_called_not_false" in summary_true["blocker_reasons"]
+    assert summary_missing["validator_status"] == prereg.STATUS_BLOCKED_RUNTIME_BOUNDARY
+    assert "missing_codex_cli_called" in summary_missing["blocker_reasons"]
+
+
 def _valid_fixture(**updates: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "comparison_id": "v3_8_ksana_real_research_vs_full_gotra_fixture",
@@ -177,6 +252,7 @@ def _valid_fixture(**updates: object) -> dict[str, object]:
         "actual_30d_readiness_status": prereg.ACTUAL_30D_READINESS_STATUS,
         "actual_30d_next_check_after": prereg.ACTUAL_30D_NEXT_CHECK_AFTER,
         "provider_or_backend_called": False,
+        "codex_cli_called": False,
         "codex_cli_new_call": False,
         "formal_lite_entered": False,
         "v3_7_actual_verdict_executable": False,

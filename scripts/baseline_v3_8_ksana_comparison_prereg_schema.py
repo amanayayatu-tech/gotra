@@ -50,6 +50,7 @@ OPTIONAL_DIRECT_LLM = "direct_llm_parametric_memory_control"
 FORBIDDEN_DIRECT_LLM_ROLES = {"primary", "primary_comparator", "baseline", "clean_baseline", "treatment"}
 REQUIRED_FALSE_FLAGS = (
     "provider_or_backend_called",
+    "codex_cli_called",
     "codex_cli_new_call",
     "formal_lite_entered",
     "v3_7_actual_verdict_executable",
@@ -77,6 +78,7 @@ BOUNDARY_CRITICAL_FIELDS = (
     "actual_30d_next_check_after",
     "direct_llm_interpretation",
     "provider_or_backend_called",
+    "codex_cli_called",
     "codex_cli_new_call",
     "formal_lite_entered",
     "v3_7_actual_verdict_executable",
@@ -193,6 +195,43 @@ def provenance_arms(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {}
 
 
+def is_forbidden_artifact_path(path: str) -> bool:
+    return claim_scan.forbidden_path(path) or claim_scan.forbidden_path(normalize_path(path))
+
+
+def artifact_path_candidates(path: str, *, fixture_path: Path) -> list[Path]:
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        return [candidate]
+    candidates = [(fixture_path.parent / candidate).resolve(), (REPO_ROOT / candidate).resolve()]
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for item in candidates:
+        key = str(item)
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique
+
+
+def valid_non_claims(value: Any) -> bool:
+    if isinstance(value, str):
+        text = value.strip().lower()
+        return bool(text) and "not" in text and "provider" in text and "actual" in text and (
+            "oos" in text or "science" in text or "public" in text or "trading" in text
+        )
+    if isinstance(value, dict):
+        if not value:
+            return False
+        if any(item is not True for item in value.values()):
+            return False
+        keys = " ".join(str(key).lower() for key in value)
+        return "provider" in keys and "actual" in keys and (
+            "oos" in keys or "science" in keys or "public" in keys or "trading" in keys
+        )
+    return False
+
+
 def schema_blockers(payload: dict[str, Any]) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
     for field in REQUIRED_FIELDS:
@@ -210,6 +249,8 @@ def schema_blockers(payload: dict[str, Any]) -> list[dict[str, Any]]:
         blockers.append(blocked_item("fixture", "actual_30d_next_check_after_mismatch", "next_check_after must remain 2026-07-21T00:00:00Z"))
     if payload.get("direct_llm_interpretation") != DIRECT_LLM_INTERPRETATION:
         blockers.append(blocked_item("fixture", "direct_llm_interpretation_mismatch", "direct_llm_interpretation must be direct_llm_parametric_memory_control"))
+    if not valid_non_claims(payload.get("non_claims")):
+        blockers.append(blocked_item("fixture.non_claims", "non_claims_invalid", "non_claims must be non-empty boundary attestations"))
     for field in ("comparison_id", "prereg_id"):
         if not is_non_empty_string(payload.get(field)):
             blockers.append(blocked_item("fixture", f"{field}_invalid", f"{field} must be a non-empty string"))
@@ -220,7 +261,11 @@ def schema_blockers(payload: dict[str, Any]) -> list[dict[str, Any]]:
         blockers.append(blocked_item("fixture.arms", "arms_not_list", "arms must be a list"))
     elif len(arms) != len(raw_arms):
         blockers.append(blocked_item("fixture.arms", "arm_entry_not_object", "all arm entries must be objects"))
-    arm_ids = {arm_id(entry) for entry in arms}
+    arm_ids_list = [arm_id(entry) for entry in arms if arm_id(entry)]
+    arm_ids = set(arm_ids_list)
+    duplicate_arm_ids = sorted({item for item in arm_ids_list if arm_ids_list.count(item) > 1})
+    for duplicate in duplicate_arm_ids:
+        blockers.append(blocked_item("fixture.arms", "duplicate_arm_id", f"duplicate arm_id is not allowed: {duplicate}"))
     if not REQUIRED_ARMS.issubset(arm_ids):
         blockers.append(blocked_item("fixture.arms", "required_arms_missing", "arms must include ksana_real_research and full_gotra"))
     comparison_arms = arm_ids - {OPTIONAL_DIRECT_LLM}
@@ -230,9 +275,10 @@ def schema_blockers(payload: dict[str, Any]) -> list[dict[str, Any]]:
         current_id = arm_id(entry)
         if not current_id:
             blockers.append(blocked_item(f"fixture.arms[{index}]", "arm_id_missing", "arm_id is required"))
-        if current_id == "direct_llm" or str(entry.get("role") or "").strip().lower() in FORBIDDEN_DIRECT_LLM_ROLES:
+        role = str(entry.get("role") or "").strip().lower()
+        if current_id == "direct_llm" or ("direct_llm" in current_id and current_id != OPTIONAL_DIRECT_LLM):
             blockers.append(blocked_item(f"fixture.arms[{index}]", "direct_llm_as_primary_or_clean_baseline", "direct_llm cannot be a primary comparator or clean baseline"))
-        if current_id == OPTIONAL_DIRECT_LLM and str(entry.get("role") or "").strip().lower() not in {"historical_diagnostic", "diagnostic_control", "metadata_only"}:
+        if current_id == OPTIONAL_DIRECT_LLM and role not in {"historical_diagnostic", "diagnostic_control", "metadata_only"}:
             blockers.append(blocked_item(f"fixture.arms[{index}]", "direct_llm_role_not_diagnostic", "direct_llm_parametric_memory_control must be diagnostic metadata only"))
 
     paired = payload.get("paired_design")
@@ -259,7 +305,7 @@ def artifact_blockers(payload: dict[str, Any]) -> list[dict[str, Any]]:
     blockers = claim_regression.path_blockers(payload, path="fixture")
     for entry in arm_entries(payload):
         path = str(entry.get("source_artifact_path") or "")
-        if path and claim_scan.forbidden_path(path):
+        if path and is_forbidden_artifact_path(path):
             blockers.append(blocked_item(path, "forbidden_source_artifact_path", "source artifact path violates artifact boundary"))
     return blockers
 
@@ -283,19 +329,24 @@ def provenance_blockers(payload: dict[str, Any], *, fixture_path: Path) -> list[
             blockers.append(blocked_item(entry_path, "source_artifact_sha256_invalid", "source_artifact_sha256 must be sha256 hex"))
         if entry.get("generated_at") and parse_generated_at(entry.get("generated_at")) is None:
             blockers.append(blocked_item(entry_path, "generated_at_invalid", "generated_at must be ISO-8601"))
-        prov = provenance.get(current_id, {})
-        if prov:
+        prov = provenance.get(current_id)
+        if not isinstance(prov, dict):
+            blockers.append(blocked_item(f"fixture.provenance.arms.{current_id}", "provenance_arm_missing", f"provenance for {current_id} is required"))
+        else:
             for field in ("source_run_id", "source_artifact_path", "source_summary_sha256"):
                 if prov.get(field) != entry.get(field):
                     blockers.append(blocked_item(f"fixture.provenance.arms.{current_id}", f"{field}_mismatch", f"provenance {field} must match arm"))
-        if is_non_empty_string(entry.get("source_artifact_path")) and is_hash(entry.get("source_artifact_sha256")):
-            candidate = Path(str(entry["source_artifact_path"])).expanduser()
-            if not candidate.is_absolute():
-                candidate = (fixture_path.parent / candidate).resolve()
-            if candidate.exists() and candidate.is_file():
+        source_path = str(entry.get("source_artifact_path") or "")
+        if source_path and is_forbidden_artifact_path(source_path):
+            continue
+        if is_non_empty_string(source_path) and is_hash(entry.get("source_artifact_sha256")):
+            for candidate in artifact_path_candidates(source_path, fixture_path=fixture_path):
+                if not candidate.exists() or not candidate.is_file():
+                    continue
                 actual = sha256_file(candidate)
                 if actual != str(entry["source_artifact_sha256"]).lower():
                     blockers.append(blocked_item(candidate, "source_artifact_sha256_mismatch", "source artifact hash does not match file bytes"))
+                break
     return blockers
 
 
@@ -376,6 +427,7 @@ def base_summary(config: PreregConfig, *, run_root: Path, status: str) -> dict[s
         "blocked_items": [],
         "prereg_content_sha256": "",
         "provider_or_backend_called": False,
+        "codex_cli_called": False,
         "codex_cli_new_call": False,
         "formal_lite_entered": False,
         "v3_7_actual_verdict_executable": False,
@@ -449,6 +501,7 @@ def build_summary(config: PreregConfig) -> dict[str, Any]:
             "blocked_items": blocked_items[:100],
             "prereg_content_sha256": stable_sha256_json(digest_payload(payload, status, blocker_reasons)),
             "provider_or_backend_called": bool(payload.get("provider_or_backend_called")) if payload else False,
+            "codex_cli_called": bool(payload.get("codex_cli_called")) if payload else False,
             "codex_cli_new_call": bool(payload.get("codex_cli_new_call")) if payload else False,
             "formal_lite_entered": bool(payload.get("formal_lite_entered")) if payload else False,
             "v3_7_actual_verdict_executable": bool(payload.get("v3_7_actual_verdict_executable")) if payload else False,
@@ -477,6 +530,7 @@ def write_outputs(config: PreregConfig, summary: dict[str, Any], *, run_root: Pa
         "prereg_content_sha256": summary.get("prereg_content_sha256"),
         "validator_status": summary.get("validator_status"),
         "provider_or_backend_called": False,
+        "codex_cli_called": False,
         "codex_cli_new_call": False,
         "formal_lite_entered": False,
         "v3_7_actual_verdict_executable": False,

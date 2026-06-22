@@ -49,6 +49,7 @@ Minimum fields:
 - `actual_30d_readiness_status`
 - `actual_30d_next_check_after`
 - `provider_or_backend_called`
+- `codex_cli_called`
 - `codex_cli_new_call`
 - `formal_lite_entered`
 - `v3_7_actual_verdict_executable`
@@ -66,12 +67,18 @@ Each primary arm must include:
 - `source_artifact_sha256`
 - `generated_at`
 
+Each primary arm must also have a matching nested entry under
+`provenance.arms`. Duplicate comparison arms are invalid.
+
 ## Direct LLM Boundary
 
 The only allowed direct LLM label is
 `direct_llm_parametric_memory_control`. It may be recorded only as historical
 diagnostic metadata. It is not a clean baseline, not a no-future baseline, and
 not a primary comparator for this future comparison design.
+
+Primary comparison arms may use ordinary role labels such as `baseline` or
+`treatment`; those role restrictions apply only to direct-LLM metadata entries.
 
 ## Allowed Statuses
 
