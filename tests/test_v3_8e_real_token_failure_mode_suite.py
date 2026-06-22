@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 
 from scripts import baseline_v3_8e_real_token_failure_mode_suite as suite
 
@@ -66,8 +67,10 @@ def test_provider_error_payloads_stay_under_tmp(tmp_path: Path) -> None:
 
 
 def test_output_dir_outside_tmp_does_not_write_summary_or_manifest(tmp_path: Path) -> None:
-    output_dir = tmp_path / "outside_tmp_runs"
+    output_dir = Path("/var/tmp") / f"gotra_v3_8e_outside_tmp_{tmp_path.name}"
     run_id = "baseline_v3_8e_real_token_failure_mode_suite_outside_tmp"
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
 
     summary = suite.build_summary(
         suite.FailureSuiteConfig(
