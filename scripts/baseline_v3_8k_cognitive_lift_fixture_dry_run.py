@@ -68,6 +68,7 @@ DIRECT_PREFIX = rubric.DIRECT_PREFIX
 DIRECT_INTERPRETATION_KEY = rubric.DIRECT_INTERPRETATION_KEY
 DIRECT_CLEAN_BASELINE_KEY = rubric.DIRECT_CLEAN_BASELINE_KEY
 SECRET_RE = packet_canary.SECRET_RE
+CLAIM_TEXT_SKIP_SUFFIXES = (".run_root", ".summary_path", ".manifest_path")
 VERDICT_WORD = "verd" + "ict"
 COMPARATIVE_RESULT_WORD = "win" + "ner"
 STATUS_CLAIM_RE = re.compile(
@@ -81,6 +82,10 @@ COMPARATIVE_CLAIM_RE = re.compile(
 )
 DIRECT_UNSAFE_RE = re.compile(
     r"(?:direct_llm|direct_llm_parametric_memory_control).{0,80}(?:clean|no[-_ ]future|no[-_ ]memory|primary comparator|primary baseline)",
+    re.IGNORECASE,
+)
+DIRECT_UNSAFE_ROLE_RE = re.compile(
+    r"\b(?:clean|no[-_ ]future|no[-_ ]memory|primary comparator|primary baseline)\b",
     re.IGNORECASE,
 )
 
@@ -275,8 +280,8 @@ def base_fixture_records() -> list[dict[str, Any]]:
     return records
 
 
-def per_arm_scores(records: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
-    result: dict[str, dict[str, int]] = {}
+def per_arm_scores(records: list[dict[str, Any]]) -> dict[str, dict[str, dict[str, int]]]:
+    result: dict[str, dict[str, dict[str, int]]] = {}
     for record in records:
         arm = str(record.get("arm") or "")
         if arm in ALLOWED_ARMS and isinstance(record.get("dimension_scores"), dict):
@@ -285,7 +290,9 @@ def per_arm_scores(records: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
                 value = record["dimension_scores"].get(dimension)
                 if isinstance(value, int) and not isinstance(value, bool):
                     scores[dimension] = value
-            result[arm] = scores
+            sample_id = str(record.get("paired_sample_id") or "")
+            if sample_id:
+                result.setdefault(sample_id, {})[arm] = scores
     return result
 
 
@@ -396,8 +403,8 @@ def recursive_strings(value: Any, *, path: str) -> list[tuple[str, str]]:
     return strings
 
 
-def recursive_paths(value: Any, *, key_hint: str = "") -> list[str]:
-    paths: list[str] = []
+def recursive_paths(value: Any, *, key_hint: str = "") -> list[tuple[str, str]]:
+    paths: list[tuple[str, str]] = []
     path_keys = {
         "source_path",
         "source_paths",
@@ -414,7 +421,7 @@ def recursive_paths(value: Any, *, key_hint: str = "") -> list[str]:
     }
     if isinstance(value, str):
         if key_hint in path_keys or claim_scan.forbidden_path(value):
-            paths.append(value)
+            paths.append((key_hint, value))
     elif isinstance(value, dict):
         for key, item in value.items():
             paths.extend(recursive_paths(item, key_hint=key))
@@ -425,14 +432,19 @@ def recursive_paths(value: Any, *, key_hint: str = "") -> list[str]:
 
 
 def claim_blockers(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    text_items = [
+        (path, text)
+        for path, text in recursive_strings(payload, path="dry_run")
+        if not path.endswith(CLAIM_TEXT_SKIP_SUFFIXES)
+    ]
     sources = [
         claim_scan.ScanSource(path=path, text=text, origin="v3_8k_fixture_dry_run")
-        for path, text in recursive_strings(payload, path="dry_run")
+        for path, text in text_items
     ]
     scan = claim_scan.scan_sources(sources)
     blockers = scan["overclaim"] + scan[DIRECT_PREFIX] + scan["maturity_gate"] + scan["short_horizon_as_30d"]
     blockers.extend(claim_regression.extra_text_blockers(sources))
-    for path, text in recursive_strings(payload, path="dry_run"):
+    for path, text in text_items:
         if STATUS_CLAIM_RE.search(text) and not claim_regression.FALSE_LINE_RE.search(text):
             blockers.append(blocked_item(path, "actual_or_superiority_verdict_claim", "text cannot assert current actual or superiority verdict readiness"))
         match = COMPARATIVE_CLAIM_RE.search(text)
@@ -448,17 +460,20 @@ def direct_boundary_blockers(payload: dict[str, Any]) -> list[dict[str, Any]]:
     if payload.get(DIRECT_CLEAN_BASELINE_KEY) is not False:
         blockers.append(blocked_item(f"summary.{DIRECT_CLEAN_BASELINE_KEY}", DIRECT_PREFIX + "_clean_baseline_not_false", "direct_llm_parametric_memory_control cannot be a clean baseline"))
     for path, text in recursive_strings(payload, path="dry_run"):
-        if DIRECT_UNSAFE_RE.search(text):
-            blockers.append(blocked_item(path, DIRECT_PREFIX + "_unsafe_role_wording", "direct_llm_parametric_memory_control cannot be clean/no-future/no-memory or primary comparator"))
+        for match in DIRECT_UNSAFE_RE.finditer(text):
+            role_match = DIRECT_UNSAFE_ROLE_RE.search(match.group(0))
+            role_start = match.start() + role_match.start() if role_match else match.start()
+            if not claim_scan.is_negated(text, role_start):
+                blockers.append(blocked_item(path, DIRECT_PREFIX + "_unsafe_role_wording", "direct_llm_parametric_memory_control cannot be clean/no-future/no-memory or primary comparator"))
     return blockers
 
 
 def path_blockers(payload: dict[str, Any]) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
-    for candidate in recursive_paths(payload):
+    for key_hint, candidate in recursive_paths(payload):
         if claim_scan.forbidden_path(candidate):
             blockers.append(blocked_item(candidate, "forbidden_artifact_reference", "forbidden/raw artifact path reference"))
-        elif candidate.startswith("/") and "raw" in candidate.lower() and not under_tmp(candidate):
+        elif (key_hint.startswith("raw") or "raw" in candidate.lower()) and not under_tmp(candidate):
             blockers.append(blocked_item(candidate, "raw_reference_not_tmp", "raw-like path references must stay under /tmp"))
     return blockers
 
@@ -563,8 +578,13 @@ def protocol_blockers(summary: dict[str, Any]) -> list[dict[str, Any]]:
     records = [record for record in summary.get("fixture_records", []) if isinstance(record, dict)]
     raw_sample_ids = [record.get("paired_sample_id") for record in records]
     sample_ids = {sample_id for sample_id in raw_sample_ids if isinstance(sample_id, str) and sample_id}
-    if len(sample_ids) != len(set(raw_sample_ids)):
+    invalid_sample_ids = [sample_id for sample_id in raw_sample_ids if not isinstance(sample_id, str) or not sample_id]
+    if invalid_sample_ids:
         blockers.append(blocked_item("summary.fixture_records", "paired_sample_id_invalid_or_duplicate", "paired sample ids must be non-empty unique strings per sample"))
+    if not sample_ids:
+        blockers.append(blocked_item("summary.fixture_records", "fixture_records_empty", "canonical dry-run requires one paired fixture with all three arms"))
+    if len(sample_ids) > 1:
+        blockers.append(blocked_item("summary.fixture_records", "multiple_paired_samples_not_supported", "canonical dry-run summary supports exactly one paired fixture"))
     if summary.get("paired_sample_count") != len(sample_ids):
         blockers.append(blocked_item("summary.paired_sample_count", "paired_sample_count_mismatch", "paired_sample_count must match fixture records"))
     if summary.get("fixture_pair_count") != len(sample_ids):
@@ -575,19 +595,21 @@ def protocol_blockers(summary: dict[str, Any]) -> list[dict[str, Any]]:
         if sorted(arms) != sorted(ALLOWED_ARMS):
             blockers.append(blocked_item(f"summary.fixture_records.{sample_id}", "paired_record_arms_mismatch", "each paired sample must contain all allowed arms"))
             continue
-        prompt_hashes = {record.get("prompt_hash") for record in sample_records}
-        input_hashes = {record.get("input_hash") for record in sample_records}
-        visible_boundaries = {record.get("visible_data_boundary") for record in sample_records}
-        horizons = {record.get("horizon") for record in sample_records}
-        rubric_versions = {record.get("scoring_rubric_version") for record in sample_records}
-        if len(prompt_hashes) != 1 or len(input_hashes) != 1:
-            blockers.append(blocked_item(f"summary.fixture_records.{sample_id}", "paired_prompt_input_identity_mismatch", "paired records must share prompt/input identity"))
-        if len(visible_boundaries) != 1:
-            blockers.append(blocked_item(f"summary.fixture_records.{sample_id}", "paired_visible_data_boundary_mismatch", "paired records must share visible data boundary"))
-        if len(horizons) != 1:
-            blockers.append(blocked_item(f"summary.fixture_records.{sample_id}", "paired_horizon_mismatch", "paired records must share horizon/readiness gate"))
-        if rubric_versions != {RUBRIC_SCHEMA_VERSION}:
-            blockers.append(blocked_item(f"summary.fixture_records.{sample_id}", "paired_rubric_version_mismatch", "paired records must share rubric version"))
+        for key in (
+            "ticker",
+            "decision_date",
+            "horizon",
+            "prompt_hash",
+            "input_hash",
+            "visible_data_boundary",
+            "scoring_rubric_version",
+        ):
+            values = {record.get(key) for record in sample_records if isinstance(record.get(key), str) and record.get(key)}
+            if key == "scoring_rubric_version":
+                if values != {RUBRIC_SCHEMA_VERSION}:
+                    blockers.append(blocked_item(f"summary.fixture_records.{sample_id}", "paired_rubric_version_mismatch", "paired records must share rubric version"))
+            elif len(values) != 1:
+                blockers.append(blocked_item(f"summary.fixture_records.{sample_id}", f"paired_{key}_mismatch", f"paired records must share {key}"))
     expected_scores = per_arm_scores(records)
     if summary.get("per_arm_dimension_scores") != expected_scores:
         blockers.append(blocked_item("summary.per_arm_dimension_scores", "per_arm_dimension_scores_mismatch", "per-arm score summary must match fixture records"))
@@ -654,7 +676,7 @@ def _rule_has(item: dict[str, Any], tokens: tuple[str, ...]) -> bool:
 
 def choose_status(blockers: list[dict[str, Any]], current_status: str | None = None) -> str:
     if not blockers:
-        return current_status if current_status in ALLOWED_STATUSES else STATUS_READY
+        return STATUS_READY
     reasons = {str(item.get("rule_id") or "") for item in blockers}
     if any(DIRECT_PREFIX in reason or "direct_control" in reason for reason in reasons):
         return STATUS_BLOCKED_DIRECT_BOUNDARY
@@ -664,8 +686,6 @@ def choose_status(blockers: list[dict[str, Any]], current_status: str | None = N
         return STATUS_BLOCKED_CLAIM_BOUNDARY
     if any("runtime" in reason or "flag" in reason or "provider" in reason or "backend" in reason or "executable" in reason or "canary" in reason or "calls" in reason or "token" in reason or "output_dir" in reason for reason in reasons):
         return STATUS_BLOCKED_RUNTIME_BOUNDARY
-    if any("score" in reason or "metadata" in reason for reason in reasons):
-        return STATUS_BLOCKED_METADATA
     if any(
         "protocol" in reason
         or "paired" in reason
@@ -680,6 +700,8 @@ def choose_status(blockers: list[dict[str, Any]], current_status: str | None = N
         return STATUS_BLOCKED_SCHEMA
     if any("provenance" in reason or "sha256" in reason or "hash" in reason or "digest" in reason or "source" in reason for reason in reasons):
         return STATUS_BLOCKED_PROVENANCE
+    if any("score" in reason or "metadata" in reason for reason in reasons):
+        return STATUS_BLOCKED_METADATA
     return STATUS_BLOCKED_SCHEMA
 
 
@@ -729,8 +751,6 @@ def build_from_fixture(config: DryRunConfig, *, run_root: Path) -> dict[str, Any
     if payload:
         summary.update(payload)
     restore_config_identity(summary, config=config, run_root=run_root)
-    summary["fixture_records_sha256"] = stable_sha256_json(summary.get("fixture_records", []))
-    summary["dry_run_sha256"] = dry_run_digest(summary)
     blockers = load_blockers + identity_blockers + validate_summary_payload(summary)
     summary["dry_run_status"] = choose_status(blockers, current_status=str(summary.get("dry_run_status") or ""))
     finalize_blockers(summary, blockers)
@@ -778,8 +798,9 @@ def write_outputs(summary: dict[str, Any], *, run_root: Path) -> None:
     summary["summary_path"] = str(summary_path)
     summary["manifest_path"] = str(manifest_path)
     summary["summary_digest_target"] = "manifest.summary_sha256"
-    summary["fixture_records_sha256"] = stable_sha256_json(summary.get("fixture_records", []))
-    summary["dry_run_sha256"] = dry_run_digest(summary)
+    if summary.get("dry_run_status") == STATUS_READY:
+        summary["fixture_records_sha256"] = stable_sha256_json(summary.get("fixture_records", []))
+        summary["dry_run_sha256"] = dry_run_digest(summary)
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     manifest = {
         "schema": MANIFEST_SCHEMA,
@@ -791,12 +812,14 @@ def write_outputs(summary: dict[str, Any], *, run_root: Path) -> None:
         "fixture_records_sha256": summary.get("fixture_records_sha256"),
         "dry_run_status": summary.get("dry_run_status"),
         "cognitive_lift_superiority_verdict_status": summary.get("cognitive_lift_superiority_verdict_status"),
-        "provider_or_backend_called": False,
-        "provider_canary_executed": False,
-        "codex_cli_called": False,
-        "codex_cli_new_call": False,
-        "formal_lite_entered": False,
-        "v3_7_actual_verdict_executable": False,
+        "provider_or_backend_called": summary.get("provider_or_backend_called"),
+        "provider_canary_executed": summary.get("provider_canary_executed"),
+        "codex_cli_called": summary.get("codex_cli_called"),
+        "codex_cli_new_call": summary.get("codex_cli_new_call"),
+        "formal_lite_entered": summary.get("formal_lite_entered"),
+        "v3_7_actual_verdict_executable": summary.get("v3_7_actual_verdict_executable"),
+        "runtime_boundary_status": summary.get("runtime_boundary_status"),
+        "blocker_reasons": summary.get("blocker_reasons", []),
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
 

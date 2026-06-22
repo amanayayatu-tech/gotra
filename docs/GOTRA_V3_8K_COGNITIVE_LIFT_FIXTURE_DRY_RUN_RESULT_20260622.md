@@ -25,9 +25,9 @@ This result is an engineering fixture/tooling readiness result only. It is not a
 
 Local validation wrote only `/tmp` artifacts:
 
-- summary path: `/tmp/gotra_v3_8k_cognitive_lift_fixture_dry_run_local/runs/baseline_v3_8k_cognitive_lift_fixture_dry_run_local_20260622T000000Z/summary.json`
-- summary sha256: `5cf914a147d9ddb050322dca76f2726620bdd659a89ba08e834e99f64b4769c7`
-- dry-run sha256: `111a951c36d2dd3bcba6fb3ea24ef0ca1023e121b58ae32c269ad9ba71ac6a24`
+- summary path: `/tmp/gotra_v3_8k_cognitive_lift_fixture_dry_run_repair/runs/baseline_v3_8k_cognitive_lift_fixture_dry_run_repair_20260622T000000Z/summary.json`
+- summary sha256: `8f1ef33ce3b4ecc8f8101a5a4900565de14f3a6439b37d12388e57eeb9e07e98`
+- dry-run sha256: `0121525590ebd9cf11ad43fa0456e137c40e08480414322f7d9ce0775d5ec9ce`
 - fixture records sha256: `1757d3361b04b5ee67a2a1835913127b6a0fc608f21ec04cbe3569f5cfd7d96a`
 
 The fixture contains one synthetic paired sample with `ksana_real_research`, `full_gotra`, and `direct_llm_parametric_memory_control`. The third arm remains a historical diagnostic/control arm with parametric memory boundary; it is not a clean baseline and not a no-future baseline.
@@ -48,7 +48,7 @@ Local validation completed before PR creation:
 
 - `py_compile`: pass
 - `ruff`: pass
-- focused v3.8K pytest: `12 passed`
+- focused v3.8K pytest: `21 passed`
 - local v3.8K validation to `/tmp`: `COGNITIVE_LIFT_FIXTURE_DRY_RUN_READY`
 - v3.7H claim-boundary regression on PR files: `V3_7_CLAIM_BOUNDARY_REGRESSION_READY`
 - docs claim-boundary scan: `CLAIM_BOUNDARY_CLEAN`

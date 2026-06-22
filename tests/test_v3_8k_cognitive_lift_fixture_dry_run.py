@@ -11,7 +11,7 @@ from scripts import baseline_v3_8k_cognitive_lift_fixture_dry_run as dry_run
 def test_valid_fixture_dry_run_is_ready(tmp_path: Path) -> None:
     summary = dry_run.build_summary(_config(tmp_path))
 
-    assert summary["dry_run_status"] == dry_run.STATUS_READY
+    assert summary["dry_run_status"] == dry_run.STATUS_READY, summary["blocker_reasons"]
     assert summary["dimension_count"] == 8
     assert summary["paired_sample_count"] == 1
     assert summary["fixture_pair_count"] == 1
@@ -41,6 +41,32 @@ def test_missing_paired_identity_blocks_structurally(tmp_path: Path) -> None:
     assert "paired_record_arms_mismatch" in summary["blocker_reasons"]
 
 
+def test_paired_ticker_or_decision_date_mismatch_blocks(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["fixture_records"][1]["ticker"] = "ALT"  # type: ignore[index]
+    payload["fixture_records"][2]["decision_date"] = "2026-06-23"  # type: ignore[index]
+    payload = _refresh_fixture_digests(payload)
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = dry_run.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["dry_run_status"] in {dry_run.STATUS_BLOCKED_SCHEMA, dry_run.STATUS_BLOCKED_PROTOCOL}
+    assert "paired_ticker_mismatch" in summary["blocker_reasons"]
+    assert "paired_decision_date_mismatch" in summary["blocker_reasons"]
+
+
+def test_malformed_sample_id_nonhashable_returns_structured_block(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["fixture_records"][0]["paired_sample_id"] = ["bad"]  # type: ignore[index]
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = dry_run.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["dry_run_status"] in {dry_run.STATUS_BLOCKED_SCHEMA, dry_run.STATUS_BLOCKED_PROTOCOL}
+    assert "paired_sample_id_invalid" in summary["blocker_reasons"]
+    assert "paired_sample_id_invalid_or_duplicate" in summary["blocker_reasons"]
+
+
 def test_missing_dimension_evidence_blocks(tmp_path: Path) -> None:
     payload = _ready_fixture()
     payload["fixture_records"][0]["dimension_evidence"][dry_run.DIMENSIONS[0]] = []  # type: ignore[index]
@@ -50,6 +76,17 @@ def test_missing_dimension_evidence_blocks(tmp_path: Path) -> None:
 
     assert summary["dry_run_status"] == dry_run.STATUS_BLOCKED_SCHEMA
     assert "dimension_evidence_missing" in summary["blocker_reasons"]
+
+
+def test_negated_direct_llm_baseline_caveat_is_allowed(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["notes"] = "direct_llm_parametric_memory_control is not a clean no-future baseline"
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = dry_run.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["dry_run_status"] == dry_run.STATUS_READY, summary["blocker_reasons"]
+    assert summary["direct_llm_boundary_status"] == "clean"
 
 
 def test_direct_llm_clean_or_no_future_label_blocks(tmp_path: Path) -> None:
@@ -65,6 +102,32 @@ def test_direct_llm_clean_or_no_future_label_blocks(tmp_path: Path) -> None:
     assert summary["direct_llm_boundary_status"] == "blocked"
 
 
+def test_stale_fixture_digests_block_before_recompute(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["fixture_records_sha256"] = "0" * 64
+    payload["dry_run_sha256"] = "1" * 64
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = dry_run.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["dry_run_status"] == dry_run.STATUS_BLOCKED_PROVENANCE
+    assert "fixture_records_sha256_mismatch" in summary["blocker_reasons"]
+    assert "dry_run_sha256_mismatch" in summary["blocker_reasons"]
+    assert summary["fixture_records_sha256"] == "0" * 64
+    assert summary["dry_run_sha256"] == "1" * 64
+
+
+def test_clean_fixture_with_stale_blocked_status_becomes_ready(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["dry_run_status"] = dry_run.STATUS_BLOCKED_SCHEMA
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = dry_run.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["dry_run_status"] == dry_run.STATUS_READY
+    assert summary["blocker_reasons"] == []
+
+
 def test_provider_or_canary_flags_block_runtime(tmp_path: Path) -> None:
     payload = _ready_fixture()
     payload["provider_or_backend_called"] = True
@@ -78,6 +141,22 @@ def test_provider_or_canary_flags_block_runtime(tmp_path: Path) -> None:
     assert "provider_canary_executed_not_false" in summary["blocker_reasons"]
 
 
+def test_manifest_mirrors_blocked_runtime_flags(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["provider_or_backend_called"] = True
+    payload["codex_cli_called"] = True
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = dry_run.build_summary(_config(tmp_path, fixture=fixture))
+    manifest = json.loads(Path(summary["manifest_path"]).read_text(encoding="utf-8"))
+
+    assert summary["dry_run_status"] == dry_run.STATUS_BLOCKED_RUNTIME_BOUNDARY
+    assert manifest["provider_or_backend_called"] is True
+    assert manifest["codex_cli_called"] is True
+    assert manifest["runtime_boundary_status"] == "blocked"
+    assert "provider_or_backend_called_not_false" in manifest["blocker_reasons"]
+
+
 def test_overclaim_wording_blocks_claim_boundary(tmp_path: Path) -> None:
     payload = _ready_fixture()
     payload["notes"] = "This proves cognitive lift superiority, has a winner, and is public science proof with trading advice."
@@ -89,6 +168,21 @@ def test_overclaim_wording_blocks_claim_boundary(tmp_path: Path) -> None:
     assert summary["claim_boundary_status"] == "blocked"
 
 
+def test_empty_fixture_records_block(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["fixture_records"] = []
+    payload["paired_sample_count"] = 0
+    payload["fixture_pair_count"] = 0
+    payload["per_arm_dimension_scores"] = {}
+    payload = _refresh_fixture_digests(payload)
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = dry_run.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["dry_run_status"] in {dry_run.STATUS_BLOCKED_SCHEMA, dry_run.STATUS_BLOCKED_PROTOCOL}
+    assert "fixture_records_empty" in summary["blocker_reasons"]
+
+
 def test_forbidden_or_raw_repo_path_blocks_artifact_boundary(tmp_path: Path) -> None:
     payload = _ready_fixture()
     payload["unexpected_artifact_path"] = "data/backtest/" + "runs/dry_run.json"
@@ -98,6 +192,17 @@ def test_forbidden_or_raw_repo_path_blocks_artifact_boundary(tmp_path: Path) -> 
 
     assert summary["dry_run_status"] == dry_run.STATUS_BLOCKED_ARTIFACT_BOUNDARY
     assert "forbidden_artifact_reference" in summary["blocker_reasons"]
+
+
+def test_relative_raw_tmp_path_blocks_artifact_boundary(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["raw_tmp_path"] = "raw_payload.json"
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = dry_run.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["dry_run_status"] == dry_run.STATUS_BLOCKED_ARTIFACT_BOUNDARY
+    assert "raw_reference_not_tmp" in summary["blocker_reasons"]
 
 
 def test_actual_verdict_executable_blocks_runtime(tmp_path: Path) -> None:
@@ -122,6 +227,28 @@ def test_malformed_score_returns_structured_block(tmp_path: Path) -> None:
 
     assert summary["dry_run_status"] in {dry_run.STATUS_BLOCKED_SCHEMA, dry_run.STATUS_BLOCKED_METADATA}
     assert "dimension_score_invalid" in summary["blocker_reasons"]
+
+
+def test_multiple_paired_samples_block_and_preserve_each_pair_scores(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    records = copy.deepcopy(payload["fixture_records"])  # type: ignore[index]
+    second_pair = copy.deepcopy(records)
+    for record in second_pair:
+        record["paired_sample_id"] = "fixture_pair_0002"
+        record["source_run_id"] = f"{record['source_run_id']}_pair2"
+    payload["fixture_records"] = records + second_pair
+    payload["paired_sample_count"] = 2
+    payload["fixture_pair_count"] = 2
+    payload["per_arm_dimension_scores"] = dry_run.per_arm_scores(payload["fixture_records"])  # type: ignore[arg-type]
+    payload = _refresh_fixture_digests(payload)
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = dry_run.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["dry_run_status"] == dry_run.STATUS_BLOCKED_PROTOCOL
+    assert "multiple_paired_samples_not_supported" in summary["blocker_reasons"]
+    assert "fixture_pair_0001" in summary["per_arm_dimension_scores"]
+    assert "fixture_pair_0002" in summary["per_arm_dimension_scores"]
 
 
 def test_unexpected_fixture_field_is_recursively_scanned(tmp_path: Path) -> None:
@@ -188,6 +315,12 @@ def _write_fixture(tmp_path: Path, payload: dict[str, object]) -> Path:
     path = tmp_path / "dry_run_fixture.json"
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     return path
+
+
+def _refresh_fixture_digests(payload: dict[str, object]) -> dict[str, object]:
+    payload["fixture_records_sha256"] = dry_run.stable_sha256_json(payload.get("fixture_records", []))
+    payload["dry_run_sha256"] = dry_run.dry_run_digest(payload)
+    return payload
 
 
 def _config(tmp_path: Path, *, fixture: Path | None = None) -> dry_run.DryRunConfig:
