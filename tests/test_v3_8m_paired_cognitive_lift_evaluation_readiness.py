@@ -93,6 +93,18 @@ def test_actual_readiness_ready_or_actual_verdict_executable_blocks(tmp_path: Pa
     assert "v3_7_actual_verdict_executable_not_false" in summary["blocker_reasons"]
 
 
+def test_nested_actual_verdict_executed_attestation_blocks(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["maturity_readiness_blockers"]["actual_v3_7_verdict_executed"] = True
+    payload = _refresh_digest(payload)
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = readiness.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["readiness_status"] == readiness.STATUS_BLOCKED_MATURITY_READINESS
+    assert "actual_v3_7_verdict_executed_not_false" in summary["blocker_reasons"]
+
+
 def test_provider_canary_execution_flag_or_text_blocks(tmp_path: Path) -> None:
     payload = _ready_fixture()
     payload["provider_canary_executed"] = True
@@ -105,6 +117,30 @@ def test_provider_canary_execution_flag_or_text_blocks(tmp_path: Path) -> None:
     assert summary["readiness_status"] == readiness.STATUS_BLOCKED_RUNTIME_BOUNDARY
     assert "provider_canary_executed_not_false" in summary["blocker_reasons"]
     assert "provider_canary_execution_text_claim" in summary["blocker_reasons"]
+
+
+def test_active_voice_provider_execution_claim_blocks(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["notes"] = "We called the backend and we executed provider canary."
+    payload = _refresh_digest(payload)
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = readiness.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["readiness_status"] == readiness.STATUS_BLOCKED_RUNTIME_BOUNDARY
+    assert "provider_canary_execution_text_claim" in summary["blocker_reasons"]
+
+
+def test_codex_cli_and_formal_lite_execution_text_blocks(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["notes"] = "Formal-lite was entered in v3.8M. Codex CLI new call was made."
+    payload = _refresh_digest(payload)
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = readiness.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["readiness_status"] == readiness.STATUS_BLOCKED_RUNTIME_BOUNDARY
+    assert "codex_or_formal_lite_execution_text_claim" in summary["blocker_reasons"]
 
 
 def test_placeholder_caps_are_not_executable_authorization(tmp_path: Path) -> None:
@@ -120,6 +156,21 @@ def test_placeholder_caps_are_not_executable_authorization(tmp_path: Path) -> No
     assert summary["readiness_status"] == readiness.STATUS_BLOCKED_AUTHORIZATION_BOUNDARY
     assert "execution_allowed_not_false" in summary["blocker_reasons"]
     assert "provider_canary_execution_allowed_not_false" in summary["blocker_reasons"]
+
+
+def test_top_level_provider_authorization_status_mismatch_blocks_and_manifest_is_safe(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["provider_canary_authorization_status"] = "AUTHORIZED"
+    payload = _refresh_digest(payload)
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = readiness.build_summary(_config(tmp_path, fixture=fixture))
+    manifest = json.loads(Path(summary["manifest_path"]).read_text(encoding="utf-8"))
+
+    assert summary["readiness_status"] == readiness.STATUS_BLOCKED_AUTHORIZATION_BOUNDARY
+    assert "provider_canary_authorization_status_not_placeholder" in summary["blocker_reasons"]
+    assert manifest["provider_canary_authorization_status"] == readiness.AUTHORIZATION_STATUS
+    assert manifest["provider_canary_authorization_status_observed"] == "AUTHORIZED"
 
 
 def test_concrete_provider_authorization_missing_metadata_blocks(tmp_path: Path) -> None:
@@ -143,6 +194,68 @@ def test_concrete_provider_authorization_missing_metadata_blocks(tmp_path: Path)
     assert "raw_reference_not_tmp" in summary["blocker_reasons"]
 
 
+def test_direct_build_summary_invalid_run_id_blocks_without_writing(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    config = readiness.ReadinessConfig(
+        readiness_pack_id="../escape",
+        output_dir=outside,
+        allow_overwrite=True,
+    )
+
+    summary = readiness.build_summary(config)
+
+    assert summary["readiness_status"] in {
+        readiness.STATUS_BLOCKED_SCHEMA,
+        readiness.STATUS_BLOCKED_PROVENANCE,
+        readiness.STATUS_BLOCKED_MISSING_EVIDENCE,
+    }
+    assert "readiness_pack_id_invalid" in summary["blocker_reasons"]
+    assert not outside.exists()
+
+
+def test_unsafe_direct_control_role_blocks(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["paired_sample_identity_schema"]["direct_control_role"] = "primary comparator and clean baseline"
+    payload = _refresh_digest(payload)
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = readiness.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["readiness_status"] == readiness.STATUS_BLOCKED_DIRECT_BOUNDARY
+    assert "direct_control_role_mismatch" in summary["blocker_reasons"]
+    assert "direct_llm_unsafe_identity_role" in summary["blocker_reasons"]
+
+
+def test_identity_matching_and_provenance_requirements_must_be_preserved(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["paired_sample_identity_schema"]["matched_identity_fields"].remove("prompt_hash")
+    payload["paired_sample_identity_schema"]["minimum_provenance_requirements"].remove("source_artifact_sha256")
+    payload = _refresh_digest(payload)
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = readiness.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["readiness_status"] in {
+        readiness.STATUS_BLOCKED_SCHEMA,
+        readiness.STATUS_BLOCKED_PROVENANCE,
+        readiness.STATUS_BLOCKED_MISSING_EVIDENCE,
+    }
+    assert "paired_identity_matched_fields_mismatch" in summary["blocker_reasons"]
+    assert "paired_identity_minimum_provenance_mismatch" in summary["blocker_reasons"]
+
+
+def test_legacy_backend_free_text_blocks(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["notes"] = "Future backend is kimi and candidate provider model is deepseek."
+    payload = _refresh_digest(payload)
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = readiness.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["readiness_status"] == readiness.STATUS_BLOCKED_AUTHORIZATION_BOUNDARY
+    assert "legacy_backend_reference" in summary["blocker_reasons"]
+
+
 def test_superiority_public_science_trading_guidance_wording_blocks(tmp_path: Path) -> None:
     payload = _ready_fixture()
     payload["can_say"].append("This proves superiority, names a winner, and gives investment guidance.")
@@ -156,6 +269,21 @@ def test_superiority_public_science_trading_guidance_wording_blocks(tmp_path: Pa
         readiness.STATUS_BLOCKED_CLAIM_BOUNDARY,
     }
     assert "comparative_or_action_guidance_claim" in summary["blocker_reasons"]
+
+
+def test_verdict_success_synonyms_block(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["notes"] = "Actual 30D verdict succeeded. Cognitive lift superiority established. This is final."
+    payload = _refresh_digest(payload)
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = readiness.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["readiness_status"] in {
+        readiness.STATUS_BLOCKED_VERDICT_OVERREACH,
+        readiness.STATUS_BLOCKED_CLAIM_BOUNDARY,
+    }
+    assert "actual_or_superiority_verdict_claim" in summary["blocker_reasons"]
 
 
 def test_raw_full_transcript_or_non_tmp_raw_path_blocks(tmp_path: Path) -> None:

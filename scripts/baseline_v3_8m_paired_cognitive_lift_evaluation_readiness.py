@@ -114,23 +114,32 @@ PAIRED_IDENTITY_FIELDS = (
 ALLOWED_ARMS = ("ksana_real_research", "full_gotra", DIRECT_INTERPRETATION)
 
 SECRET_RE = packet_canary.SECRET_RE
-LEGACY_BACKEND_RE = re.compile(r"\b(?:ki" + "mi|g" + "lm|deep" + "seek)\b", re.IGNORECASE)
+LEGACY_BACKEND_RE = re.compile(
+    r"\b(?:" + "ki" + "mi" + r"|g" + "lm" + r"|deep" + "seek" + r")\b",
+    re.IGNORECASE,
+)
 VERDICT_WORD = "verd" + "ict"
 COMPARATIVE_RESULT_WORD = "win" + "ner"
 RAW_PATH_RE = re.compile(r"(?:^|[/. _-])raw(?:[/. _-]|$)", re.IGNORECASE)
 PROVIDER_EXECUTION_CLAIM_RE = re.compile(
-    r"\b(?:provider|backend|canary).{0,80}\b(?:called|executed|ran|used|completed)\b",
+    r"(?:\b(?:provider|backend|canary).{0,80}\b(?:called|executed|ran|used|completed)\b"
+    r"|\b(?:called|executed|ran|used|completed).{0,80}\b(?:provider|backend|canary)\b)",
+    re.IGNORECASE,
+)
+CODEX_FORMAL_EXECUTION_CLAIM_RE = re.compile(
+    r"(?:\b(?:codex(?:\s+cli)?|codex_cli|formal[-_ ]lite).{0,80}\b(?:called|executed|ran|used|completed|entered|made)\b"
+    r"|\b(?:called|executed|ran|used|completed|entered|made).{0,80}\b(?:codex(?:\s+cli)?|codex_cli|formal[-_ ]lite)\b)",
     re.IGNORECASE,
 )
 STATUS_CLAIM_RE = re.compile(
     rf"(?:v3[\._]?7|v3[\._]?8|30d|30-day|actual|cognitive[-_ ]lift).{{0,90}}"
     rf"(?:{VERDICT_WORD}|readiness|executable|superiority).{{0,70}}"
-    r"(?:ready|pass|allowed|true|executed|proved|validated|confirmed)",
+    r"(?:ready|pass|allowed|true|executed|proved|validated|confirmed|succeeded|established|final)",
     re.IGNORECASE,
 )
 VERDICT_OVERREACH_RE = re.compile(
     rf"(?:superiority|comparative|external|actual).{{0,70}}(?:{VERDICT_WORD}|result|conclusion).{{0,70}}"
-    r"(?:ready|proved|confirmed|passed|executed|wins)",
+    r"(?:ready|proved|confirmed|passed|executed|wins|succeeded|established|final)",
     re.IGNORECASE,
 )
 COMPARATIVE_CLAIM_RE = re.compile(
@@ -149,7 +158,7 @@ COMPARATIVE_CLAIM_RE = re.compile(
     re.IGNORECASE,
 )
 AFFIRMATIVE_STATUS_TOKEN_RE = re.compile(
-    rf"\b(?:ready|pass|allowed|true|executed|proved|validated|confirmed|{COMPARATIVE_RESULT_WORD}|wins)\b",
+    rf"\b(?:ready|pass|allowed|true|executed|proved|validated|confirmed|succeeded|established|final|{COMPARATIVE_RESULT_WORD}|wins)\b",
     re.IGNORECASE,
 )
 DIRECT_UNSAFE_RE = re.compile(
@@ -192,6 +201,7 @@ REQUIRED_SUMMARY_FIELDS = {
     "source_stage_statuses",
     "source_stage_metadata_sha256",
     "readiness_package_sha256",
+    "provider_canary_authorization_status",
     "can_say",
     "cannot_say",
     "missing_before_superiority_verdict",
@@ -645,6 +655,12 @@ def claim_blockers(payload: dict[str, Any]) -> list[dict[str, Any]]:
         for provider_match in PROVIDER_EXECUTION_CLAIM_RE.finditer(text):
             if not _is_locally_negated(text, provider_match.start()):
                 blockers.append(blocked_item(path, "provider_canary_execution_text_claim", "text cannot claim provider/backend/canary execution in v3.8M"))
+        for runtime_match in CODEX_FORMAL_EXECUTION_CLAIM_RE.finditer(text):
+            if not _is_locally_negated(text, runtime_match.start()):
+                blockers.append(blocked_item(path, "codex_or_formal_lite_execution_text_claim", "text cannot claim Codex CLI or formal-lite execution in v3.8M"))
+        for legacy_match in LEGACY_BACKEND_RE.finditer(text):
+            if not _is_locally_negated(text, legacy_match.start()):
+                blockers.append(blocked_item(path, "legacy_backend_reference", "legacy provider/backend references are not authorized in v3.8M"))
         for match in COMPARATIVE_CLAIM_RE.finditer(text):
             if not claim_scan.is_negated(text, match.start()):
                 blockers.append(blocked_item(path, "comparative_or_action_guidance_claim", "comparative or action-guidance wording exceeds readiness boundary"))
@@ -750,6 +766,8 @@ def runtime_blockers(summary: dict[str, Any]) -> list[dict[str, Any]]:
 
 def authorization_blockers(summary: dict[str, Any]) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
+    if summary.get("provider_canary_authorization_status") != AUTHORIZATION_STATUS:
+        blockers.append(blocked_item("summary.provider_canary_authorization_status", "provider_canary_authorization_status_not_placeholder", "top-level provider canary authorization status must remain non-executable placeholder"))
     checklist = summary.get("future_provider_30d_verdict_authorization_checklist")
     if not isinstance(checklist, dict):
         return [blocked_item("summary.future_provider_30d_verdict_authorization_checklist", "authorization_checklist_not_object", "authorization checklist must be an object")]
@@ -830,6 +848,28 @@ def _validate_identity_schema(value: Any, blockers: list[dict[str, Any]]) -> Non
         blockers.append(blocked_item("summary.paired_sample_identity_schema.arm_identity_required", "arm_identity_required_not_true", "arm identity is required"))
     if value.get(DIRECT_CLEAN_BASELINE_KEY) is not False:
         blockers.append(blocked_item("summary.paired_sample_identity_schema", DIRECT_PREFIX + "_identity_clean_baseline_not_false", "direct control cannot be clean baseline"))
+    if value.get("matched_identity_fields") != [
+        "paired_sample_id",
+        "ticker",
+        "decision_date",
+        "horizon",
+        "prompt_hash",
+        "input_hash",
+        "visible_data_boundary",
+        "rubric_version",
+    ]:
+        blockers.append(blocked_item("summary.paired_sample_identity_schema.matched_identity_fields", "paired_identity_matched_fields_mismatch", "paired identity schema must preserve prompt/input and visible-boundary matching"))
+    if value.get("minimum_provenance_requirements") != [
+        "source_run_id",
+        "source_summary_sha256",
+        "source_artifact_sha256",
+    ]:
+        blockers.append(blocked_item("summary.paired_sample_identity_schema.minimum_provenance_requirements", "paired_identity_minimum_provenance_mismatch", "paired identity schema must preserve source run and hash provenance requirements"))
+    role = value.get("direct_control_role")
+    if role != "historical diagnostic/control arm with parametric memory boundary":
+        blockers.append(blocked_item("summary.paired_sample_identity_schema.direct_control_role", "direct_control_role_mismatch", "direct control role must remain historical diagnostic/control with parametric-memory boundary"))
+    if isinstance(role, str) and DIRECT_UNSAFE_ROLE_RE.search(role):
+        blockers.append(blocked_item("summary.paired_sample_identity_schema.direct_control_role", DIRECT_PREFIX + "_unsafe_identity_role", "direct control role cannot be clean/no-future/no-memory or primary comparator"))
 
 
 def _validate_scoring_prerequisites(value: Any, blockers: list[dict[str, Any]]) -> None:
@@ -859,6 +899,8 @@ def _validate_maturity(value: Any, blockers: list[dict[str, Any]]) -> None:
         blockers.append(blocked_item("summary.maturity_readiness_blockers.mature_paired_evidence_available", "mature_paired_evidence_not_false", "mature paired evidence is not available"))
     if value.get("actual_v3_7_verdict_executable") is not False:
         blockers.append(blocked_item("summary.maturity_readiness_blockers.actual_v3_7_verdict_executable", "actual_v3_7_verdict_executable_not_false", "actual verdict remains not executable"))
+    if value.get("actual_v3_7_verdict_executed") is not False:
+        blockers.append(blocked_item("summary.maturity_readiness_blockers.actual_v3_7_verdict_executed", "actual_v3_7_verdict_executed_not_false", "actual verdict remains not executed"))
 
 
 def _validate_statistical(value: Any, blockers: list[dict[str, Any]]) -> None:
@@ -985,13 +1027,13 @@ def finalize_blockers(summary: dict[str, Any], blockers: list[dict[str, Any]]) -
     summary["schema_status"] = "blocked" if any(_rule_has(item, ("schema", "missing", "invalid", "not_object", "not_list")) for item in blockers) else "clean"
     summary["provenance_status"] = "blocked" if any(_rule_has(item, ("source_stage", "source_", "metadata_sha256", "readiness_package_sha256")) for item in blockers) else "clean"
     summary["missing_evidence_boundary_status"] = "blocked" if summary["provenance_status"] == "blocked" else "clean"
-    summary["maturity_readiness_status"] = "blocked" if any(_rule_has(item, ("maturity", "actual_30d", "next_check", "verdict_executable")) for item in blockers) else "blocked_expected"
+    summary["maturity_readiness_status"] = "blocked" if any(_rule_has(item, ("maturity", "actual_30d", "next_check", "verdict_executable", "verdict_executed")) for item in blockers) else "blocked_expected"
     summary["statistical_eligibility_status"] = "blocked" if any(_rule_has(item, ("statistical", "sample_size", "paired_clean", "p_value", "estimate", "bootstrap", "confidence_interval")) for item in blockers) else "blocked_expected"
     summary["claim_boundary_status"] = "blocked" if any(_rule_has(item, ("claim", "overclaim", "comparative_or_action")) for item in blockers) else "clean"
-    summary["runtime_boundary_status"] = "blocked" if any(_rule_has(item, ("runtime", "flag", "provider", "backend", "executable", "canary", "calls", "token", "scoring_executed")) for item in blockers) else "clean"
+    summary["runtime_boundary_status"] = "blocked" if any(_rule_has(item, ("runtime", "flag", "provider", "backend", "executable", "canary", "codex", "formal", "calls", "token", "scoring_executed")) for item in blockers) else "clean"
     summary["artifact_boundary_status"] = "blocked" if any(_rule_has(item, ("forbidden_artifact", "raw_reference", "raw_tmp", "repo_raw", "transcript")) for item in blockers) else "clean"
     summary[DIRECT_PREFIX + "_boundary_status"] = "blocked" if any(_rule_has(item, (DIRECT_PREFIX, "direct_control")) for item in blockers) else "clean"
-    summary["authorization_boundary_status"] = "blocked" if any(_rule_has(item, ("authorization", "placeholder_cap", "execution_allowed")) for item in blockers) else "clean"
+    summary["authorization_boundary_status"] = "blocked" if any(_rule_has(item, ("authorization", "placeholder_cap", "execution_allowed", "legacy_backend")) for item in blockers) else "clean"
     summary["verdict_boundary_status"] = "blocked" if any(_rule_has(item, ("verdict_overreach", "actual_or_superiority_verdict")) for item in blockers) else "clean"
 
 
@@ -1008,13 +1050,15 @@ def choose_status(blockers: list[dict[str, Any]]) -> str:
         return STATUS_BLOCKED_DIRECT_BOUNDARY
     if any("forbidden_artifact" in reason or "raw_reference" in reason or "raw_tmp" in reason or "transcript" in reason for reason in reasons):
         return STATUS_BLOCKED_ARTIFACT_BOUNDARY
-    if any("provider_canary_execution_text_claim" in reason for reason in reasons):
+    if any("provider_canary_execution_text_claim" in reason or "codex_or_formal_lite_execution_text_claim" in reason for reason in reasons):
         return STATUS_BLOCKED_RUNTIME_BOUNDARY
+    if any("legacy_backend_reference" in reason for reason in reasons):
+        return STATUS_BLOCKED_AUTHORIZATION_BOUNDARY
     if any("authorization" in reason or "placeholder_cap" in reason or "execution_allowed" in reason for reason in reasons):
         return STATUS_BLOCKED_AUTHORIZATION_BOUNDARY
     if any("verdict_overreach" in reason or "actual_or_superiority_verdict" in reason or "comparative_or_action" in reason for reason in reasons):
         return STATUS_BLOCKED_VERDICT_OVERREACH
-    if any("maturity" in reason or "actual_30d" in reason or "next_check" in reason or "verdict_executable" in reason for reason in reasons):
+    if any("maturity" in reason or "actual_30d" in reason or "next_check" in reason or "verdict_executable" in reason or "verdict_executed" in reason for reason in reasons):
         return STATUS_BLOCKED_MATURITY_READINESS
     if any("statistical" in reason or "sample_size" in reason or "paired_clean" in reason or "p_value" in reason or "estimate" in reason or "bootstrap" in reason for reason in reasons):
         return STATUS_BLOCKED_STATISTICAL_ELIGIBILITY
@@ -1065,6 +1109,22 @@ def restore_config_identity(summary: dict[str, Any], *, config: ReadinessConfig,
 
 
 def build_summary(config: ReadinessConfig) -> dict[str, Any]:
+    try:
+        validate_run_id(config.readiness_pack_id)
+    except ValueError:
+        safe_config = ReadinessConfig(
+            readiness_pack_id=f"{RUN_ID_PREFIX}invalid",
+            output_dir=Path("/tmp") / "gotra_v3_8m_invalid_readiness_pack_id",
+            allow_overwrite=False,
+            summary_fixture=config.summary_fixture,
+        )
+        run_root = safe_config.output_dir / safe_config.readiness_pack_id
+        summary = base_summary(safe_config, run_root=run_root, status=STATUS_BLOCKED_SCHEMA)
+        blockers = [blocked_item("summary.readiness_pack_id", "readiness_pack_id_invalid", "readiness_pack_id failed validation")]
+        summary["requested_readiness_pack_id"] = str(config.readiness_pack_id)
+        summary["readiness_status"] = choose_status(blockers)
+        finalize_blockers(summary, blockers)
+        return summary
     run_root = config.output_dir / config.readiness_pack_id
     if not under_tmp(config.output_dir):
         summary = base_summary(config, run_root=run_root, status=STATUS_BLOCKED_RUNTIME_BOUNDARY)
@@ -1111,6 +1171,12 @@ def write_outputs(summary: dict[str, Any], *, config: ReadinessConfig, run_root:
     summary_path = run_root / "summary.json"
     manifest_path = run_root / "manifest.json"
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    observed_authorization_status = summary.get("provider_canary_authorization_status")
+    manifest_authorization_status = (
+        observed_authorization_status
+        if observed_authorization_status == AUTHORIZATION_STATUS
+        else AUTHORIZATION_STATUS
+    )
     manifest = {
         "schema": MANIFEST_SCHEMA,
         "readiness_pack_id": summary.get("readiness_pack_id"),
@@ -1122,7 +1188,8 @@ def write_outputs(summary: dict[str, Any], *, config: ReadinessConfig, run_root:
         "real_calls_count": summary.get("real_calls_count"),
         "token_usage_total": summary.get("token_usage_total"),
         "cognitive_lift_superiority_verdict_status": summary.get("cognitive_lift_superiority_verdict_status"),
-        "provider_canary_authorization_status": summary.get("provider_canary_authorization_status"),
+        "provider_canary_authorization_status": manifest_authorization_status,
+        "provider_canary_authorization_status_observed": observed_authorization_status,
         "evidence_layer": summary.get("evidence_layer"),
         "generated_at": utc_now_iso(),
     }
