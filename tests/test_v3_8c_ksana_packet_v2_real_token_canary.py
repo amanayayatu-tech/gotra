@@ -139,7 +139,11 @@ def test_real_output_dir_must_be_under_tmp_before_client_creation(tmp_path: Path
             raise AssertionError("client should not be constructed for non-/tmp output dir")
 
     monkeypatch.setattr(canary, "CodexResponsesCompletionClient", FailIfConstructed)
-    config = _real_config_with_options(tmp_path, call_count=1, output_dir=tmp_path / "repo_like_runs")
+    config = _real_config_with_options(
+        tmp_path,
+        call_count=1,
+        output_dir=Path("/var/tmp") / f"gotra_v3_8c_non_tmp_output_{tmp_path.name}",
+    )
 
     summary = canary.build_summary(config)
 
