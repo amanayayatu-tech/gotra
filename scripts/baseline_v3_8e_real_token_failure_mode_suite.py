@@ -149,9 +149,14 @@ TEXT_SCAN_FIELDS = (
     "evidence_layer",
     "non_claims",
     "blocker_reasons",
-    "failure_cases",
     DIRECT_INTERPRETATION_KEY,
     "actual_30d_readiness_status",
+)
+PROTECTED_IDENTITY_FIELDS = (
+    "failure_suite_run_id",
+    "run_root",
+    "summary_path",
+    "manifest_path",
 )
 
 
@@ -701,11 +706,83 @@ def recursive_string_values(value: Any) -> list[str]:
     return []
 
 
+def recursive_claim_sources(value: Any, *, path: str) -> list[claim_scan.ScanSource]:
+    sources: list[claim_scan.ScanSource] = []
+    if isinstance(value, str):
+        sources.append(claim_scan.ScanSource(path=path, text=value, origin="v3_8e_failure_mode_suite"))
+    elif isinstance(value, dict):
+        for key, item in sorted(value.items()):
+            sources.extend(recursive_claim_sources(item, path=f"{path}.{key}"))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            sources.extend(recursive_claim_sources(item, path=f"{path}[{index}]"))
+    return sources
+
+
+def failure_case_claim_blockers(cases: Any) -> list[dict[str, Any]]:
+    sources = recursive_claim_sources(cases, path="summary.failure_cases")
+    scan = claim_scan.scan_sources(sources)
+    blockers = scan["overclaim"] + scan["direct" + "_llm"] + scan["maturity_gate"] + scan["short_horizon_as_30d"]
+    blockers.extend(claim_regression.extra_text_blockers(sources))
+    return blockers
+
+
+def aggregate_case_counts(cases: list[Any]) -> dict[str, Any]:
+    call_count = 0
+    token_usage = 0
+    retry_count = 0
+    provider_called = False
+    status_counts: dict[str, int] = {}
+    for case in cases:
+        if not isinstance(case, dict):
+            continue
+        if isinstance(case.get("call_count"), int) and case["call_count"] >= 0:
+            call_count += int(case["call_count"])
+        if isinstance(case.get("token_usage_total"), int) and case["token_usage_total"] >= 0:
+            token_usage += int(case["token_usage_total"])
+        if isinstance(case.get("retry_count"), int) and case["retry_count"] >= 0:
+            retry_count += int(case["retry_count"])
+        provider_called = provider_called or case.get("provider_or_backend_called") is True
+        observed = str(case.get("observed_status") or "")
+        if observed:
+            status_counts[observed] = status_counts.get(observed, 0) + 1
+    return {
+        "real_calls_count": call_count,
+        "token_usage_total": token_usage,
+        "retry_count_total": retry_count,
+        "provider_or_backend_called": provider_called,
+        "case_status_counts": status_counts,
+    }
+
+
+def fixture_identity_blockers(payload: dict[str, Any], *, config: FailureSuiteConfig, run_root: Path) -> list[dict[str, Any]]:
+    expected = {
+        "failure_suite_run_id": config.failure_suite_run_id,
+        "run_root": str(run_root),
+        "summary_path": str(run_root / "summary.json"),
+        "manifest_path": str(run_root / "manifest.json"),
+    }
+    blockers: list[dict[str, Any]] = []
+    for key, expected_value in expected.items():
+        if key in payload and payload.get(key) != expected_value:
+            blockers.append(blocked_item(f"summary.{key}", f"{key}_identity_mismatch", f"{key} must come from CLI/config"))
+    return blockers
+
+
+def restore_config_identity(summary: dict[str, Any], *, config: FailureSuiteConfig, run_root: Path) -> None:
+    summary["failure_suite_run_id"] = config.failure_suite_run_id
+    summary["run_root"] = str(run_root)
+    summary["summary_path"] = str(run_root / "summary.json")
+    summary["manifest_path"] = str(run_root / "manifest.json")
+
+
 def validate_summary_payload(summary: dict[str, Any]) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
     status = str(summary.get("suite_status") or "")
     if status not in ALLOWED_STATUSES:
         blockers.append(blocked_item("summary.suite_status", "invalid_suite_status", "suite_status is not allowed"))
+    if summary.get("schema") != SUMMARY_SCHEMA:
+        blockers.append(blocked_item("summary.schema", "summary_schema_mismatch", f"schema must be {SUMMARY_SCHEMA}"))
     missing = sorted(REQUIRED_SUMMARY_FIELDS - set(summary))
     blockers.extend(blocked_item(f"summary.{key}", "summary_missing_field", f"{key} is required") for key in missing)
     if summary.get("evidence_layer") != EVIDENCE_LAYER:
@@ -733,36 +810,60 @@ def validate_summary_payload(summary: dict[str, Any]) -> list[dict[str, Any]]:
         blockers.append(blocked_item("summary.failure_cases", "failure_cases_empty", "failure suite needs at least one case"))
     for index, case in enumerate(cases):
         blockers.extend(validate_case_result(case, index=index))
+    aggregate = aggregate_case_counts(cases)
     call_count = summary.get("real_calls_count")
     if not isinstance(call_count, int) or call_count < 0:
         blockers.append(blocked_item("summary.real_calls_count", "real_calls_count_invalid", "real_calls_count must be non-negative integer"))
         call_count = 0
     elif call_count > HARD_MAX_REAL_CALLS:
         blockers.append(blocked_item("summary.real_calls_count", "real_calls_count_over_hard_limit", "real calls exceed hard limit"))
+    elif call_count != aggregate["real_calls_count"]:
+        blockers.append(blocked_item("summary.real_calls_count", "real_calls_count_mismatch", "real_calls_count must equal aggregate failure case calls"))
     token_usage = summary.get("token_usage_total")
+    token_budget = summary.get("token_budget")
+    if not isinstance(token_budget, int) or token_budget < 0:
+        blockers.append(blocked_item("summary.token_budget", "token_budget_invalid", "token_budget must be a non-negative integer"))
+        token_budget = DEFAULT_TOKEN_BUDGET
+    elif token_budget > HARD_TOKEN_BUDGET:
+        blockers.append(blocked_item("summary.token_budget", "token_budget_over_hard_limit", "token budget exceeds hard limit"))
     if not isinstance(token_usage, int) or token_usage < 0:
         blockers.append(blocked_item("summary.token_usage_total", "token_usage_total_invalid", "token usage must be non-negative integer"))
-    elif token_usage > HARD_TOKEN_BUDGET or token_usage > int(summary.get("token_budget") or DEFAULT_TOKEN_BUDGET):
+    elif token_usage > HARD_TOKEN_BUDGET or token_usage > token_budget:
         blockers.append(blocked_item("summary.token_usage_total", "token_usage_over_budget", "token usage exceeds budget"))
+    elif token_usage != aggregate["token_usage_total"]:
+        blockers.append(blocked_item("summary.token_usage_total", "token_usage_total_mismatch", "token usage total must equal aggregate failure case usage"))
     retries = summary.get("retry_count_total")
     if not isinstance(retries, int) or retries < 0:
         blockers.append(blocked_item("summary.retry_count_total", "retry_count_total_invalid", "retry count must be non-negative integer"))
     elif retries > MAX_RETRY_COUNT:
         blockers.append(blocked_item("summary.retry_count_total", "retry_count_over_limit", "retry count exceeds limit"))
+    elif retries != aggregate["retry_count_total"]:
+        blockers.append(blocked_item("summary.retry_count_total", "retry_count_total_mismatch", "retry count total must equal aggregate failure case retries"))
     if summary.get("provider_or_backend_called") is True and call_count == 0:
         blockers.append(blocked_item("summary.provider_or_backend_called", "provider_called_without_call_count", "called flag needs calls"))
     if summary.get("provider_or_backend_called") is False and call_count > 0:
         blockers.append(blocked_item("summary.provider_or_backend_called", "provider_called_flag_false", "real calls need called flag"))
+    if summary.get("provider_or_backend_called") != aggregate["provider_or_backend_called"]:
+        blockers.append(blocked_item("summary.provider_or_backend_called", "provider_or_backend_called_mismatch", "provider flag must match aggregate failure case calls"))
     if summary.get("total_cases") != len(cases):
         blockers.append(blocked_item("summary.total_cases", "total_cases_mismatch", "total_cases must match failure_cases length"))
     if summary.get("passed_cases") != sum(1 for item in cases if isinstance(item, dict) and item.get("handled") is True):
         blockers.append(blocked_item("summary.passed_cases", "passed_cases_mismatch", "passed_cases must match handled cases"))
     if summary.get("blocked_cases") != sum(1 for item in cases if isinstance(item, dict) and item.get("handled") is not True):
         blockers.append(blocked_item("summary.blocked_cases", "blocked_cases_mismatch", "blocked_cases must match unhandled cases"))
+    if summary.get("case_status_counts") != aggregate["case_status_counts"]:
+        blockers.append(blocked_item("summary.case_status_counts", "case_status_counts_mismatch", "case_status_counts must match observed failure case statuses"))
     for key in ("raw_tmp_paths", "raw_tmp_sha256s"):
         if not isinstance(summary.get(key), list):
             blockers.append(blocked_item(f"summary.{key}", f"{key}_not_list", f"{key} must be list"))
-    for index, raw_path in enumerate(summary.get("raw_tmp_paths") if isinstance(summary.get("raw_tmp_paths"), list) else []):
+    raw_paths = summary.get("raw_tmp_paths") if isinstance(summary.get("raw_tmp_paths"), list) else []
+    raw_hashes = summary.get("raw_tmp_sha256s") if isinstance(summary.get("raw_tmp_sha256s"), list) else []
+    if isinstance(raw_paths, list) and isinstance(raw_hashes, list) and len(raw_paths) != len(raw_hashes):
+        blockers.append(blocked_item("summary.raw_tmp_sha256s", "raw_tmp_sha256s_count_mismatch", "raw hash count must match raw path count"))
+    for index, raw_hash in enumerate(raw_hashes):
+        if not is_hex64(raw_hash):
+            blockers.append(blocked_item(f"summary.raw_tmp_sha256s[{index}]", "raw_tmp_sha256_invalid", "raw tmp sha256 must be 64-char hex"))
+    for index, raw_path in enumerate(raw_paths):
         if not isinstance(raw_path, str) or not raw_path:
             blockers.append(blocked_item(f"summary.raw_tmp_paths[{index}]", "raw_tmp_path_invalid", "raw path must be non-empty string"))
         elif not under_tmp(raw_path):
@@ -770,6 +871,7 @@ def validate_summary_payload(summary: dict[str, Any]) -> list[dict[str, Any]]:
     if contains_secret(summary):
         blockers.append(blocked_item("summary", "secret_material_detected", "summary contains secret-like material"))
     blockers.extend(claim_regression.claim_blockers({field: summary.get(field) for field in TEXT_SCAN_FIELDS}, path="summary"))
+    blockers.extend(failure_case_claim_blockers(cases))
     blockers.extend(status_claim_blockers(summary))
     return blockers
 
@@ -817,6 +919,7 @@ def build_controlled_suite(config: FailureSuiteConfig, *, run_root: Path) -> dic
 
 def build_from_fixture(config: FailureSuiteConfig, *, run_root: Path) -> dict[str, Any]:
     payload, load_blockers = load_summary_fixture(config.summary_fixture or Path(""))
+    identity_blockers = fixture_identity_blockers(payload, config=config, run_root=run_root) if payload else []
     summary = base_summary(
         config,
         run_root=run_root,
@@ -824,7 +927,8 @@ def build_from_fixture(config: FailureSuiteConfig, *, run_root: Path) -> dict[st
     )
     if payload:
         summary.update(payload)
-    blockers = load_blockers + validate_summary_payload(summary)
+    restore_config_identity(summary, config=config, run_root=run_root)
+    blockers = load_blockers + identity_blockers + validate_summary_payload(summary)
     summary["suite_status"] = choose_status(blockers, current_status=str(summary.get("suite_status") or ""))
     finalize_blockers(summary, blockers)
     return summary
@@ -833,6 +937,11 @@ def build_from_fixture(config: FailureSuiteConfig, *, run_root: Path) -> dict[st
 def build_summary(config: FailureSuiteConfig) -> dict[str, Any]:
     validate_run_id(config.failure_suite_run_id)
     run_root = config.output_dir / config.failure_suite_run_id
+    if not under_tmp(run_root):
+        summary = base_summary(config, run_root=run_root, status=STATUS_BLOCKED_RUNTIME_BOUNDARY)
+        blockers = [blocked_item(run_root, "output_dir_not_tmp", "failure-mode outputs must be under /tmp")]
+        finalize_blockers(summary, blockers)
+        return summary
     if run_root.exists() and any(run_root.iterdir()) and not config.allow_overwrite:
         summary = base_summary(config, run_root=run_root, status=STATUS_RUN_ID_EXISTS)
         finalize_blockers(summary, [blocked_item(run_root, "output_run_id_exists", "output run id exists")])

@@ -74,6 +74,24 @@ any actual verdict.
 - repository commits: code, tests, docs, schemas, hashes, statuses, and metadata
   only
 
+## Repair Hardening Contract
+
+The validator must fail closed for fixture and output-boundary issues:
+
+- an output root outside `/tmp` must not create or write `summary.json` or
+  `manifest.json`
+- fixture `schema` must exactly match the v3.8E summary schema
+- fixture `failure_suite_run_id`, `run_root`, `summary_path`, and
+  `manifest_path` cannot override the current CLI/config identity
+- malformed numeric budget fields must produce structured blockers, not
+  uncaught exceptions
+- `raw_tmp_sha256s` must be 64-character SHA-256 values and align with
+  `raw_tmp_paths`
+- summary call/token/retry/provider totals must match aggregate case metadata
+- `case_status_counts` must match observed case statuses exactly
+- every string inside `failure_cases`, including nested metadata or notes, must
+  remain inside the claim boundary
+
 ## Summary Contract
 
 The summary must include:

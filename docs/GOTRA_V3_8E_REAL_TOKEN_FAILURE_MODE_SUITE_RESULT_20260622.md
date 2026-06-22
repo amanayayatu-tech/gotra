@@ -45,9 +45,22 @@ The harness enforces:
 - secret redaction and summary secret scan
 - final `summary.json` digest stored in `manifest.json`
 
+Repair hardening added:
+
+- output roots outside `/tmp` return structured blockers before directory
+  creation or output writes
+- malformed fixture budget fields return structured blockers
+- fixture summary schema must match the v3.8E schema exactly
+- raw tmp hashes are validated as aligned SHA-256 values
+- CLI/config run identity is restored before output writes and mismatched
+  fixture identity is blocked
+- summary call/token/retry/provider totals must reconcile with per-case data
+- `case_status_counts` must match observed per-case statuses
+- all nested strings in `failure_cases` are claim-boundary scanned
+
 ## Local Controlled Validation
 
-Local controlled validation was written only under `/tmp`:
+Original local controlled validation was written only under `/tmp`:
 
 - summary:
   `/tmp/gotra_v3_8e_failure_mode_suite_mock_20260622T052000Z/runs/baseline_v3_8e_real_token_failure_mode_suite_mock_20260622T052000Z/summary.json`
@@ -87,6 +100,26 @@ Content boundary digest:
 
 - `bcf83c7469d452efeb766f3b37a8715db482954b0c2dc49594f461414df5fc23`
 
+Repair local controlled validation was written only under `/tmp`:
+
+- summary:
+  `/tmp/gotra_v3_8e_failure_mode_suite_repair_20260622T055700Z/runs/baseline_v3_8e_real_token_failure_mode_suite_repair_20260622T055700Z/summary.json`
+- summary sha256:
+  `e542d5d47bfba620cd5db74096065926abc5ceb1979f470795daf5fc1ee3c7c6`
+- manifest sha256:
+  `ff0529202a61a7c5369bb6300aad9f21ba11a3fcf33e08fc6e9af3f0a4c3dc1a`
+- status: `REAL_TOKEN_FAILURE_MODE_SUITE_PASS`
+- total cases: `12`
+- passed cases: `12`
+- blocked cases: `0`
+- real calls count: `0`
+- token usage total: `0`
+- retry count total: `1`
+- latency min/median/max ms: `40` / `47` / `1000`
+- backend/model metadata: `codex_responses_oauth_backend` / `gpt-5.5`
+- provider/backend called: `false`
+- raw/error payload handling: `/tmp` only
+
 ## Focused Tests
 
 The focused test suite covers:
@@ -104,7 +137,7 @@ The focused test suite covers:
 - blocked CLI exit semantics
 - final manifest digest verification
 
-Validation results:
+Original validation results:
 
 - `py_compile`: pass
 - `ruff`: pass
@@ -113,21 +146,30 @@ Validation results:
   `101 passed`
 - full pytest: `847 passed`
 
+Repair validation results:
+
+- `py_compile`: pass
+- `ruff`: pass
+- focused v3.8E pytest: `20 passed`
+- relevant v3.8B/v3.8C/v3.8D/v3.7G/v3.7H/v3.7I regression:
+  `109 passed`
+- full pytest: `855 passed`
+
 Docs claim-boundary scan:
 
 - summary:
-  `/tmp/gotra_v3_8e_claim_scan_20260622T052900Z/baseline_v3_6ab_evidence_claim_boundary_scan_v3_8e_docs_20260622T052900Z/summary.json`
+  `/tmp/gotra_v3_8e_repair_claim_scan_20260622T060000Z/baseline_v3_6ab_evidence_claim_boundary_scan_v3_8e_repair_docs_20260622T060000Z/summary.json`
 - summary sha256:
-  `d0f5e32f03054e8feaeba91585c1edeaf40cbce08fae7dfa2eafac99bee55f1c`
+  `301841ad08d99abe4c1f69974fc68e1c9cfd1d46895257a3632c5931725f0be9`
 - status: `CLAIM_BOUNDARY_CLEAN`
 - blockers: `0`
 
 v3.7H claim-boundary regression over the PR files:
 
 - summary:
-  `/tmp/gotra_v3_8e_claim_regression_20260622T052900Z/baseline_v3_7h_claim_boundary_regression_v3_8e_20260622T052900Z/summary.json`
+  `/tmp/gotra_v3_8e_repair_claim_regression_20260622T060000Z/baseline_v3_7h_claim_boundary_regression_v3_8e_repair_20260622T060000Z/summary.json`
 - summary sha256:
-  `9b30ce0b4da35b16965bf8655eb62c1d049b859ca1dd2844b097d133c906aa74`
+  `eb711376092065e6d8850fe88edb6c0c678f2a699b5df11dfe7c27be913e024a`
 - status: `V3_7_CLAIM_BOUNDARY_REGRESSION_READY`
 - blockers: `0`
 
