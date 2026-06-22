@@ -62,7 +62,7 @@ Observed local status: `PROVIDER_CANARY_AUTHORIZATION_GATE_READY`.
 Summary:
 
 - path: `/tmp/gotra_v3_8h_provider_canary_authorization_gate/runs/baseline_v3_8h_provider_canary_authorization_gate_local_20260622/summary.json`
-- sha256: `d92aa98f6153bb48ec1bb0fe24517990c01045ca9178946341c9b22e32af9aef`
+- sha256: `63036a390979ac0c9854953d777d9a62e786d3885d3d3efa952ec736bd7ccfb4`
 
 Manifest:
 
@@ -73,13 +73,23 @@ Manifest:
 
 - `py_compile`: pass
 - `ruff`: pass
-- focused v3.8H pytest: `15 passed`
+- focused v3.8H pytest: `20 passed`
 - relevant v3.8G/v3.8F/v3.7H/v3.7I/v3.8H regression: `77 passed`
 - full pytest: `905 passed`
 - local/mock guard validation: `PROVIDER_CANARY_AUTHORIZATION_GATE_READY`
 - docs claim-boundary scan: `CLAIM_BOUNDARY_CLEAN`
 - v3.7H PR-file regression: `V3_7_CLAIM_BOUNDARY_REGRESSION_READY`
 - `git diff --check`: pass
+
+## Repair Hardening
+
+The PR #72 repair hardens five authorization-boundary cases:
+
+- observed call and token usage must stay within `authorization_packet.max_calls` and `authorization_packet.max_tokens`.
+- malformed `observed_call_count` returns a structured blocker instead of raising an exception.
+- provider-called/executed summaries must include non-empty observed provider family, backend, and model identity.
+- positive `observed_token_usage_total` is treated as provider/backend evidence even when call flags are false.
+- `non_claims` must include the complete required attestation set with every value set to true.
 
 ## Next Authorization Boundary
 

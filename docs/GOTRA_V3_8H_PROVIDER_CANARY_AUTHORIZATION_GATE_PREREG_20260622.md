@@ -50,9 +50,14 @@ Default future caps enforced by the gate:
 The guard blocks:
 
 - provider canary execution or backend usage without a separate authorization packet
+- observed calls/tokens above the authorization packet limits
+- malformed observed call or token counts
+- missing observed provider family, backend, or model identity when provider evidence is present
+- positive token usage without matching authorization evidence
 - legacy provider references without explicit named future authorization
 - missing or oversized call/token budgets
 - missing usage metadata for any recorded call
+- partial or malformed non-claim attestations
 - raw paths outside `/tmp`
 - committed raw/full transcript/data artifacts
 - forbidden artifact paths such as env files, DB files, bundles, backtest run directories, and paper-trading data directories

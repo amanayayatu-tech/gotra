@@ -95,6 +95,14 @@ AUTHORIZATION_REQUIRED_FIELDS = {
     "no_raw_repo",
     "usage_metadata_required",
 }
+REQUIRED_NON_CLAIMS = {
+    "not_provider_canary_execution",
+    "not_provider_benchmark",
+    "not_actual_30d_verdict",
+    "not_oos_science_public_trading_claim",
+    "not_trading_or_investment_advice",
+    "not_readiness_gate_passed",
+}
 REQUIRED_FIELDS = {
     "schema",
     "script_version",
@@ -232,12 +240,14 @@ def non_negative_int(value: Any) -> bool:
 
 def provider_called(summary: dict[str, Any]) -> bool:
     observed_count = summary.get("observed_call_count")
+    observed_tokens = summary.get("observed_token_usage_total")
     return (
         summary.get("provider_or_backend_called") is True
         or summary.get("provider_canary_executed") is True
         or summary.get("observed_provider_or_backend_called") is True
         or summary.get("observed_provider_canary_executed") is True
         or (isinstance(observed_count, int) and not isinstance(observed_count, bool) and observed_count > 0)
+        or (isinstance(observed_tokens, int) and not isinstance(observed_tokens, bool) and observed_tokens > 0)
     )
 
 
@@ -325,7 +335,8 @@ def base_summary(config: GateConfig, *, run_root: Path, status: str) -> dict[str
             "not_provider_benchmark": True,
             "not_actual_30d_verdict": True,
             "not_oos_science_public_trading_claim": True,
-            "not_investment_advice": True,
+            "not_trading_or_investment_advice": True,
+            "not_readiness_gate_passed": True,
         },
         "can_say": [
             "provider canary authorization gate is locally validated",
@@ -387,8 +398,19 @@ def schema_blockers(summary: dict[str, Any], *, fixture_payload: dict[str, Any] 
         blockers.append(blocked_item("summary.changed_files", "changed_files_not_list", "changed_files must be a list"))
     if not isinstance(summary.get("raw_tmp_paths"), list):
         blockers.append(blocked_item("summary.raw_tmp_paths", "raw_tmp_paths_not_list", "raw_tmp_paths must be a list"))
-    if not isinstance(summary.get("non_claims"), dict) or not all(summary.get("non_claims", {}).values()):
-        blockers.append(blocked_item("summary.non_claims", "non_claims_invalid", "non-claim attestations must be true"))
+    non_claims = summary.get("non_claims")
+    if not isinstance(non_claims, dict):
+        blockers.append(blocked_item("summary.non_claims", "boundary_attestations_invalid", "non-claim attestations must be object"))
+    else:
+        missing_non_claims = sorted(REQUIRED_NON_CLAIMS - set(non_claims))
+        blockers.extend(blocked_item(f"summary.non_claims.{key}", "boundary_attestation_missing_field", f"{key} is required") for key in missing_non_claims)
+        for key in REQUIRED_NON_CLAIMS & set(non_claims):
+            if non_claims.get(key) is not True:
+                blockers.append(blocked_item(f"summary.non_claims.{key}", "boundary_attestation_invalid", f"{key} must be true"))
+    if provider_called(summary):
+        for key in ("observed_backend_family", "observed_backend", "observed_model"):
+            if not isinstance(summary.get(key), str) or not summary.get(key, "").strip():
+                blockers.append(blocked_item(f"summary.{key}", f"{key}_missing_for_execution", f"{key} is required when provider/backend evidence is present"))
     return blockers
 
 
@@ -411,6 +433,13 @@ def authorization_blockers(summary: dict[str, Any]) -> list[dict[str, Any]]:
     observed_family = str(summary.get("observed_backend_family") or "")
     observed_backend = str(summary.get("observed_backend") or "")
     if provider_called(summary):
+        for key, observed_key in (
+            ("provider_family", "observed_backend_family"),
+            ("backend", "observed_backend"),
+            ("model", "observed_model"),
+        ):
+            if not isinstance(summary.get(observed_key), str) or not summary.get(observed_key, "").strip():
+                blockers.append(blocked_item(f"summary.{observed_key}", f"{observed_key}_missing_for_execution", f"{observed_key} must be present before authorization binding"))
         if provider_family and observed_family and provider_family != observed_family:
             blockers.append(blocked_item("summary.authorization_packet.provider_family", "authorization_provider_family_mismatch", "authorization provider family must bind observed family"))
         if auth.get("backend") and observed_backend and auth.get("backend") != observed_backend:
@@ -426,6 +455,13 @@ def authorization_blockers(summary: dict[str, Any]) -> list[dict[str, Any]]:
             blockers.append(blocked_item(f"summary.authorization_packet.{key}", f"authorization_{key}_invalid", f"{key} must be positive integer"))
         elif value > cap:
             blockers.append(blocked_item(f"summary.authorization_packet.{key}", f"authorization_{key}_over_cap", f"{key} exceeds guard cap"))
+    if provider_called(summary):
+        auth_max_calls = auth.get("max_calls")
+        if is_positive_int(auth_max_calls) and non_negative_int(summary.get("observed_call_count")) and summary["observed_call_count"] > auth_max_calls:
+            blockers.append(blocked_item("summary.observed_call_count", "observed_call_count_exceeds_authorization", "observed calls exceed authorization packet max_calls"))
+        auth_max_tokens = auth.get("max_tokens")
+        if is_positive_int(auth_max_tokens) and non_negative_int(summary.get("observed_token_usage_total")) and summary["observed_token_usage_total"] > auth_max_tokens:
+            blockers.append(blocked_item("summary.observed_token_usage_total", "observed_token_usage_exceeds_authorization", "observed token usage exceeds authorization packet max_tokens"))
     for key in ("raw_tmp_only", "no_raw_repo", "usage_metadata_required"):
         if auth.get(key) is not True:
             blockers.append(blocked_item(f"summary.authorization_packet.{key}", f"authorization_{key}_not_true", f"{key} must be true"))
@@ -486,7 +522,8 @@ def metadata_blockers(summary: dict[str, Any]) -> list[dict[str, Any]]:
     if summary.get("usage_metadata_required") is not True:
         blockers.append(blocked_item("summary.usage_metadata_required", "usage_metadata_required_not_true", "usage metadata must be required"))
     observed_calls = summary.get("observed_calls") if isinstance(summary.get("observed_calls"), list) else []
-    if not observed_calls and int(summary.get("observed_call_count") or 0) > 0:
+    observed_count = summary.get("observed_call_count")
+    if not observed_calls and non_negative_int(observed_count) and observed_count > 0:
         blockers.append(blocked_item("summary.observed_calls", "observed_calls_missing_for_execution", "executed calls must include per-call metadata"))
     for index, call in enumerate(observed_calls):
         if not isinstance(call, dict):

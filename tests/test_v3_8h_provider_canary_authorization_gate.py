@@ -185,6 +185,96 @@ def test_authorized_execution_with_metadata_stays_ready(tmp_path: Path) -> None:
     assert summary["metadata_status"] == "clean"
 
 
+def test_authorized_execution_over_packet_caps_blocks(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["authorization_packet"] = _authorization_packet(max_calls=1, max_tokens=1000)
+    payload["observed_provider_or_backend_called"] = True
+    payload["observed_provider_canary_executed"] = True
+    payload["observed_call_count"] = 2
+    payload["observed_token_usage_total"] = 1001
+    payload["observed_calls"] = [
+        {
+            "call_count": 2,
+            "token_usage_total": 1001,
+            "usage_metadata_available": True,
+            "raw_tmp_path": "/tmp/gotra_v3_8h/call.json",
+        }
+    ]
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = gate.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["gate_status"] == gate.STATUS_BLOCKED_AUTHORIZATION_BOUNDARY
+    assert "observed_call_count_exceeds_authorization" in summary["blocker_reasons"]
+    assert "observed_token_usage_exceeds_authorization" in summary["blocker_reasons"]
+
+
+def test_malformed_observed_call_count_with_provider_flag_blocks_without_crash(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["observed_provider_or_backend_called"] = True
+    payload["observed_call_count"] = "one"
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = gate.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["gate_status"] == gate.STATUS_BLOCKED_AUTHORIZATION_BOUNDARY
+    assert "observed_call_count_invalid" in summary["blocker_reasons"]
+    assert "provider_execution_without_authorization_packet" in summary["blocker_reasons"]
+
+
+def test_provider_execution_missing_observed_identity_blocks(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["authorization_packet"] = _authorization_packet()
+    payload["observed_provider_or_backend_called"] = True
+    payload["observed_provider_canary_executed"] = True
+    payload["observed_call_count"] = 1
+    payload["observed_token_usage_total"] = 42
+    payload["observed_backend_family"] = ""
+    payload["observed_backend"] = ""
+    payload["observed_model"] = ""
+    payload["observed_calls"] = [
+        {
+            "call_count": 1,
+            "token_usage_total": 42,
+            "usage_metadata_available": True,
+            "raw_tmp_path": "/tmp/gotra_v3_8h/call.json",
+        }
+    ]
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = gate.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["gate_status"] == gate.STATUS_BLOCKED_SCHEMA
+    assert "observed_backend_family_missing_for_execution" in summary["blocker_reasons"]
+    assert "observed_backend_missing_for_execution" in summary["blocker_reasons"]
+    assert "observed_model_missing_for_execution" in summary["blocker_reasons"]
+
+
+def test_positive_token_usage_triggers_authorization_boundary(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["observed_provider_or_backend_called"] = False
+    payload["observed_provider_canary_executed"] = False
+    payload["observed_call_count"] = 0
+    payload["observed_token_usage_total"] = 42
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = gate.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["gate_status"] == gate.STATUS_BLOCKED_AUTHORIZATION_BOUNDARY
+    assert "provider_execution_without_authorization_packet" in summary["blocker_reasons"]
+
+
+def test_partial_non_claims_blocks(tmp_path: Path) -> None:
+    payload = _ready_fixture()
+    payload["non_claims"] = {"not_investment_advice": True}
+    fixture = _write_fixture(tmp_path, payload)
+
+    summary = gate.build_summary(_config(tmp_path, fixture=fixture))
+
+    assert summary["gate_status"] == gate.STATUS_BLOCKED_SCHEMA
+    assert "boundary_attestation_missing_field" in summary["blocker_reasons"]
+
+
 def test_output_dir_outside_tmp_does_not_write(tmp_path: Path) -> None:
     output_dir = Path("/var/tmp") / f"gotra_v3_8h_outside_tmp_{tmp_path.name}"
     run_id = "baseline_v3_8h_provider_canary_authorization_gate_outside_tmp"
@@ -236,7 +326,7 @@ def test_cli_blocked_status_exits_nonzero(tmp_path: Path) -> None:
     assert rc == 1
 
 
-def _authorization_packet() -> dict[str, object]:
+def _authorization_packet(*, max_calls: int = 1, max_tokens: int = 1000) -> dict[str, object]:
     return {
         "user_authorization_present": True,
         "authorization_id": "user_future_canary_authorization_fixture",
@@ -244,8 +334,8 @@ def _authorization_packet() -> dict[str, object]:
         "provider_family": gate.DEFAULT_BACKEND_FAMILY,
         "backend": gate.DEFAULT_BACKEND_FAMILY,
         "model": gate.DEFAULT_MODEL,
-        "max_calls": 1,
-        "max_tokens": 1000,
+        "max_calls": max_calls,
+        "max_tokens": max_tokens,
         "raw_tmp_only": True,
         "no_raw_repo": True,
         "usage_metadata_required": True,
