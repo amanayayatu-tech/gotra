@@ -65,7 +65,54 @@ When `--publish-static` is set, it also copies the same public-safe files to:
 
 `status.json` includes `schema`, `mode`, `as_of_date`, `trading_date`,
 per-exchange trading dates, `universe_count`, `success_count`, `failed_count`,
-`missing_symbols`, `source`, public-safety boundary text, and generated time.
+`missing_symbols`, `failed_symbols`, `run_status`, `artifact_write_status`,
+`artifact_write_failure_reason`, `source`, public-safety boundary text, and
+generated time. `missing_symbols` is retained for compatibility; use
+`failed_symbols` for new checks.
+
+## Observability And Failure Checks
+
+systemd captures script logs in the service journal. Use these commands first
+when a timer looks stale or a report is missing:
+
+```bash
+sudo journalctl -u gotra-stock-pool-morning-report.service -n 120 --no-pager
+sudo journalctl -u gotra-stock-pool-evening-report.service -n 120 --no-pager
+sudo journalctl -u gotra-stock-pool-morning-report.service --since "24 hours ago" --no-pager
+sudo journalctl -u gotra-stock-pool-evening-report.service --since "24 hours ago" --no-pager
+```
+
+The journal should include start parameters, resolved trading dates, coverage,
+failed-symbol summaries, artifact paths, and any `status.json write failed`
+reason. If `status.json` itself cannot be written, the journal is the source of
+truth for that write failure.
+
+Check the current source status:
+
+```bash
+jq '{ok, run_status, mode, as_of_date, trading_date, success_count, failed_count, artifact_write_status, artifact_write_failure_reason}' \
+  /opt/gotra/data/reports/status.json
+```
+
+List failed symbols:
+
+```bash
+jq -r '.failed_symbols[]? | [.exchange, .symbol, .provider_ticker, .reason] | @tsv' \
+  /opt/gotra/data/reports/status.json
+```
+
+Check the public static status:
+
+```bash
+curl -fsS http://47.251.249.147/reports/status.json \
+  | jq '{ok, run_status, mode, trading_date, success_count, failed_count, artifact_write_status, artifact_write_failure_reason}'
+
+curl -fsS http://47.251.249.147/reports/status.json \
+  | jq -r '.failed_symbols[]? | [.exchange, .symbol, .provider_ticker, .reason] | @tsv'
+```
+
+Current notification boundary: no email, Telegram, or Notion notification is
+configured. The first operational alert surface is journal + `status.json`.
 
 ## Timers
 
@@ -129,6 +176,7 @@ Check local artifacts:
 ```bash
 test -s /opt/gotra/data/reports/latest.md
 python3 -m json.tool /opt/gotra/data/reports/status.json >/dev/null
+jq '.failed_symbols' /opt/gotra/data/reports/status.json
 ```
 
 Check static frontend artifacts:
