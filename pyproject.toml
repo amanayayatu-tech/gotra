@@ -5,6 +5,7 @@ description = "Autonomy, integration, and backtest layer for the Gotra research 
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "fastapi>=0.115",
     "httpx>=0.27",
     "jsonschema>=4.23,<4.26",
     "ksana-researchos",
@@ -18,6 +19,7 @@ dependencies = [
     "scipy>=1.13",
     "statsmodels>=0.14",
     "tenacity>=8.2",
+    "uvicorn>=0.30",
     "yfinance>=0.2",
 ]
 
