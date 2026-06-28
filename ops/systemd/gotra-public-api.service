@@ -1,0 +1,14 @@
+[Unit]
+Description=GOTRA public-safe read-only API adapter
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/gotra
+ExecStart=/root/.local/bin/uv run uvicorn gotra.public_api.app:app --host 127.0.0.1 --port 3000
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
