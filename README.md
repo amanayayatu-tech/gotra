@@ -99,6 +99,10 @@ GOTRA 不是：
 
 如果某个 run 写着 `PROVIDER_PILOT_PASS`、`FORMAL_LITE_MIN_INTERNAL_PASS`、`SCALED_INTERNAL_PROVIDER_PILOT_PASS` 或 `FORWARD_LIVE_CAPTURE_PASS`，请只在对应文档声明的证据层内解释。
 
+## 最新 closeout
+
+- GOTRA v3.8X/Y Kendall reliability repair matrix 已 documentation-only closeout：[`docs/GOTRA_V3_8XY_KENDALL_RELIABILITY_REPAIR_MATRIX_CLOSEOUT_20260628.md`](docs/GOTRA_V3_8XY_KENDALL_RELIABILITY_REPAIR_MATRIX_CLOSEOUT_20260628.md)。当前状态是 `METHOD_DECISION_NOT_FORMALLY_ACCEPTED_UNDER_CURRENT_PROTOCOL`；formal state 仍保留 `PHASE_4_BLOCKED_SCORER_RELIABILITY`；no formal pass；no Phase 5；no science/public/trading/investment claim。
+
 ## 快速开始
 
 前置要求：
