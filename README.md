@@ -5,7 +5,7 @@
 
 GOTRA 是一个 AI 原生、可审计、可复盘的投研研究工作流与内容/研究基础设施。它的目标是让研究判断、证据、预测、结果和反馈可以被追踪和复核，而不是提供荐股、自动交易或收益承诺。
 
-当前项目状态：内部工程与研究证据阶段。当前 `main` 已包含 Stage4-8、Baseline v2/v3/v3.1/v3.2/v3.3/v3.4/v3.5A 文档与代码路径，包括本地 harness、provider/backend 实验、deterministic reference 和 forward-live capture plumbing。除非某个后续文档明确升级证据层级，否则这些内容默认不构成 OOS/public/science proof，也不构成交易或投资建议。
+当前项目状态：内部工程与研究证据阶段。当前 `main` 已包含 Stage4-8、Baseline v2/v3/v3.1/v3.2/v3.3/v3.4/v3.5A 文档与代码路径，包括本地 harness、provider/backend 实验、deterministic reference 和 forward-live capture plumbing。除非某个后续文档明确升级证据层级，否则这些内容默认不构成外部验证、公开证明或科学结论，也不构成交易或投资建议。
 
 ## 项目定位
 
@@ -16,7 +16,7 @@ GOTRA 用来：
 - 通过 Judge Agent 和可人工复核的闸门处理高风险知识决策；
 - 在明确 no-future-data 约束下回放历史实验；
 - 在结果成熟前捕获 future-live 决策；
-- 把工程/runtime 健康、内部研究结果、science/public claim 和 trading claim 分开。
+- 把工程/runtime 健康、内部研究结果、强证据结论和交易/投资断言分开。
 
 GOTRA 不是：
 
@@ -51,24 +51,24 @@ GOTRA 不是：
 | --- | --- | --- |
 | local checks | 代码可导入、确定性测试、lint、fixture 行为、artifact hygiene。 | provider 可靠性、市场 edge、OOS 有效性。 |
 | provider/runtime health | 某个 provider/backend 在特定 grid 下能返回 schema-valid decisions。 | replay 有效、科学验收、投资有效。 |
-| mock/canary/tiny smoke | 小范围路径在扩容前可跑通。 | formal acceptance 或 public proof。 |
-| formal-lite internal research | 预注册内部 grid 完成或失败，并留下诊断记录。 | OOS/science/public proof 或 trading claim。 |
+| mock/canary/tiny smoke | 小范围路径在扩容前可跑通。 | formal acceptance 或公开证明。 |
+| formal-lite internal research | 预注册内部 grid 完成或失败，并留下诊断记录。 | 外部验证、科学结论、公开证明或交易/投资断言。 |
 | forward-live capture | 未来结果发生前，决策已被捕获。 | outcome matured pass；必须等 horizon 成熟后评分。 |
-| OOS/science/public proof | 需要单独记录的成熟、验收协议。 | 默认不由本 repo 当前状态声称。 |
-| trading/investment claim | 需要完全不同的合规与证据层。 | 本项目不声称。 |
+| Mature external proof layer | 需要单独记录的成熟、验收协议。 | 默认不由本 repo 当前状态声称。 |
+| Trading/investment assertion | 需要完全不同的合规与证据层。 | 本项目不声称。 |
 
 当前仓库证据默认是 internal engineering/research evidence。除非未来某个命名 artifact 明确升级证据层级，否则不要把局部 smoke、provider health、formal-lite internal run 或 forward-live capture 说成更强结论。
 
 ## Direct LLM Caveat
 
-历史 `direct_llm` 必须解释为 `direct_llm_parametric_memory_control`。
+历史 direct-LLM shorthand 必须解释为 `direct_llm_parametric_memory_control`。
 
 它不是干净的 no-future historical baseline。即使 prompts、input packets 和 artifact filters 都限制到 `decision_date`，现代 LLM 的参数记忆也可能包含后来的市场叙事。prompt 和 artifact gate 可以降低显式 future-data 泄漏，但不能抹掉 parametric memory。
 
 因此：
 
-- `direct_llm` metrics 只能作为诊断；
-- C1/C3/C5、return、MSE、MAE、direction-hit 等包含 `direct_llm` 的指标，不得用来证明或反驳 GOTRA、ksana、alaya 的成功或失败；
+- `direct_llm_parametric_memory_control` metrics 只能作为诊断；
+- C1/C3/C5、return、MSE、MAE、direction-hit 等包含 `direct_llm_parametric_memory_control` 的指标，不得用来证明或反驳 GOTRA、ksana、alaya 的成功或失败；
 - 更适合历史 alaya-style 解释的比较是 `ksana_real_research` vs `full_gotra`，并且仍然受 internal-evidence 边界约束；
 - 更干净的 baseline 是 deterministic price-only 或 simple statistical reference；
 - 最可信的未来导向路径是 forward-live/future-only capture，并在 outcome 成熟后再评分。
@@ -79,22 +79,22 @@ GOTRA 不是：
 
 以下是当前主线的审慎时间线，不是市场优越性声明：
 
-- **Stage4-8**：reproducibility、replay gate、provider routing 和 baseline-only signal/PNL screening。它们改进了审计 harness 并明确失败边界，但没有建立 public market-edge proof。
-- **Baseline v2 / v3**：四臂实验族，比较 `direct_llm`、`ksana_formatting_only`、`ksana_real_research`、`full_gotra`，并区分 `price_only_packet` 与 `richer_research_packet`。Baseline v3 formal-lite 属于内部研究证据，强结论仍为 inconclusive。
+- **Stage4-8**：reproducibility、replay gate、provider routing 和 baseline-only signal/PNL screening。它们改进了审计 harness 并明确失败边界，但没有建立公开市场有效性证明。
+- **Baseline v2 / v3**：四臂实验族，比较 `direct_llm_parametric_memory_control`、`ksana_formatting_only`、`ksana_real_research`、`full_gotra`，并区分 `price_only_packet` 与 `richer_research_packet`。Baseline v3 formal-lite 属于内部研究证据，强结论仍为 inconclusive。
 - **v3.1 / v3.2**：real-evidence 和 true-independent feedback substrate。v3.1 保持 H2 data-insufficient；v3.2 引入更严格的 feedback eligibility，并在 formal-lite attempt 中暴露 provider contract blocker。
 - **v3.3a-d**：Judge decision provenance、dry-run gate polling、outcome-derived feedback artifact production、temporal replay/calibration、prompt/spec hardening。这些是 local engineering 和 replay/calibration evidence。
-- **v3.4 / v3.4b / v3.4c**：新的 `codex_cli_llm_backend` experiment family、transcript/hash metadata、deterministic price-only reference integration 和 scaled internal run。这些是 internal backend/reference diagnostics，不是 OOS 或 public-science result。
+- **v3.4 / v3.4b / v3.4c**：新的 `codex_cli_llm_backend` experiment family、transcript/hash metadata、deterministic price-only reference integration 和 scaled internal run。这些是 internal backend/reference diagnostics，不是外部验证或公开科学结论。
 - **v3.5A**：forward-live/future-only decision capture path。它可以在 outcome 发生前捕获决策；outcome scoring 必须等 horizon 成熟。
 
 ## 当前不声称
 
 本仓库当前不声称：
 
-- 默认已经具备 OOS/public/science proof；
+- 默认已经具备外部验证、公开证明或科学结论；
 - 任何交易或投资推荐；
 - provider health、Codex CLI backend health 或 CI success 等于 market edge；
 - forward-live capture 等于 matured outcome pass；
-- `direct_llm` 是干净的 no-future baseline；
+- `direct_llm_parametric_memory_control` 是干净的 no-future baseline；
 - product metrics 本身可以证明预测质量或投资价值。
 
 如果某个 run 写着 `PROVIDER_PILOT_PASS`、`FORMAL_LITE_MIN_INTERNAL_PASS`、`SCALED_INTERNAL_PROVIDER_PILOT_PASS` 或 `FORWARD_LIVE_CAPTURE_PASS`，请只在对应文档声明的证据层内解释。
@@ -138,6 +138,47 @@ uv run pytest -q tests/test_baseline_v3_four_arm.py tests/test_forward_live_capt
 ```
 
 CI 还会运行 Ruff、全量 pytest、BT repair tests、heuristic BT canaries、direct-vendor LLM import guards、repository hygiene guard 和 ksana orchestration guard。详见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
+
+## Public Stock-Pool Report Ops
+
+`main` includes the single-server public stock-pool report automation used by
+the public ledger frontend. The script writes public-safe Markdown/JSON
+artifacts only; it does not call LLM providers, read `.env`, expose private UI
+state, or generate trading instructions.
+
+Manual run on the server:
+
+```bash
+cd /opt/gotra
+/root/.local/bin/uv run python scripts/public_stock_pool_report.py --mode morning-global --publish-static
+/root/.local/bin/uv run python scripts/public_stock_pool_report.py --mode evening-hk --publish-static
+```
+
+Check timers and logs:
+
+```bash
+systemctl list-timers --all | grep gotra-stock-pool
+sudo systemctl status gotra-stock-pool-morning-report.service --no-pager
+sudo systemctl status gotra-stock-pool-evening-report.service --no-pager
+sudo journalctl -u gotra-stock-pool-morning-report.service -n 120 --no-pager
+sudo journalctl -u gotra-stock-pool-evening-report.service -n 120 --no-pager
+```
+
+Check the latest status and failed-symbol list:
+
+```bash
+jq '{ok, run_status, mode, as_of_date, trading_date, success_count, failed_count, artifact_write_status, artifact_write_failure_reason}' \
+  /opt/gotra/data/reports/status.json
+jq -r '.failed_symbols[]? | [.exchange, .symbol, .provider_ticker, .reason] | @tsv' \
+  /opt/gotra/data/reports/status.json
+curl -fsS http://47.251.249.147/reports/status.json \
+  | jq '{ok, run_status, mode, trading_date, success_count, failed_count, artifact_write_status, artifact_write_failure_reason}'
+```
+
+If `status.json` cannot be written, the exact `status.json write failed` reason
+is preserved in the service journal. Full ops notes, systemd templates, Nginx
+route snippet, smoke checks, and safety scans are in
+[`docs/PUBLIC_STOCK_POOL_REPORT_AUTOMATION_RUNBOOK.md`](docs/PUBLIC_STOCK_POOL_REPORT_AUTOMATION_RUNBOOK.md).
 
 ## Artifact Hygiene
 

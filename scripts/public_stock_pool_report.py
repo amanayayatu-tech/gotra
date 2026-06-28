@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import shutil
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
@@ -19,10 +21,14 @@ from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
-import pandas as pd
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from gotra.backtest.price_cache import fetch_yahoo_adjusted_close
-from gotra.public_api.app import research_universe_items
+import pandas as pd  # noqa: E402
+
+from gotra.backtest.price_cache import fetch_yahoo_adjusted_close  # noqa: E402
+from gotra.public_api.app import research_universe_items  # noqa: E402
 
 
 Mode = Literal["morning-global", "evening-hk"]
@@ -39,6 +45,7 @@ BOUNDARY_LINES = (
 DATA_SOURCE = "Yahoo Finance chart API via GOTRA price_cache helper"
 SCHEMA = "gotra.public_stock_pool_report.v1"
 REPORT_TIMEZONE = ZoneInfo("Asia/Shanghai")
+LOGGER = logging.getLogger("gotra.public_stock_pool_report")
 
 
 @dataclass(frozen=True)
@@ -68,6 +75,37 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    configure_logging()
+    try:
+        return run(args)
+    except Exception as exc:  # noqa: BLE001 - service failures must be preserved in journal/status.
+        LOGGER.exception(
+            "public stock-pool report failed mode=%s report_dir=%s static_dir=%s publish_static=%s",
+            args.mode,
+            args.report_dir,
+            args.static_dir,
+            args.publish_static,
+        )
+        write_failure_status(args=args, exc=exc, stage="run")
+        return 1
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stdout,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+
+def run(args: argparse.Namespace) -> int:
+    LOGGER.info(
+        "starting public stock-pool report mode=%s publish_static=%s report_dir=%s static_dir=%s",
+        args.mode,
+        args.publish_static,
+        args.report_dir,
+        args.static_dir,
+    )
     as_of_date = parse_date(args.as_of_date) if args.as_of_date else datetime.now(REPORT_TIMEZONE).date()
     exchange_dates = resolve_exchange_dates(
         mode=args.mode,
@@ -78,6 +116,15 @@ def main() -> int:
     items = research_universe_items()
     if len(items) != 138:
         raise RuntimeError(f"expected 138 public-universe items, got {len(items)}")
+    LOGGER.info(
+        "resolved report dates as_of_date=%s primary=%s hkex=%s nasdaq=%s nyse=%s universe=%s",
+        as_of_date.isoformat(),
+        exchange_dates.primary_trading_date.isoformat(),
+        exchange_dates.hkex_trading_date.isoformat(),
+        exchange_dates.nasdaq_trading_date.isoformat(),
+        exchange_dates.nyse_trading_date.isoformat(),
+        len(items),
+    )
 
     results = fetch_universe(items, exchange_dates, max_workers=max(1, args.max_workers))
     paths = write_outputs(
@@ -88,8 +135,27 @@ def main() -> int:
         items=items,
         results=results,
     )
+    log_status_summary(paths["status"])
     if args.publish_static:
-        publish_static(paths, args.static_dir)
+        try:
+            publish_static(paths, args.static_dir)
+        except Exception as exc:  # noqa: BLE001 - preserve publish failure in status.json and journal.
+            status = mark_artifact_write_failure(paths["status"], stage="publish_static", exc=exc)
+            write_status_json(Path(paths["status_path"]), status)
+            paths["status"] = status
+            try:
+                publish_status_static(Path(paths["status_path"]), args.static_dir)
+            except Exception as status_exc:  # noqa: BLE001 - journal retains the status copy failure.
+                LOGGER.exception(
+                    "status.json static publish failed path=%s static_dir=%s reason=%s",
+                    paths["status_path"],
+                    args.static_dir,
+                    status_exc,
+                )
+            log_status_summary(status)
+            print(json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True))
+            return 1
+        LOGGER.info("published static report artifacts static_dir=%s", args.static_dir)
 
     print(json.dumps(paths["status"], ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if paths["status"]["failed_count"] == 0 else 2
@@ -152,7 +218,14 @@ def fetch_universe(
         futures = [executor.submit(fetch_one, item, exchange_dates) for item in items]
         for future in as_completed(futures):
             results.append(future.result())
-    return sorted(results, key=lambda row: (str(row["exchange"]), str(row["symbol"])))
+    sorted_results = sorted(results, key=lambda row: (str(row["exchange"]), str(row["symbol"])))
+    failures = [row for row in sorted_results if not row.get("ok")]
+    if failures:
+        LOGGER.warning(
+            "stock-pool fetch completed with failed_symbols=%s",
+            ",".join(f"{row['exchange']}:{row['symbol']}:{row.get('reason', 'unknown')}" for row in failures),
+        )
+    return sorted_results
 
 
 def fetch_one(item: dict[str, str], exchange_dates: ExchangeDates) -> dict[str, Any]:
@@ -261,10 +334,15 @@ def write_outputs(
     markdown = render_markdown(status=status, results=results)
     write_text_atomic(report_path, markdown)
     write_text_atomic(latest_path, markdown)
-    write_text_atomic(status_path, json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    write_status_json(status_path, status)
     chmod_public(report_path)
     chmod_public(latest_path)
-    chmod_public(status_path)
+    LOGGER.info(
+        "wrote report artifacts report_path=%s latest_path=%s status_path=%s",
+        report_path.resolve(),
+        latest_path.resolve(),
+        status_path.resolve(),
+    )
     return {
         "report_path": str(report_path.resolve()),
         "latest_path": str(latest_path.resolve()),
@@ -287,9 +365,19 @@ def build_status(
     successes = [row for row in results if row.get("ok")]
     failures = [row for row in results if not row.get("ok")]
     exchanges = ("HKEX", "NASDAQ", "NYSE")
+    failed_symbols = [
+        {
+            "exchange": row["exchange"],
+            "symbol": row["symbol"],
+            "provider_ticker": row["provider_ticker"],
+            "reason": row.get("reason", "unknown"),
+        }
+        for row in failures
+    ]
     return {
         "schema": SCHEMA,
         "ok": not failures,
+        "run_status": "completed" if not failures else "partial",
         "mode": mode,
         "as_of_date": as_of_date.isoformat(),
         "trading_date": exchange_dates.primary_trading_date.isoformat(),
@@ -314,22 +402,116 @@ def build_status(
             }
             for exchange in exchanges
         },
-        "missing_symbols": [
-            {
-                "exchange": row["exchange"],
-                "symbol": row["symbol"],
-                "provider_ticker": row["provider_ticker"],
-                "reason": row.get("reason", "unknown"),
-            }
-            for row in failures
-        ],
+        "missing_symbols": failed_symbols,
+        "failed_symbols": failed_symbols,
         "source": DATA_SOURCE,
         "boundary": list(BOUNDARY_LINES),
         "generated_at_utc": datetime.now(UTC).replace(microsecond=0).isoformat(),
         "report_file": report_path.name,
         "latest_file": latest_path.name,
         "status_file": status_path.name,
+        "artifact_write_status": "ok",
+        "artifact_write_failure_reason": None,
+        "failure_stage": None,
     }
+
+
+def build_failure_status(*, args: argparse.Namespace, exc: Exception, stage: str) -> dict[str, Any]:
+    as_of = failure_as_of_date(args.as_of_date)
+    status_path = args.report_dir / "status.json"
+    reason = failure_reason(stage=stage, exc=exc)
+    return {
+        "schema": SCHEMA,
+        "ok": False,
+        "run_status": "failed",
+        "mode": args.mode,
+        "as_of_date": as_of.isoformat(),
+        "trading_date": None,
+        "exchange_trading_dates": {},
+        "reason": "report generation failed before a complete public-safe report was written",
+        "session_status": "failed",
+        "universe_count": 0,
+        "success_count": 0,
+        "failed_count": 0,
+        "by_exchange": {},
+        "missing_symbols": [],
+        "failed_symbols": [],
+        "source": DATA_SOURCE,
+        "boundary": list(BOUNDARY_LINES),
+        "generated_at_utc": datetime.now(UTC).replace(microsecond=0).isoformat(),
+        "report_file": None,
+        "latest_file": None,
+        "status_file": status_path.name,
+        "artifact_write_status": "failed",
+        "artifact_write_failure_reason": reason,
+        "failure_stage": stage,
+    }
+
+
+def failure_reason(*, stage: str, exc: Exception) -> str:
+    return f"{stage}: {type(exc).__name__}: {str(exc)[:240]}"
+
+
+def failure_as_of_date(value: str | None) -> date:
+    if not value:
+        return datetime.now(REPORT_TIMEZONE).date()
+    try:
+        return parse_date(value)
+    except Exception:  # noqa: BLE001 - failure status must survive malformed input.
+        return datetime.now(REPORT_TIMEZONE).date()
+
+
+def mark_artifact_write_failure(status: dict[str, Any], *, stage: str, exc: Exception) -> dict[str, Any]:
+    failed = dict(status)
+    failed["ok"] = False
+    failed["run_status"] = "failed"
+    failed["artifact_write_status"] = "failed"
+    failed["artifact_write_failure_reason"] = failure_reason(stage=stage, exc=exc)
+    failed["failure_stage"] = stage
+    failed["failure_time_utc"] = datetime.now(UTC).replace(microsecond=0).isoformat()
+    return failed
+
+
+def write_failure_status(*, args: argparse.Namespace, exc: Exception, stage: str) -> None:
+    status = build_failure_status(args=args, exc=exc, stage=stage)
+    status_path = args.report_dir / "status.json"
+    try:
+        args.report_dir.mkdir(parents=True, exist_ok=True)
+        write_status_json(status_path, status)
+        LOGGER.error(
+            "wrote failure status.json path=%s reason=%s",
+            status_path.resolve(),
+            status["artifact_write_failure_reason"],
+        )
+    except Exception as status_exc:  # noqa: BLE001 - this exact failure must remain visible in journal.
+        LOGGER.exception("status.json write failed path=%s reason=%s", status_path, status_exc)
+        return
+
+    if args.publish_static:
+        try:
+            publish_status_static(status_path, args.static_dir)
+        except Exception as status_exc:  # noqa: BLE001 - journal retains the static status copy failure.
+            LOGGER.exception(
+                "failure status.json static publish failed path=%s static_dir=%s reason=%s",
+                status_path,
+                args.static_dir,
+                status_exc,
+            )
+
+
+def log_status_summary(status: dict[str, Any]) -> None:
+    LOGGER.info(
+        "report status ok=%s run_status=%s success_count=%s failed_count=%s trading_date=%s status_file=%s",
+        status.get("ok"),
+        status.get("run_status"),
+        status.get("success_count"),
+        status.get("failed_count"),
+        status.get("trading_date"),
+        status.get("status_file"),
+    )
+    failed_symbols = status.get("failed_symbols") or []
+    if failed_symbols:
+        LOGGER.warning("failed symbols: %s", json.dumps(failed_symbols, ensure_ascii=False, sort_keys=True))
 
 
 def render_markdown(*, status: dict[str, Any], results: list[dict[str, Any]]) -> str:
@@ -445,6 +627,25 @@ def publish_static(paths: dict[str, Any], static_dir: Path) -> None:
         chmod_public(target)
         apply_owner(target, owner)
     chmod_public(static_dir)
+
+
+def publish_status_static(status_path: Path, static_dir: Path) -> None:
+    static_dir.mkdir(parents=True, exist_ok=True)
+    owner = static_owner(static_dir)
+    apply_owner(static_dir, owner)
+    target = static_dir / status_path.name
+    shutil.copy2(status_path, target)
+    chmod_public(target)
+    apply_owner(target, owner)
+
+
+def write_status_json(path: Path, status: dict[str, Any]) -> None:
+    try:
+        write_text_atomic(path, json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        chmod_public(path)
+    except Exception as exc:  # noqa: BLE001 - caller logs or writes a fallback failure status.
+        LOGGER.exception("status.json write failed path=%s reason=%s", path, exc)
+        raise
 
 
 def write_text_atomic(path: Path, content: str) -> None:
