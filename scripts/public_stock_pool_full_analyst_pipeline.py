@@ -478,6 +478,8 @@ def normalize_failure_reason(exc: Exception) -> str:
         return "missing_required_fields"
     if text.startswith("forbidden_raw_io_keys"):
         return "forbidden_raw_io_keys_detected"
+    if text.startswith("forbidden_public_content_detected"):
+        return "forbidden_public_content_detected"
     return f"{type(exc).__name__}: {text[:180]}"
 
 
