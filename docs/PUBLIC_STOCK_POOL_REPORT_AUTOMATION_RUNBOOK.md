@@ -27,10 +27,16 @@ are not `/etc` snapshots and do not include certificates, private key material,
 credential values, environment files, or local machine logs.
 
 - `ops/systemd/gotra-public-api.service`
-- `ops/systemd/gotra-stock-pool-morning-report.service`
-- `ops/systemd/gotra-stock-pool-morning-report.timer`
-- `ops/systemd/gotra-stock-pool-evening-report.service`
-- `ops/systemd/gotra-stock-pool-evening-report.timer`
+- `ops/systemd/gotra-stock-pool-hk-morning-report.service`
+- `ops/systemd/gotra-stock-pool-hk-morning-report.timer`
+- `ops/systemd/gotra-stock-pool-hk-evening-report.service`
+- `ops/systemd/gotra-stock-pool-hk-evening-report.timer`
+- `ops/systemd/gotra-stock-pool-us-morning-report.service`
+- `ops/systemd/gotra-stock-pool-us-morning-report.timer`
+- `ops/systemd/gotra-stock-pool-us-evening-report.service`
+- `ops/systemd/gotra-stock-pool-us-evening-report.timer`
+- `ops/systemd/gotra-stock-pool-global-summary-report.service`
+- `ops/systemd/gotra-stock-pool-global-summary-report.timer`
 
 Runtime invariants:
 
@@ -45,12 +51,12 @@ Runtime invariants:
 
 ## Commands
 
-Generate the full-market morning report:
+Generate the HK morning report:
 
 ```bash
 cd /opt/gotra
 /root/.local/bin/uv run python scripts/public_stock_pool_report.py \
-  --mode morning-global \
+  --mode morning-hk \
   --publish-static \
   --allowed-missing-symbol HKEX:0501
 ```
@@ -65,6 +71,34 @@ cd /opt/gotra
   --allowed-missing-symbol HKEX:0501
 ```
 
+Generate the US morning report:
+
+```bash
+cd /opt/gotra
+/root/.local/bin/uv run python scripts/public_stock_pool_report.py \
+  --mode morning-us \
+  --publish-static
+```
+
+Generate the US evening report:
+
+```bash
+cd /opt/gotra
+/root/.local/bin/uv run python scripts/public_stock_pool_report.py \
+  --mode evening-us \
+  --publish-static
+```
+
+Generate the global summary report:
+
+```bash
+cd /opt/gotra
+/root/.local/bin/uv run python scripts/public_stock_pool_report.py \
+  --mode morning-global \
+  --publish-static \
+  --allowed-missing-symbol HKEX:0501
+```
+
 Useful dry-run flags:
 
 ```bash
@@ -74,6 +108,7 @@ Useful dry-run flags:
 --report-dir /tmp/gotra-report-smoke
 --static-dir /tmp/gotra-report-static
 --allowed-missing-symbol HKEX:0501
+--fetch-retries 2
 ```
 
 `--allowed-missing-symbol` is a provider coverage-gap allowlist. It accepts
@@ -82,27 +117,40 @@ Useful dry-run flags:
 mark the report as full success; it only lets systemd treat a successfully
 written data-gap artifact as a successful oneshot process.
 
+`--fetch-retries` retries each symbol fetch before recording a final
+`failed_symbols` row. The default is `2` to reduce transient Yahoo HTTP
+failures while still preserving real provider coverage gaps in the report.
+
 ## Output Files
 
-The script creates:
+The script creates mode-specific artifacts:
 
-- `data/reports/public_stock_pool_eod_<trading_date>.md`
+- `data/reports/public_stock_pool_<mode_slug>_<trading_date>.md`
+- `data/reports/latest_<mode_slug>.md`
+- `data/reports/status_<mode_slug>.json`
+
+It also writes compatibility aliases for the most recent run:
+
 - `data/reports/latest.md`
 - `data/reports/status.json`
 
 When `--publish-static` is set, it also copies the same public-safe files to:
 
+- `/var/www/gotra-public-ledger/reports/public_stock_pool_<mode_slug>_<trading_date>.md`
+- `/var/www/gotra-public-ledger/reports/latest_<mode_slug>.md`
+- `/var/www/gotra-public-ledger/reports/status_<mode_slug>.json`
 - `/var/www/gotra-public-ledger/reports/latest.md`
 - `/var/www/gotra-public-ledger/reports/status.json`
-- `/var/www/gotra-public-ledger/reports/public_stock_pool_eod_<trading_date>.md`
 
 `status.json` includes `schema`, `mode`, `as_of_date`, `trading_date`,
-per-exchange trading dates, `universe_count`, `success_count`, `failed_count`,
-`missing_symbols`, `failed_symbols`, `run_status`, `artifact_write_status`,
+`mode_label`, `mode_slug`, `target_exchanges`, per-exchange trading dates,
+`universe_count`, `success_count`, `failed_count`, `missing_symbols`,
+`failed_symbols`, `run_status`, `artifact_write_status`,
 `artifact_write_failure_reason`, `allowed_missing_symbols`,
-`allowed_missing_count`, `unexpected_failed_count`, `exit_status`, `source`,
-public-safety boundary text, and generated time. `missing_symbols` is retained
-for compatibility; use `failed_symbols` for new checks.
+`allowed_missing_count`, `unexpected_failed_count`, `exit_status`,
+`fetch_retries`, `source`, mode-specific file names, compatibility alias file
+names, public-safety boundary text, and generated time. `missing_symbols` is retained for
+compatibility; use `failed_symbols` for new checks.
 
 Known provider coverage gaps should remain visible in `failed_symbols`. When
 all failures are allowlisted coverage gaps and `artifact_write_status` is `ok`,
@@ -115,10 +163,11 @@ systemd captures script logs in the service journal. Use these commands first
 when a timer looks stale or a report is missing:
 
 ```bash
-sudo journalctl -u gotra-stock-pool-morning-report.service -n 120 --no-pager
-sudo journalctl -u gotra-stock-pool-evening-report.service -n 120 --no-pager
-sudo journalctl -u gotra-stock-pool-morning-report.service --since "24 hours ago" --no-pager
-sudo journalctl -u gotra-stock-pool-evening-report.service --since "24 hours ago" --no-pager
+journalctl -u gotra-stock-pool-hk-morning-report.service -n 120 --no-pager
+journalctl -u gotra-stock-pool-hk-evening-report.service -n 120 --no-pager
+journalctl -u gotra-stock-pool-us-morning-report.service -n 120 --no-pager
+journalctl -u gotra-stock-pool-us-evening-report.service -n 120 --no-pager
+journalctl -u gotra-stock-pool-global-summary-report.service -n 120 --no-pager
 ```
 
 The journal should include start parameters, resolved trading dates, coverage,
@@ -131,6 +180,9 @@ Check the current source status:
 ```bash
 jq '{ok, run_status, mode, as_of_date, trading_date, success_count, failed_count, allowed_missing_count, unexpected_failed_count, exit_status, artifact_write_status, artifact_write_failure_reason}' \
   /opt/gotra/data/reports/status.json
+
+jq '{ok, run_status, mode, target_exchanges, as_of_date, trading_date, success_count, failed_count, allowed_missing_count, unexpected_failed_count, exit_status}' \
+  /opt/gotra/data/reports/status_evening_us.json
 ```
 
 List failed symbols:
@@ -164,22 +216,38 @@ sudo cp ops/systemd/gotra-stock-pool-*.timer /etc/systemd/system/
 sudo cp ops/systemd/gotra-public-api.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now gotra-public-api.service
-sudo systemctl enable --now gotra-stock-pool-morning-report.timer
-sudo systemctl enable --now gotra-stock-pool-evening-report.timer
+sudo systemctl disable --now gotra-stock-pool-morning-report.timer gotra-stock-pool-evening-report.timer || true
+sudo systemctl enable --now gotra-stock-pool-hk-morning-report.timer
+sudo systemctl enable --now gotra-stock-pool-hk-evening-report.timer
+sudo systemctl enable --now gotra-stock-pool-us-morning-report.timer
+sudo systemctl enable --now gotra-stock-pool-us-evening-report.timer
+sudo systemctl enable --now gotra-stock-pool-global-summary-report.timer
 ```
 
 Current schedules:
 
-- `gotra-stock-pool-morning-report.timer`: `Tue..Sat *-*-* 10:30:00 Asia/Shanghai`
-- `gotra-stock-pool-evening-report.timer`: `Mon..Fri *-*-* 18:30:00 Asia/Shanghai`
+- `gotra-stock-pool-hk-morning-report.timer`: `Mon..Fri *-*-* 09:00:00 Asia/Shanghai`
+- `gotra-stock-pool-hk-evening-report.timer`: `Mon..Fri *-*-* 18:30:00 Asia/Shanghai`
+- `gotra-stock-pool-us-morning-report.timer`: `Mon..Fri *-*-* 21:00:00 Asia/Shanghai`
+- `gotra-stock-pool-us-evening-report.timer`: `Tue..Sat *-*-* 06:30:00 Asia/Shanghai`
+- `gotra-stock-pool-global-summary-report.timer`: `Tue..Sat *-*-* 10:30:00 Asia/Shanghai`
 
 Validate calendar syntax and next runs:
 
 ```bash
-systemd-analyze calendar 'Tue..Sat *-*-* 10:30:00 Asia/Shanghai'
+systemd-analyze calendar 'Mon..Fri *-*-* 09:00:00 Asia/Shanghai'
 systemd-analyze calendar 'Mon..Fri *-*-* 18:30:00 Asia/Shanghai'
+systemd-analyze calendar 'Mon..Fri *-*-* 21:00:00 Asia/Shanghai'
+systemd-analyze calendar 'Tue..Sat *-*-* 06:30:00 Asia/Shanghai'
+systemd-analyze calendar 'Tue..Sat *-*-* 10:30:00 Asia/Shanghai'
 systemctl list-timers --all "gotra-stock-pool-*" --no-pager
-systemctl status gotra-stock-pool-morning-report.timer gotra-stock-pool-evening-report.timer --no-pager
+systemctl status \
+  gotra-stock-pool-hk-morning-report.timer \
+  gotra-stock-pool-hk-evening-report.timer \
+  gotra-stock-pool-us-morning-report.timer \
+  gotra-stock-pool-us-evening-report.timer \
+  gotra-stock-pool-global-summary-report.timer \
+  --no-pager
 ```
 
 ## Runtime Status Commands
@@ -196,8 +264,11 @@ Check report timers and journals:
 
 ```bash
 systemctl list-timers --all "gotra-stock-pool-*" --no-pager
-journalctl -u gotra-stock-pool-morning-report.service -n 120 --no-pager
-journalctl -u gotra-stock-pool-evening-report.service -n 120 --no-pager
+journalctl -u gotra-stock-pool-hk-morning-report.service -n 120 --no-pager
+journalctl -u gotra-stock-pool-hk-evening-report.service -n 120 --no-pager
+journalctl -u gotra-stock-pool-us-morning-report.service -n 120 --no-pager
+journalctl -u gotra-stock-pool-us-evening-report.service -n 120 --no-pager
+journalctl -u gotra-stock-pool-global-summary-report.service -n 120 --no-pager
 ```
 
 Check local and public status JSON:
@@ -215,8 +286,8 @@ curl -fsS http://47.251.249.147/reports/status.json \
 Run the service manually:
 
 ```bash
-sudo systemctl start gotra-stock-pool-morning-report.service
-sudo systemctl status gotra-stock-pool-morning-report.service --no-pager
+sudo systemctl start gotra-stock-pool-global-summary-report.service
+sudo systemctl status gotra-stock-pool-global-summary-report.service --no-pager
 ```
 
 Check local artifacts:
@@ -225,6 +296,11 @@ Check local artifacts:
 test -s /opt/gotra/data/reports/latest.md
 python3 -m json.tool /opt/gotra/data/reports/status.json >/dev/null
 jq '.failed_symbols' /opt/gotra/data/reports/status.json
+python3 -m json.tool /opt/gotra/data/reports/status_morning_hk.json >/dev/null
+python3 -m json.tool /opt/gotra/data/reports/status_evening_hk.json >/dev/null
+python3 -m json.tool /opt/gotra/data/reports/status_morning_us.json >/dev/null
+python3 -m json.tool /opt/gotra/data/reports/status_evening_us.json >/dev/null
+python3 -m json.tool /opt/gotra/data/reports/status_morning_global.json >/dev/null
 ```
 
 Check static frontend artifacts:

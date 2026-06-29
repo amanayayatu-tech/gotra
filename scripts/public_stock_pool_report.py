@@ -14,6 +14,7 @@ import logging
 import os
 import shutil
 import sys
+import time as time_module
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
@@ -31,7 +32,7 @@ from gotra.backtest.price_cache import fetch_yahoo_adjusted_close  # noqa: E402
 from gotra.public_api.app import research_universe_items  # noqa: E402
 
 
-Mode = Literal["morning-global", "evening-hk"]
+Mode = Literal["morning-hk", "evening-hk", "morning-us", "evening-us", "morning-global"]
 Exchange = Literal["HKEX", "NASDAQ", "NYSE"]
 
 REPORT_DIR = Path("data/reports")
@@ -59,7 +60,11 @@ class ExchangeDates:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate a public-safe GOTRA stock-pool report.")
-    parser.add_argument("--mode", choices=("morning-global", "evening-hk"), required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("morning-hk", "evening-hk", "morning-us", "evening-us", "morning-global"),
+        required=True,
+    )
     parser.add_argument("--as-of-date", help="Local Asia/Shanghai as-of date, YYYY-MM-DD.")
     parser.add_argument(
         "--trading-date",
@@ -70,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--static-dir", type=Path, default=STATIC_REPORT_DIR)
     parser.add_argument("--publish-static", action="store_true")
     parser.add_argument("--max-workers", type=int, default=8)
+    parser.add_argument("--fetch-retries", type=int, default=2, help="Per-symbol Yahoo fetch retries before recording failure.")
     parser.add_argument(
         "--allowed-missing-symbol",
         action="append",
@@ -123,20 +129,28 @@ def run(args: argparse.Namespace) -> int:
         trading_date=parse_date(args.trading_date) if args.trading_date else None,
         us_trading_date=parse_date(args.us_trading_date) if args.us_trading_date else None,
     )
-    items = research_universe_items()
-    if len(items) != 138:
-        raise RuntimeError(f"expected 138 public-universe items, got {len(items)}")
+    universe_items = research_universe_items()
+    if len(universe_items) != 138:
+        raise RuntimeError(f"expected 138 public-universe items, got {len(universe_items)}")
+    target_exchanges = exchanges_for_mode(args.mode)
+    items = target_universe_items(universe_items, target_exchanges)
+    if not items:
+        raise RuntimeError(f"no public-universe items matched mode={args.mode} exchanges={target_exchanges}")
     LOGGER.info(
-        "resolved report dates as_of_date=%s primary=%s hkex=%s nasdaq=%s nyse=%s universe=%s",
+        "resolved report dates as_of_date=%s mode=%s primary=%s hkex=%s nasdaq=%s nyse=%s universe=%s target_universe=%s target_exchanges=%s",
         as_of_date.isoformat(),
+        args.mode,
         exchange_dates.primary_trading_date.isoformat(),
         exchange_dates.hkex_trading_date.isoformat(),
         exchange_dates.nasdaq_trading_date.isoformat(),
         exchange_dates.nyse_trading_date.isoformat(),
+        len(universe_items),
         len(items),
+        ",".join(target_exchanges),
     )
 
-    results = fetch_universe(items, exchange_dates, max_workers=max(1, args.max_workers))
+    fetch_retries = max(0, args.fetch_retries)
+    results = fetch_universe(items, exchange_dates, max_workers=max(1, args.max_workers), fetch_retries=fetch_retries)
     paths = write_outputs(
         report_dir=args.report_dir,
         mode=args.mode,
@@ -145,6 +159,7 @@ def run(args: argparse.Namespace) -> int:
         items=items,
         results=results,
         allowed_missing_symbols=allowed_missing_symbols,
+        fetch_retries=fetch_retries,
     )
     log_status_summary(paths["status"])
     if args.publish_static:
@@ -153,9 +168,11 @@ def run(args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001 - preserve publish failure in status.json and journal.
             status = mark_artifact_write_failure(paths["status"], stage="publish_static", exc=exc)
             write_status_json(Path(paths["status_path"]), status)
+            write_status_json(Path(paths["compat_status_path"]), status)
             paths["status"] = status
             try:
                 publish_status_static(Path(paths["status_path"]), args.static_dir)
+                publish_status_static(Path(paths["compat_status_path"]), args.static_dir)
             except Exception as status_exc:  # noqa: BLE001 - journal retains the status copy failure.
                 LOGGER.exception(
                     "status.json static publish failed path=%s static_dir=%s reason=%s",
@@ -189,8 +206,39 @@ def resolve_exchange_dates(
             reason="after US market close; full-market latest completed session",
         )
 
+    if mode == "morning-hk":
+        hkex_date = trading_date or previous_weekday(as_of_date - timedelta(days=1))
+        us_date = us_trading_date or latest_completed_us_session(as_of_date)
+        return ExchangeDates(
+            primary_trading_date=hkex_date,
+            hkex_trading_date=hkex_date,
+            nasdaq_trading_date=us_date,
+            nyse_trading_date=us_date,
+            reason="before HK market open; HKEX uses previous completed HK session",
+        )
+
     hkex_date = trading_date or latest_completed_hk_session(as_of_date)
     us_date = us_trading_date or latest_completed_us_session(as_of_date)
+    if mode == "morning-us":
+        us_date = us_trading_date or trading_date or latest_completed_us_session(as_of_date)
+        return ExchangeDates(
+            primary_trading_date=us_date,
+            hkex_trading_date=hkex_date,
+            nasdaq_trading_date=us_date,
+            nyse_trading_date=us_date,
+            reason="before US market open; NASDAQ/NYSE use previous completed US session",
+        )
+
+    if mode == "evening-us":
+        us_date = us_trading_date or trading_date or latest_completed_us_session(as_of_date)
+        return ExchangeDates(
+            primary_trading_date=us_date,
+            hkex_trading_date=hkex_date,
+            nasdaq_trading_date=us_date,
+            nyse_trading_date=us_date,
+            reason="after US market close; NASDAQ/NYSE use latest completed US session",
+        )
+
     return ExchangeDates(
         primary_trading_date=hkex_date,
         hkex_trading_date=hkex_date,
@@ -201,6 +249,19 @@ def resolve_exchange_dates(
             "US exchanges use previous completed US session"
         ),
     )
+
+
+def exchanges_for_mode(mode: Mode) -> tuple[Exchange, ...]:
+    if mode in ("morning-hk", "evening-hk"):
+        return ("HKEX",)
+    if mode in ("morning-us", "evening-us"):
+        return ("NASDAQ", "NYSE")
+    return ("HKEX", "NASDAQ", "NYSE")
+
+
+def target_universe_items(items: list[dict[str, str]], exchanges: tuple[Exchange, ...]) -> list[dict[str, str]]:
+    exchange_set = set(exchanges)
+    return [item for item in items if item.get("exchange") in exchange_set]
 
 
 def latest_completed_us_session(as_of_date: date) -> date:
@@ -223,10 +284,11 @@ def fetch_universe(
     exchange_dates: ExchangeDates,
     *,
     max_workers: int,
+    fetch_retries: int,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(fetch_one, item, exchange_dates) for item in items]
+        futures = [executor.submit(fetch_one, item, exchange_dates, fetch_retries=fetch_retries) for item in items]
         for future in as_completed(futures):
             results.append(future.result())
     sorted_results = sorted(results, key=lambda row: (str(row["exchange"]), str(row["symbol"])))
@@ -239,7 +301,20 @@ def fetch_universe(
     return sorted_results
 
 
-def fetch_one(item: dict[str, str], exchange_dates: ExchangeDates) -> dict[str, Any]:
+def fetch_one(item: dict[str, str], exchange_dates: ExchangeDates, *, fetch_retries: int = 0) -> dict[str, Any]:
+    attempts = max(1, fetch_retries + 1)
+    last_row: dict[str, Any] | None = None
+    for attempt in range(1, attempts + 1):
+        row = fetch_one_once(item, exchange_dates)
+        row["fetch_attempts"] = attempt
+        if row.get("ok") or attempt >= attempts:
+            return row
+        last_row = row
+        time_module.sleep(min(0.25 * attempt, 1.0))
+    return last_row or fetch_one_once(item, exchange_dates)
+
+
+def fetch_one_once(item: dict[str, str], exchange_dates: ExchangeDates) -> dict[str, Any]:
     symbol = str(item["symbol"]).strip().upper()
     exchange = str(item["exchange"])
     ticker = yahoo_ticker(symbol, exchange)
@@ -328,11 +403,15 @@ def write_outputs(
     items: list[dict[str, str]],
     results: list[dict[str, Any]],
     allowed_missing_symbols: tuple[str, ...] = (),
+    fetch_retries: int = 0,
 ) -> dict[str, Any]:
     report_dir.mkdir(parents=True, exist_ok=True)
-    report_path = report_dir / f"public_stock_pool_eod_{exchange_dates.primary_trading_date}.md"
-    latest_path = report_dir / "latest.md"
-    status_path = report_dir / "status.json"
+    slug = mode_slug(mode)
+    report_path = report_dir / f"public_stock_pool_{slug}_{exchange_dates.primary_trading_date}.md"
+    latest_path = report_dir / f"latest_{slug}.md"
+    status_path = report_dir / f"status_{slug}.json"
+    compat_latest_path = report_dir / "latest.md"
+    compat_status_path = report_dir / "status.json"
     status = build_status(
         mode=mode,
         as_of_date=as_of_date,
@@ -342,24 +421,34 @@ def write_outputs(
         report_path=report_path,
         latest_path=latest_path,
         status_path=status_path,
+        compat_latest_path=compat_latest_path,
+        compat_status_path=compat_status_path,
         allowed_missing_symbols=allowed_missing_symbols,
+        fetch_retries=fetch_retries,
     )
     markdown = render_markdown(status=status, results=results)
     write_text_atomic(report_path, markdown)
     write_text_atomic(latest_path, markdown)
+    write_text_atomic(compat_latest_path, markdown)
     write_status_json(status_path, status)
+    write_status_json(compat_status_path, status)
     chmod_public(report_path)
     chmod_public(latest_path)
+    chmod_public(compat_latest_path)
     LOGGER.info(
-        "wrote report artifacts report_path=%s latest_path=%s status_path=%s",
+        "wrote report artifacts report_path=%s latest_path=%s status_path=%s compat_latest_path=%s compat_status_path=%s",
         report_path.resolve(),
         latest_path.resolve(),
         status_path.resolve(),
+        compat_latest_path.resolve(),
+        compat_status_path.resolve(),
     )
     return {
         "report_path": str(report_path.resolve()),
         "latest_path": str(latest_path.resolve()),
         "status_path": str(status_path.resolve()),
+        "compat_latest_path": str(compat_latest_path.resolve()),
+        "compat_status_path": str(compat_status_path.resolve()),
         "status": status,
     }
 
@@ -374,11 +463,14 @@ def build_status(
     report_path: Path,
     latest_path: Path,
     status_path: Path,
+    compat_latest_path: Path | None = None,
+    compat_status_path: Path | None = None,
     allowed_missing_symbols: tuple[str, ...] = (),
+    fetch_retries: int = 0,
 ) -> dict[str, Any]:
     successes = [row for row in results if row.get("ok")]
     failures = [row for row in results if not row.get("ok")]
-    exchanges = ("HKEX", "NASDAQ", "NYSE")
+    exchanges = exchanges_for_mode(mode)
     allowed_missing = tuple(sorted(set(normalize_allowed_missing_symbols(allowed_missing_symbols))))
     failed_symbols = [
         {
@@ -401,6 +493,9 @@ def build_status(
         "ok": not failures,
         "run_status": run_status,
         "mode": mode,
+        "mode_label": mode_label(mode),
+        "mode_slug": mode_slug(mode),
+        "target_exchanges": list(exchanges),
         "as_of_date": as_of_date.isoformat(),
         "trading_date": exchange_dates.primary_trading_date.isoformat(),
         "exchange_trading_dates": {
@@ -430,11 +525,14 @@ def build_status(
         "missing_symbols": failed_symbols,
         "failed_symbols": failed_symbols,
         "source": DATA_SOURCE,
+        "fetch_retries": fetch_retries,
         "boundary": list(BOUNDARY_LINES),
         "generated_at_utc": datetime.now(UTC).replace(microsecond=0).isoformat(),
         "report_file": report_path.name,
         "latest_file": latest_path.name,
         "status_file": status_path.name,
+        "compat_latest_file": compat_latest_path.name if compat_latest_path else None,
+        "compat_status_file": compat_status_path.name if compat_status_path else None,
         "artifact_write_status": "ok",
         "artifact_write_failure_reason": None,
         "failure_stage": None,
@@ -445,13 +543,16 @@ def build_status(
 
 def build_failure_status(*, args: argparse.Namespace, exc: Exception, stage: str) -> dict[str, Any]:
     as_of = failure_as_of_date(args.as_of_date)
-    status_path = args.report_dir / "status.json"
+    status_path = mode_status_path(args.report_dir, args.mode)
     reason = failure_reason(stage=stage, exc=exc)
     return {
         "schema": SCHEMA,
         "ok": False,
         "run_status": "failed",
         "mode": args.mode,
+        "mode_label": mode_label(args.mode),
+        "mode_slug": mode_slug(args.mode),
+        "target_exchanges": list(exchanges_for_mode(args.mode)),
         "as_of_date": as_of.isoformat(),
         "trading_date": None,
         "exchange_trading_dates": {},
@@ -467,11 +568,14 @@ def build_failure_status(*, args: argparse.Namespace, exc: Exception, stage: str
         "missing_symbols": [],
         "failed_symbols": [],
         "source": DATA_SOURCE,
+        "fetch_retries": int(getattr(args, "fetch_retries", 0) or 0),
         "boundary": list(BOUNDARY_LINES),
         "generated_at_utc": datetime.now(UTC).replace(microsecond=0).isoformat(),
         "report_file": None,
         "latest_file": None,
         "status_file": status_path.name,
+        "compat_latest_file": None,
+        "compat_status_file": "status.json",
         "artifact_write_status": "failed",
         "artifact_write_failure_reason": reason,
         "failure_stage": stage,
@@ -549,10 +653,12 @@ def exit_code_for_status(status: dict[str, Any]) -> int:
 
 def write_failure_status(*, args: argparse.Namespace, exc: Exception, stage: str) -> dict[str, Any] | None:
     status = build_failure_status(args=args, exc=exc, stage=stage)
-    status_path = args.report_dir / "status.json"
+    status_path = mode_status_path(args.report_dir, args.mode)
+    compat_status_path = args.report_dir / "status.json"
     try:
         args.report_dir.mkdir(parents=True, exist_ok=True)
         write_status_json(status_path, status)
+        write_status_json(compat_status_path, status)
         LOGGER.error(
             "wrote failure status.json path=%s reason=%s",
             status_path.resolve(),
@@ -565,6 +671,7 @@ def write_failure_status(*, args: argparse.Namespace, exc: Exception, stage: str
     if args.publish_static:
         try:
             publish_status_static(status_path, args.static_dir)
+            publish_status_static(compat_status_path, args.static_dir)
         except Exception as status_exc:  # noqa: BLE001 - journal retains the static status copy failure.
             LOGGER.exception(
                 "failure status.json static publish failed path=%s static_dir=%s reason=%s",
@@ -696,6 +803,8 @@ def publish_static(paths: dict[str, Any], static_dir: Path) -> None:
         Path(paths["report_path"]),
         Path(paths["latest_path"]),
         Path(paths["status_path"]),
+        Path(paths["compat_latest_path"]),
+        Path(paths["compat_status_path"]),
     ]
     for source in sources:
         target = static_dir / source.name
@@ -749,6 +858,25 @@ def apply_owner(path: Path, owner: tuple[int, int] | None) -> None:
         os.chown(path, owner[0], owner[1])
     except PermissionError:
         return
+
+
+def mode_slug(mode: str) -> str:
+    return mode.replace("-", "_")
+
+
+def mode_status_path(report_dir: Path, mode: str) -> Path:
+    return report_dir / f"status_{mode_slug(mode)}.json"
+
+
+def mode_label(mode: str) -> str:
+    labels = {
+        "morning-hk": "HK morning report",
+        "evening-hk": "HK evening report",
+        "morning-us": "US morning report",
+        "evening-us": "US evening report",
+        "morning-global": "Global summary report",
+    }
+    return labels.get(mode, mode)
 
 
 def parse_date(value: str) -> date:

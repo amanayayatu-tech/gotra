@@ -1,0 +1,10 @@
+[Unit]
+Description=Run GOTRA public stock-pool US morning report before US market open
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 21:00:00 Asia/Shanghai
+Persistent=true
+Unit=gotra-stock-pool-us-morning-report.service
+
+[Install]
+WantedBy=timers.target

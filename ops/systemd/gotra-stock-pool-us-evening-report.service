@@ -1,0 +1,10 @@
+[Unit]
+Description=GOTRA public stock-pool US evening report
+After=network-online.target gotra-public-api.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/gotra
+ExecStart=/root/.local/bin/uv run python scripts/public_stock_pool_report.py --mode evening-us --publish-static
+Nice=5
