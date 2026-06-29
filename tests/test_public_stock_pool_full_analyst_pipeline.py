@@ -5,8 +5,10 @@ from pathlib import Path
 from scripts.public_stock_pool_full_research import RunnerResult
 from scripts.public_stock_pool_full_analyst_pipeline import (
     BOUNDARY_LINES,
+    LOOP_SMOKE_MODE,
     MODE,
     FullAnalystConfig,
+    GotraInternalAlayaSyncClient,
     MockAlayaSyncClient,
     run,
 )
@@ -32,6 +34,9 @@ def config(tmp_path: Path, *, symbols: tuple[str, ...] = ("HKEX:0700", "HKEX:998
         codex_bin="codex",
         model="fixture",
         reasoning_effort="low",
+        heartbeat_interval_seconds=300,
+        loop_duration_seconds=0,
+        sample_cadence_seconds=1800,
     )
 
 
@@ -90,6 +95,42 @@ class RecordingAlaya(MockAlayaSyncClient):
         return super().sync(payload)
 
 
+class RealSuccessAlaya(RecordingAlaya):
+    def sync(self, payload: dict[str, object]) -> dict[str, object]:
+        self.calls.append(payload)
+        return {
+            "status": "synced",
+            "mode": "real",
+            "event_id": "real-event-1",
+            "event_hash": "real-hash-1",
+            "readback_status": "verified",
+        }
+
+
+class FailingAlaya(RecordingAlaya):
+    def sync(self, payload: dict[str, object]) -> dict[str, object]:
+        self.calls.append(payload)
+        return {
+            "status": "failed",
+            "mode": "real",
+            "reason": "gotra_internal_state_write_failed",
+            "readback_status": "skipped",
+        }
+
+
+class ReadbackMismatchAlaya(RecordingAlaya):
+    def sync(self, payload: dict[str, object]) -> dict[str, object]:
+        self.calls.append(payload)
+        return {
+            "status": "failed",
+            "mode": "real",
+            "reason": "alaya_readback_mismatch",
+            "event_id": "real-event-1",
+            "event_hash": "expected-hash",
+            "readback_status": "mismatch",
+        }
+
+
 def valid_payload(symbol: str = "0700") -> dict[str, object]:
     return {
         "schema": "gotra.full_analyst.symbol.v1",
@@ -134,6 +175,62 @@ def test_fixture_run_writes_independent_public_and_static_artifacts(tmp_path: Pa
     assert status["alaya_synced_count"] == 2
     assert status["provider_model_io_embedded"] is False
     assert "local checks + one-shot runtime smoke" in status["evidence_layer"]
+    assert (cfg.private_audit_root / cfg.run_id / "heartbeat.json").exists()
+    assert (cfg.private_audit_root / cfg.run_id / "events.jsonl").exists()
+    assert (cfg.private_audit_root / cfg.run_id / "cycle_001_summary.json").exists()
+
+
+def test_all_publish_exits_zero_with_real_alaya_readback_verified(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    cfg = FullAnalystConfig(**{**cfg.__dict__, "alaya_mode": "real"})
+    alaya = RealSuccessAlaya()
+
+    exit_code = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=StaticRunner(valid_payload()),
+        alaya_client=alaya,
+    )
+
+    status = json.loads((cfg.output_dir / "status_full_analyst_evening_hk.json").read_text())
+    assert exit_code == 0
+    assert status["run_status"] == "completed"
+    assert status["publish_count"] == 1
+    assert status["alaya_synced_count"] == 1
+    assert status["alaya_readback_verified_count"] == 1
+    assert status["alaya_readback_status"] == "verified"
+    assert alaya.calls
+
+
+def test_real_alaya_uses_gotra_internal_state_hash_chain(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    cfg = FullAnalystConfig(**{**cfg.__dict__, "alaya_mode": "real"})
+    state_path = cfg.private_audit_root / "cognition_flywheel" / "full_analyst_memory_events.jsonl"
+
+    exit_code = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=StaticRunner(valid_payload()),
+        alaya_client=GotraInternalAlayaSyncClient(
+            state_path=state_path,
+            actor="test/full_analyst_pipeline",
+        ),
+    )
+
+    status = json.loads((cfg.output_dir / "status_full_analyst_evening_hk.json").read_text())
+    records = [json.loads(line) for line in state_path.read_text().splitlines() if line.strip()]
+    event_meta = json.loads(
+        (cfg.private_audit_root / cfg.run_id / "alaya_events" / "HKEX_0700.json").read_text()
+    )
+    assert exit_code == 0
+    assert status["alaya_mode"] == "real"
+    assert status["alaya_readback_status"] == "verified"
+    assert status["alaya_readback_verified_count"] == 1
+    assert records[0]["event_type"] == "full_analyst_memory_sync"
+    assert records[0]["cognition_flywheel_layer"] == "full_analyst_public_research"
+    assert records[0]["event_hash"] == event_meta["event_hash"]
 
 
 def test_missing_required_field_becomes_blocked_failure(tmp_path: Path) -> None:
@@ -218,6 +315,110 @@ def test_forbidden_public_content_reason_is_public_safe(tmp_path: Path) -> None:
     assert exit_code == 2
     assert status["blocked_symbols"][0]["reason"] == "forbidden_public_content_detected"
     assert "stdout" not in public_text
+
+
+def test_alaya_sync_failure_blocks_run(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    cfg = FullAnalystConfig(**{**cfg.__dict__, "alaya_mode": "real"})
+
+    exit_code = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=StaticRunner(valid_payload()),
+        alaya_client=FailingAlaya(),
+    )
+
+    status = json.loads((cfg.output_dir / "status_full_analyst_evening_hk.json").read_text())
+    assert exit_code == 2
+    assert status["run_status"] == "completed_with_blockers"
+    assert status["alaya_failed_count"] == 1
+    assert status["last_error_category"] == "gotra_internal_state_sync_failed"
+
+
+def test_alaya_readback_mismatch_blocks_run(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    cfg = FullAnalystConfig(**{**cfg.__dict__, "alaya_mode": "real"})
+
+    exit_code = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=StaticRunner(valid_payload()),
+        alaya_client=ReadbackMismatchAlaya(),
+    )
+
+    status = json.loads((cfg.output_dir / "status_full_analyst_evening_hk.json").read_text())
+    assert exit_code == 2
+    assert status["alaya_readback_failed_count"] == 1
+    assert status["alaya_readback_status"] == "failed"
+    assert status["last_error_category"] == "alaya_readback_mismatch"
+
+
+def test_artifact_write_failure_exits_two(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    cfg.static_dir.write_text("not a directory", encoding="utf-8")
+
+    exit_code = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=StaticRunner(valid_payload()),
+        alaya_client=RecordingAlaya(),
+    )
+
+    status = json.loads((cfg.output_dir / "status_full_analyst_evening_hk.json").read_text())
+    assert exit_code == 2
+    assert status["artifact_write_status"] == "failed"
+    assert status["last_error_category"] == "artifact_write_failed"
+
+
+def test_public_scan_failure_exits_two(monkeypatch, tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+
+    from scripts import public_stock_pool_full_analyst_pipeline as module
+
+    monkeypatch.setattr(module, "render_markdown", lambda status, results: "stdout leaked into public artifact")
+
+    exit_code = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=StaticRunner(valid_payload()),
+        alaya_client=RecordingAlaya(),
+    )
+
+    status = json.loads((cfg.output_dir / "status_full_analyst_evening_hk.json").read_text())
+    assert exit_code == 2
+    assert status["public_scan_status"] == "failed"
+    assert status["last_error_category"] == "forbidden_public_content_detected"
+
+
+def test_loop_smoke_writes_loop_named_public_artifacts(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    cfg = FullAnalystConfig(
+        **{
+            **cfg.__dict__,
+            "mode": LOOP_SMOKE_MODE,
+            "output_dir": tmp_path / "loop-public",
+            "run_id": "full_analyst_10h_loop_20260629_v1",
+        }
+    )
+
+    exit_code = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=StaticRunner(valid_payload()),
+        alaya_client=RecordingAlaya(),
+    )
+
+    status_path = cfg.output_dir / "status_full_analyst_loop.json"
+    status = json.loads(status_path.read_text())
+    assert exit_code == 0
+    assert status_path.exists()
+    assert (cfg.output_dir / "full_analyst_loop_latest.md").exists()
+    assert status["evidence_layer"] == "local checks + short loop smoke + public-safe artifact smoke"
 
 
 def test_public_artifacts_do_not_expose_forbidden_runtime_surfaces(tmp_path: Path) -> None:
