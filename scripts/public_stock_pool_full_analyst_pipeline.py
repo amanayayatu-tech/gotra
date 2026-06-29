@@ -1454,7 +1454,15 @@ def update_loop_public_status(
     last_error_category: str | None = None,
 ) -> None:
     report_path, status_path = report_paths(config)
-    if not status_path.exists():
+    status: dict[str, Any] | None = None
+    should_bootstrap = not status_path.exists()
+    if not should_bootstrap:
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        should_bootstrap = status.get("run_id") != config.run_id or status.get("mode") != config.mode
+    if should_bootstrap:
         config.output_dir.mkdir(parents=True, exist_ok=True)
         status = build_loop_running_status(
             config,
@@ -1469,11 +1477,8 @@ def update_loop_public_status(
         markdown = render_loop_running_markdown(status)
         scan_public_text(markdown)
         write_public_text(report_path, markdown)
-    else:
-        try:
-            status = json.loads(status_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return
+    if status is None:
+        return
     started = datetime.fromisoformat(started_at_utc.replace("Z", "+00:00"))
     elapsed = max(0, int((datetime.now(UTC) - started).total_seconds()))
     status["status"] = loop_status

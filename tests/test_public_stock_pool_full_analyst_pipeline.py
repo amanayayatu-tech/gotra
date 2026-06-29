@@ -473,6 +473,50 @@ def test_loop_public_status_bootstraps_before_first_cycle_artifact(tmp_path: Pat
     assert "stderr" not in public_text
 
 
+def test_loop_public_status_resets_stale_run_id(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700", "HKEX:9988"))
+    cfg = FullAnalystConfig(
+        **{
+            **cfg.__dict__,
+            "mode": LOOP_MODE,
+            "output_dir": tmp_path / "loop-public",
+            "run_id": "full_analyst_10h_loop_20260629_v2",
+            "alaya_mode": "real",
+            "loop_duration_seconds": 36000,
+        }
+    )
+    status_path = cfg.output_dir / "status_full_analyst_loop.json"
+    cfg.output_dir.mkdir(parents=True)
+    status_path.write_text(
+        json.dumps(
+            {
+                "run_id": "full_analyst_10h_loop_20260629_v1",
+                "mode": LOOP_MODE,
+                "status": "running",
+                "publish_count": 99,
+                "sample_symbols": ["OLD"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    update_loop_public_status(
+        cfg,
+        current_cycle=0,
+        last_successful_cycle=0,
+        loop_status="running",
+        phase="preflight",
+        started_at_utc="2026-06-29T00:00:00Z",
+        sample_symbols=(),
+    )
+
+    status = json.loads(status_path.read_text())
+    assert status["run_id"] == "full_analyst_10h_loop_20260629_v2"
+    assert status["publish_count"] == 0
+    assert status["sample_symbols"] == []
+    assert status["phase"] == "preflight"
+
+
 def test_loop_cycles_keep_distinct_private_summaries_and_cycle_heartbeat(tmp_path: Path) -> None:
     cfg = config(tmp_path, symbols=("HKEX:0700",))
     cfg = FullAnalystConfig(
