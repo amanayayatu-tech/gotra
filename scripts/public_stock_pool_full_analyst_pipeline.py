@@ -457,6 +457,9 @@ def build_prompt(item: dict[str, str], price_row: dict[str, Any], config: FullAn
         "Produce a public-safe analyst pilot summary with positive_case, negative_case, and red_team_review.\n"
         "Do not provide investment advice, trading signal, directional recommendation, price objective, "
         "allocation guidance, outcome promise, performance proof, or science/public proof.\n"
+        "Avoid the literal phrases buy recommendation, sell recommendation, hold recommendation, "
+        "target price, stdout, stderr, completion, messages, and raw_provider_response in all JSON values.\n"
+        "Copy the boundary array exactly from the Input JSON.\n"
         "Do not include prompt_text, completion, messages, raw_provider_response, stdout, stderr, "
         "Authorization, Bearer, API keys, or secrets.\n"
         "Use arrays for key_updates, positive_case, negative_case, red_team_review, risk_factors, "
@@ -685,10 +688,34 @@ def sanitize_list(value: Any) -> list[str]:
 
 def assert_public_safe(payload: Any) -> None:
     text = json.dumps(payload, ensure_ascii=False, sort_keys=True) if not isinstance(payload, str) else payload
-    match = FORBIDDEN_PUBLIC_RE.search(text)
+    scan_text = normalize_negated_boundary_text(text)
+    match = FORBIDDEN_PUBLIC_RE.search(scan_text)
     if match:
         token = re.sub(r"[^a-z0-9_ -]+", "", match.group(0).lower()).strip().replace(" ", "_")
         raise ValueError(f"forbidden_public_content_detected:{token[:80] or 'unknown'}")
+
+
+def normalize_negated_boundary_text(text: str) -> str:
+    """Keep public scans strict while avoiding blocks on explicit no-advice disclaimers."""
+
+    replacements = (
+        (
+            re.compile(
+                r"\b(?:not\s+(?:a|an)\s+|no\s+)(?:buy|sell|hold)\s+"
+                r"(?:recommendation|rating|signal)\b",
+                re.IGNORECASE,
+            ),
+            "no_directional_action",
+        ),
+        (
+            re.compile(r"\b(?:not\s+(?:a|an)\s+|no\s+)target\s+price\b", re.IGNORECASE),
+            "no_price_objective",
+        ),
+    )
+    normalized = text
+    for pattern, replacement in replacements:
+        normalized = pattern.sub(replacement, normalized)
+    return normalized
 
 
 def judge_symbol(symbol_payload: dict[str, Any]) -> tuple[str, list[str]]:

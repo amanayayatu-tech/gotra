@@ -10,6 +10,7 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     FullAnalystConfig,
     GotraInternalAlayaSyncClient,
     MockAlayaSyncClient,
+    assert_public_safe,
     run,
 )
 
@@ -293,6 +294,15 @@ def test_investment_advice_like_output_is_blocked(tmp_path: Path) -> None:
     assert exit_code == 2
     assert status["blocked_count"] == 1
     assert "forbidden_public_content_detected" in status["blocked_symbols"][0]["reason"]
+
+
+def test_negated_advice_disclaimer_does_not_trip_public_scanner() -> None:
+    assert_public_safe(
+        {
+            "summary": "This is not a buy recommendation and no target price is provided.",
+            "boundary": list(BOUNDARY_LINES),
+        }
+    )
 
 
 def test_forbidden_public_content_reason_is_public_safe(tmp_path: Path) -> None:
