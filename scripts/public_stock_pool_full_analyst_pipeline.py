@@ -141,6 +141,8 @@ class FullAnalystConfig:
     heartbeat_interval_seconds: int
     loop_duration_seconds: int
     sample_cadence_seconds: int
+    loop_current_cycle: int = 1
+    loop_last_successful_cycle: int = 0
 
 
 class AnalystRunner(Protocol):
@@ -756,9 +758,30 @@ def run_jobs(
     config: FullAnalystConfig,
     runner: AnalystRunner,
     alaya_client: AlayaSyncClient,
+    *,
+    started_at_utc: str,
 ) -> list[dict[str, Any]]:
     if config.max_concurrency == 1:
-        return [run_symbol(item, price_rows[f"{item['exchange']}:{item['symbol']}"], config, runner, alaya_client) for item in items]
+        results = []
+        for item in items:
+            write_heartbeat(
+                config,
+                status="running",
+                phase="llm",
+                current_cycle=config.loop_current_cycle,
+                last_successful_cycle=config.loop_last_successful_cycle,
+                started_at_utc=started_at_utc,
+            )
+            results.append(
+                run_symbol(
+                    item,
+                    price_rows[f"{item['exchange']}:{item['symbol']}"],
+                    config,
+                    runner,
+                    alaya_client,
+                )
+            )
+        return results
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=config.max_concurrency) as executor:
         futures = {
@@ -810,6 +833,8 @@ def build_status(
         elif publish:
             alaya_readback_status = "missing"
     last_error_category = first_error_category(failed, blocked, alaya_failed, alaya_readback_failed)
+    current_cycle = max(1, config.loop_current_cycle)
+    last_successful_cycle = current_cycle if exit_status == 0 else config.loop_last_successful_cycle
     status = {
         "schema": STATUS_SCHEMA,
         "ok": exit_status == 0,
@@ -818,8 +843,8 @@ def build_status(
         "run_id": config.run_id,
         "status": "completed" if exit_status == 0 else "failed",
         "phase": "artifact",
-        "current_cycle": 1,
-        "last_successful_cycle": 1 if exit_status == 0 else 0,
+        "current_cycle": current_cycle,
+        "last_successful_cycle": last_successful_cycle,
         "as_of_date": config.as_of_date.isoformat(),
         "trading_date": config.trading_date.isoformat(),
         "sample_symbols": list(config.symbols),
@@ -1182,21 +1207,28 @@ def write_failure_records(config: FullAnalystConfig, results: list[dict[str, Any
         with path.open("a", encoding="utf-8") as handle:
             for failure in failures:
                 handle.write(json.dumps(failure, ensure_ascii=False, sort_keys=True) + "\n")
-    write_private_json_atomic(private_run_dir(config) / "cycle_001_summary.json", sanitize_private_metadata(status) | {
-        "run_id": config.run_id,
-        "cycle_id": "cycle_001",
-        "sample_symbols": list(config.symbols),
-        "publish_count": status["publish_count"],
-        "needs_review_count": status["needs_review_count"],
-        "blocked_count": status["blocked_count"],
-        "data_gap_count": status["data_gap_count"],
-        "alaya_synced_count": status["alaya_synced_count"],
-        "alaya_readback_verified_count": status["alaya_readback_verified_count"],
-        "artifact_write_status": status["artifact_write_status"],
-        "public_scan_status": status["public_scan_status"],
-        "exit_status": status["exit_status"],
-        "duration_seconds": status["elapsed_seconds"],
-    })
+    cycle_index = max(1, config.loop_current_cycle)
+    write_private_json_atomic(
+        private_run_dir(config) / f"cycle_{cycle_index:03d}_summary.json",
+        sanitize_private_metadata(status)
+        | {
+            "run_id": config.run_id,
+            "cycle_id": f"cycle_{cycle_index:03d}",
+            "current_cycle": status["current_cycle"],
+            "last_successful_cycle": status["last_successful_cycle"],
+            "sample_symbols": list(config.symbols),
+            "publish_count": status["publish_count"],
+            "needs_review_count": status["needs_review_count"],
+            "blocked_count": status["blocked_count"],
+            "data_gap_count": status["data_gap_count"],
+            "alaya_synced_count": status["alaya_synced_count"],
+            "alaya_readback_verified_count": status["alaya_readback_verified_count"],
+            "artifact_write_status": status["artifact_write_status"],
+            "public_scan_status": status["public_scan_status"],
+            "exit_status": status["exit_status"],
+            "duration_seconds": status["elapsed_seconds"],
+        },
+    )
 
 
 def write_blocker_status(config: FullAnalystConfig, *, started_at_utc: str, reason: str, report_path: Path, status_path: Path) -> int:
@@ -1301,6 +1333,115 @@ def sample_symbols_for_cycle(symbols: tuple[str, ...], successful_cycles: int) -
     return tuple(symbols[: min(sample_size, len(symbols))])
 
 
+def build_loop_running_status(
+    config: FullAnalystConfig,
+    *,
+    current_cycle: int,
+    last_successful_cycle: int,
+    loop_status: str,
+    phase: str,
+    started_at_utc: str,
+    sample_symbols: tuple[str, ...],
+    last_error_category: str | None = None,
+) -> dict[str, Any]:
+    report_path, status_path = report_paths(config)
+    started = datetime.fromisoformat(started_at_utc.replace("Z", "+00:00"))
+    elapsed = max(0, int((datetime.now(UTC) - started).total_seconds()))
+    return {
+        "schema": STATUS_SCHEMA,
+        "ok": True,
+        "run_status": "running" if loop_status == "running" else loop_status,
+        "mode": config.mode,
+        "run_id": config.run_id,
+        "status": loop_status,
+        "phase": phase,
+        "current_cycle": current_cycle,
+        "last_successful_cycle": last_successful_cycle,
+        "as_of_date": config.as_of_date.isoformat(),
+        "trading_date": config.trading_date.isoformat(),
+        "sample_symbols": list(sample_symbols),
+        "universe_count": len(sample_symbols),
+        "success_count": 0,
+        "failed_count": 0,
+        "publish_count": 0,
+        "needs_review_count": 0,
+        "blocked_count": 0,
+        "data_gap_count": 0,
+        "alaya_synced_count": 0,
+        "alaya_failed_count": 0,
+        "alaya_readback_verified_count": 0,
+        "alaya_readback_failed_count": 0,
+        "alaya_sync_status": "pending" if config.alaya_mode == "real" else "skipped",
+        "alaya_readback_status": "pending" if config.alaya_mode == "real" else "not_applicable",
+        "failed_symbols": [],
+        "blocked_symbols": [],
+        "needs_review_symbols": [],
+        "started_at_utc": started_at_utc,
+        "finished_at_utc": None,
+        "last_heartbeat_utc": utc_now_iso(),
+        "elapsed_seconds": elapsed,
+        "remaining_seconds": max(0, int(config.loop_duration_seconds - elapsed)),
+        "consecutive_failures": 1 if last_error_category else 0,
+        "llm_runner": config.llm_runner,
+        "llm_model": config.model,
+        "reasoning_effort": config.reasoning_effort,
+        "timeout_seconds": config.per_symbol_timeout_seconds,
+        "retries": config.retries,
+        "alaya_mode": config.alaya_mode,
+        "prompt_template_version": PROMPT_TEMPLATE_VERSION,
+        "boundary": list(BOUNDARY_LINES),
+        "report_file": report_path.name,
+        "latest_public_report_file": report_path.name,
+        "status_file": status_path.name,
+        "artifact_write_status": "pending",
+        "artifact_write_failure_reason": None,
+        "public_scan_status": "pending",
+        "last_error_category": last_error_category,
+        "last_error_public_message": public_error_message(last_error_category),
+        "heartbeat_stale": False,
+        "provider_model_io_embedded": False,
+        "evidence_layer": evidence_layer_for_mode(config.mode),
+        "limitations": [
+            "not formal acceptance",
+            "not science/public proof",
+            "not performance proof",
+            "not a trading signal",
+            "not investment advice",
+        ],
+        "exit_status": None,
+    }
+
+
+def render_loop_running_markdown(status: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            f"# GOTRA Full Analyst Pipeline - {status['as_of_date']}",
+            "",
+            "## Evidence Layer",
+            "",
+            f"- {status['evidence_layer']}",
+            "- not formal acceptance",
+            "- not science/public proof",
+            "- not performance proof",
+            "- not a trading signal",
+            "- not investment advice",
+            "",
+            "## Status",
+            "",
+            f"- mode: {status['mode']}",
+            f"- run_id: {status['run_id']}",
+            f"- status: {status['status']}",
+            f"- phase: {status['phase']}",
+            f"- last_heartbeat_utc: {status['last_heartbeat_utc']}",
+            f"- current_cycle: {status['current_cycle']}",
+            f"- last_successful_cycle: {status['last_successful_cycle']}",
+            f"- alaya_mode: {status['alaya_mode']}",
+            f"- alaya_sync_status: {status['alaya_sync_status']}",
+            f"- alaya_readback_status: {status['alaya_readback_status']}",
+        ]
+    ) + "\n"
+
+
 def update_loop_public_status(
     config: FullAnalystConfig,
     *,
@@ -1309,21 +1450,39 @@ def update_loop_public_status(
     loop_status: str,
     phase: str,
     started_at_utc: str,
+    sample_symbols: tuple[str, ...] | None = None,
     last_error_category: str | None = None,
 ) -> None:
     report_path, status_path = report_paths(config)
     if not status_path.exists():
-        return
-    try:
-        status = json.loads(status_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+        status = build_loop_running_status(
+            config,
+            current_cycle=current_cycle,
+            last_successful_cycle=last_successful_cycle,
+            loop_status=loop_status,
+            phase=phase,
+            started_at_utc=started_at_utc,
+            sample_symbols=sample_symbols or (),
+            last_error_category=last_error_category,
+        )
+        markdown = render_loop_running_markdown(status)
+        scan_public_text(markdown)
+        write_public_text(report_path, markdown)
+    else:
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
     started = datetime.fromisoformat(started_at_utc.replace("Z", "+00:00"))
     elapsed = max(0, int((datetime.now(UTC) - started).total_seconds()))
     status["status"] = loop_status
     status["phase"] = phase
     status["current_cycle"] = current_cycle
     status["last_successful_cycle"] = last_successful_cycle
+    if sample_symbols is not None:
+        status["sample_symbols"] = list(sample_symbols)
+        status["universe_count"] = len(sample_symbols)
     status["last_heartbeat_utc"] = utc_now_iso()
     status["elapsed_seconds"] = elapsed
     status["remaining_seconds"] = max(0, int(config.loop_duration_seconds - elapsed))
@@ -1350,11 +1509,46 @@ def run_loop(config: FullAnalystConfig) -> int:
         last_successful_cycle=0,
         started_at_utc=loop_started_at_utc,
     )
+    update_loop_public_status(
+        config,
+        current_cycle=0,
+        last_successful_cycle=0,
+        loop_status="running",
+        phase="preflight",
+        started_at_utc=loop_started_at_utc,
+        sample_symbols=(),
+    )
     while time.monotonic() - loop_started < config.loop_duration_seconds:
         current_cycle += 1
         cycle_symbols = sample_symbols_for_cycle(config.symbols, last_successful_cycle)
-        cycle_config = replace(config, symbols=cycle_symbols)
-        append_event(config, "cycle_started", {"status": "running", "event_hash": stable_hash({"cycle": current_cycle})})
+        cycle_config = replace(
+            config,
+            symbols=cycle_symbols,
+            loop_current_cycle=current_cycle,
+            loop_last_successful_cycle=last_successful_cycle,
+        )
+        append_event(
+            config,
+            "cycle_started",
+            {"status": "running", "event_hash": stable_hash({"cycle": current_cycle})},
+        )
+        write_heartbeat(
+            config,
+            status="running",
+            phase="llm",
+            current_cycle=current_cycle,
+            last_successful_cycle=last_successful_cycle,
+            started_at_utc=loop_started_at_utc,
+        )
+        update_loop_public_status(
+            config,
+            current_cycle=current_cycle,
+            last_successful_cycle=last_successful_cycle,
+            loop_status="running",
+            phase="llm",
+            started_at_utc=loop_started_at_utc,
+            sample_symbols=cycle_symbols,
+        )
         last_exit = run(cycle_config)
         if last_exit == 0:
             last_successful_cycle = current_cycle
@@ -1366,6 +1560,7 @@ def run_loop(config: FullAnalystConfig) -> int:
             loop_status="running" if last_exit == 0 else "repairing",
             phase="sleep" if last_exit == 0 else "repairing",
             started_at_utc=loop_started_at_utc,
+            sample_symbols=cycle_symbols,
             last_error_category=category,
         )
         if last_exit != 0:
@@ -1420,7 +1615,14 @@ def run(
     started_at_utc = utc_now_iso()
     ensure_private_dir(private_run_dir(config))
     report_path, status_path = report_paths(config)
-    write_heartbeat(config, status="running", phase="preflight", current_cycle=1, last_successful_cycle=0, started_at_utc=started_at_utc)
+    write_heartbeat(
+        config,
+        status="running",
+        phase="preflight",
+        current_cycle=config.loop_current_cycle,
+        last_successful_cycle=config.loop_last_successful_cycle,
+        started_at_utc=started_at_utc,
+    )
     append_event(config, "run_started", {"status": "running", "mode": config.mode})
     try:
         preflight_llm_config(config, runner)
@@ -1429,11 +1631,32 @@ def run(
         return write_blocker_status(config, started_at_utc=started_at_utc, reason=str(exc), report_path=report_path, status_path=status_path)
     universe = universe_items if universe_items is not None else load_public_universe(config)
     items = selected_universe(universe, config.symbols)
-    write_heartbeat(config, status="running", phase="cycle", current_cycle=1, last_successful_cycle=0, started_at_utc=started_at_utc)
+    write_heartbeat(
+        config,
+        status="running",
+        phase="cycle",
+        current_cycle=config.loop_current_cycle,
+        last_successful_cycle=config.loop_last_successful_cycle,
+        started_at_utc=started_at_utc,
+    )
     resolved_price_rows = fetch_price_rows(items, config, price_rows)
-    write_heartbeat(config, status="running", phase="llm", current_cycle=1, last_successful_cycle=0, started_at_utc=started_at_utc)
+    write_heartbeat(
+        config,
+        status="running",
+        phase="llm",
+        current_cycle=config.loop_current_cycle,
+        last_successful_cycle=config.loop_last_successful_cycle,
+        started_at_utc=started_at_utc,
+    )
     active_runner = runner or runner_from_config(config)
-    results = run_jobs(items, resolved_price_rows, config, active_runner, active_alaya)
+    results = run_jobs(
+        items,
+        resolved_price_rows,
+        config,
+        active_runner,
+        active_alaya,
+        started_at_utc=started_at_utc,
+    )
     status = build_status(
         config=config,
         results=results,
@@ -1457,7 +1680,15 @@ def run(
         failed["exit_status"] = 2
         config.output_dir.mkdir(parents=True, exist_ok=True)
         write_public_json(status_path, failed)
-        write_heartbeat(config, status="failed", phase="scan", current_cycle=1, last_successful_cycle=0, started_at_utc=started_at_utc, last_error_category=category)
+        write_heartbeat(
+            config,
+            status="failed",
+            phase="scan",
+            current_cycle=config.loop_current_cycle,
+            last_successful_cycle=config.loop_last_successful_cycle,
+            started_at_utc=started_at_utc,
+            last_error_category=category,
+        )
         append_event(config, "public_scan_failed", {"status": "failed", "reason": category})
         print(json.dumps(failed, ensure_ascii=False, indent=2, sort_keys=True))
         return 2
@@ -1474,18 +1705,29 @@ def run(
         failed["exit_status"] = 2
         config.output_dir.mkdir(parents=True, exist_ok=True)
         write_public_json(status_path, failed)
-        write_heartbeat(config, status="failed", phase="artifact", current_cycle=1, last_successful_cycle=0, started_at_utc=started_at_utc, last_error_category=category)
+        write_heartbeat(
+            config,
+            status="failed",
+            phase="artifact",
+            current_cycle=config.loop_current_cycle,
+            last_successful_cycle=config.loop_last_successful_cycle,
+            started_at_utc=started_at_utc,
+            last_error_category=category,
+        )
         append_event(config, "artifact_write_failed", {"status": "failed", "reason": category})
         print(json.dumps(failed, ensure_ascii=False, indent=2, sort_keys=True))
         return 2
     runtime_summary = dict(status)
     runtime_summary["local_output_paths"] = paths
+    heartbeat_last_successful_cycle = (
+        config.loop_current_cycle if status["exit_status"] == 0 else config.loop_last_successful_cycle
+    )
     write_heartbeat(
         config,
         status="completed" if status["exit_status"] == 0 else "failed",
         phase="completed",
-        current_cycle=1,
-        last_successful_cycle=1 if status["exit_status"] == 0 else 0,
+        current_cycle=config.loop_current_cycle,
+        last_successful_cycle=heartbeat_last_successful_cycle,
         started_at_utc=started_at_utc,
         last_error_category=status.get("last_error_category"),
     )

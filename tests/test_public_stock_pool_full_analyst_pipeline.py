@@ -5,6 +5,7 @@ from pathlib import Path
 from scripts.public_stock_pool_full_research import RunnerResult
 from scripts.public_stock_pool_full_analyst_pipeline import (
     BOUNDARY_LINES,
+    LOOP_MODE,
     LOOP_SMOKE_MODE,
     MODE,
     FullAnalystConfig,
@@ -12,6 +13,7 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     MockAlayaSyncClient,
     assert_public_safe,
     run,
+    update_loop_public_status,
 )
 
 
@@ -429,6 +431,95 @@ def test_loop_smoke_writes_loop_named_public_artifacts(tmp_path: Path) -> None:
     assert status_path.exists()
     assert (cfg.output_dir / "full_analyst_loop_latest.md").exists()
     assert status["evidence_layer"] == "local checks + short loop smoke + public-safe artifact smoke"
+
+
+def test_loop_public_status_bootstraps_before_first_cycle_artifact(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700", "HKEX:9988"))
+    cfg = FullAnalystConfig(
+        **{
+            **cfg.__dict__,
+            "mode": LOOP_MODE,
+            "output_dir": tmp_path / "loop-public",
+            "run_id": "full_analyst_10h_loop_20260629_v1",
+            "alaya_mode": "real",
+            "loop_duration_seconds": 36000,
+        }
+    )
+
+    update_loop_public_status(
+        cfg,
+        current_cycle=0,
+        last_successful_cycle=0,
+        loop_status="running",
+        phase="preflight",
+        started_at_utc="2026-06-29T00:00:00Z",
+        sample_symbols=(),
+    )
+
+    status_path = cfg.output_dir / "status_full_analyst_loop.json"
+    report_path = cfg.output_dir / "full_analyst_loop_latest.md"
+    status = json.loads(status_path.read_text())
+    public_text = status_path.read_text() + "\n" + report_path.read_text()
+    assert status["status"] == "running"
+    assert status["run_status"] == "running"
+    assert status["phase"] == "preflight"
+    assert status["alaya_mode"] == "real"
+    assert status["alaya_sync_status"] == "pending"
+    assert status["sample_symbols"] == []
+    assert status["publish_count"] == 0
+    assert report_path.exists()
+    assert (cfg.static_dir / "status_full_analyst_loop.json").exists()
+    assert "stdout" not in public_text
+    assert "stderr" not in public_text
+
+
+def test_loop_cycles_keep_distinct_private_summaries_and_cycle_heartbeat(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    cfg = FullAnalystConfig(
+        **{
+            **cfg.__dict__,
+            "mode": LOOP_MODE,
+            "output_dir": tmp_path / "loop-public",
+            "run_id": "full_analyst_10h_loop_20260629_v1",
+            "loop_current_cycle": 1,
+            "loop_last_successful_cycle": 0,
+        }
+    )
+
+    first_exit = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=StaticRunner(valid_payload()),
+        alaya_client=RecordingAlaya(),
+    )
+    second_cfg = FullAnalystConfig(
+        **{
+            **cfg.__dict__,
+            "loop_current_cycle": 2,
+            "loop_last_successful_cycle": 1,
+        }
+    )
+    second_exit = run(
+        second_cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=StaticRunner(valid_payload()),
+        alaya_client=RecordingAlaya(),
+    )
+
+    run_dir = cfg.private_audit_root / cfg.run_id
+    heartbeat = json.loads((run_dir / "heartbeat.json").read_text())
+    cycle_001 = json.loads((run_dir / "cycle_001_summary.json").read_text())
+    cycle_002 = json.loads((run_dir / "cycle_002_summary.json").read_text())
+    assert first_exit == 0
+    assert second_exit == 0
+    assert cycle_001["cycle_id"] == "cycle_001"
+    assert cycle_001["current_cycle"] == 1
+    assert cycle_002["cycle_id"] == "cycle_002"
+    assert cycle_002["current_cycle"] == 2
+    assert heartbeat["current_cycle"] == 2
+    assert heartbeat["last_successful_cycle"] == 2
 
 
 def test_public_artifacts_do_not_expose_forbidden_runtime_surfaces(tmp_path: Path) -> None:
