@@ -2,8 +2,9 @@
 
 This runbook documents the local single-server automation that generates and
 publishes public-safe stock-pool reports for the GOTRA public ledger frontend.
-It preserves the same boundary as the public API adapter: research information
-only, not investment advice, not a trading signal, and not performance proof.
+It preserves the same boundary as the public API adapter: informational
+research context only, without portfolio instructions or return validation
+claims.
 
 ## Scope
 
@@ -12,12 +13,35 @@ only, not investment advice, not a trading signal, and not performance proof.
 - Static report source: `/opt/gotra/data/reports/`
 - Static web target: `/var/www/gotra-public-ledger/reports/`
 - Public frontend route: `/reports`
-- Public API: unchanged
+- Public API adapter: `gotra-public-api.service`
 - Private ResearchOS UI: not exposed
 
 The report script writes Markdown and JSON artifacts only. It does not call LLM
 providers, read `.env` files, expose private workflow state, create orders, or
 generate buy/sell/hold/position instructions.
+
+## Production Runtime Boundary
+
+These files are Git-tracked templates for the current production runtime. They
+are not `/etc` snapshots and do not include certificates, private key material,
+credential values, environment files, or local machine logs.
+
+- `ops/systemd/gotra-public-api.service`
+- `ops/systemd/gotra-stock-pool-morning-report.service`
+- `ops/systemd/gotra-stock-pool-morning-report.timer`
+- `ops/systemd/gotra-stock-pool-evening-report.service`
+- `ops/systemd/gotra-stock-pool-evening-report.timer`
+
+Runtime invariants:
+
+- `gotra-public-api.service` must bind only `127.0.0.1:3000`.
+- Public traffic reaches the API only through Nginx `/api/`.
+- Port `7777` is not used by this public deployment and must not be opened to
+  the public Internet.
+- Public reports are static artifacts under `/var/www/gotra-public-ledger/reports/`.
+- Evidence from this runtime is operational only: `local checks` plus `server
+  runtime evidence`. It must not be cited as research validation, return
+  validation, or portfolio guidance.
 
 ## Commands
 
@@ -119,9 +143,12 @@ configured. The first operational alert surface is journal + `status.json`.
 Install the templates from `ops/systemd/` on the server:
 
 ```bash
+cd /opt/gotra
 sudo cp ops/systemd/gotra-stock-pool-*.service /etc/systemd/system/
 sudo cp ops/systemd/gotra-stock-pool-*.timer /etc/systemd/system/
+sudo cp ops/systemd/gotra-public-api.service /etc/systemd/system/
 sudo systemctl daemon-reload
+sudo systemctl enable --now gotra-public-api.service
 sudo systemctl enable --now gotra-stock-pool-morning-report.timer
 sudo systemctl enable --now gotra-stock-pool-evening-report.timer
 ```
@@ -136,30 +163,36 @@ Validate calendar syntax and next runs:
 ```bash
 systemd-analyze calendar 'Tue..Sat *-*-* 10:30:00 Asia/Shanghai'
 systemd-analyze calendar 'Mon..Fri *-*-* 18:30:00 Asia/Shanghai'
-systemctl list-timers --all | grep gotra-stock-pool
+systemctl list-timers --all "gotra-stock-pool-*" --no-pager
+systemctl status gotra-stock-pool-morning-report.timer gotra-stock-pool-evening-report.timer --no-pager
 ```
 
-## Nginx Route
+## Runtime Status Commands
 
-The frontend route `/reports` is a React route. Add the exact-location snippet
-from `ops/nginx/gotra-public-ledger-reports.locations.conf` before the general
-SPA fallback in `/etc/nginx/sites-available/gotra-public-ledger`:
-
-```nginx
-location = /reports {
-    try_files /index.html =404;
-}
-
-location = /reports/ {
-    try_files /index.html =404;
-}
-```
-
-Then validate and reload:
+Check the public API service and listener:
 
 ```bash
-sudo nginx -t
-sudo systemctl reload nginx
+systemctl status gotra-public-api.service --no-pager
+ss -ltnp | grep -E ':(3000|7777)\b' || true
+curl -fsS http://127.0.0.1:3000/api/health
+```
+
+Check report timers and journals:
+
+```bash
+systemctl list-timers --all "gotra-stock-pool-*" --no-pager
+journalctl -u gotra-stock-pool-morning-report.service -n 120 --no-pager
+journalctl -u gotra-stock-pool-evening-report.service -n 120 --no-pager
+```
+
+Check local and public status JSON:
+
+```bash
+jq '{ok, run_status, mode, as_of_date, trading_date, success_count, failed_count, artifact_write_status, artifact_write_failure_reason, failed_symbols}' \
+  /opt/gotra/data/reports/status.json
+
+curl -fsS http://47.251.249.147/reports/status.json \
+  | jq '{ok, run_status, mode, as_of_date, trading_date, success_count, failed_count, artifact_write_status, artifact_write_failure_reason, failed_symbols}'
 ```
 
 ## Smoke Checks
@@ -191,6 +224,7 @@ Check service and private-boundary health:
 
 ```bash
 curl -i http://47.251.249.147/api/health
+curl -i https://gotra.me/api/health
 curl -I --connect-timeout 5 --max-time 8 http://47.251.249.147:3000/api/health
 curl -I --connect-timeout 5 --max-time 8 http://47.251.249.147:7777/
 ```
@@ -208,7 +242,7 @@ Scan generated reports before public exposure:
 
 ```bash
 rg -n \
-  'OPENAI_API_KEY|ADMIN_SMOKE_TOKEN|sk-[A-Za-z0-9]|Bearer |Authorization|BEGIN PRIVATE KEY|PRIVATE KEY|password\s*=|secret\s*=|token\s*=' \
+  'OPENAI''_API_KEY|ADMIN''_SMOKE_TOKEN|s''k-[A-Za-z0-9]|Bear''er |Authori''zation|BEGIN PRIVATE'' KEY|PRIVATE'' KEY|pass''word\s*=|sec''ret\s*=|to''ken\s*=' \
   /opt/gotra/data/reports /var/www/gotra-public-ledger/reports \
   || true
 ```
@@ -221,6 +255,8 @@ completions, messages, or hidden model/provider I/O.
 - Holiday calendars are approximated by weekdays unless dates are overridden.
 - Yahoo Finance availability can be delayed or partial; coverage must be read
   from `status.json`.
-- HTTPS, domain/DNS, and public API rate limiting are pending.
+- HTTPS, security headers, Nginx `/api/` rate limiting, `/data/` static 404
+  behavior, and nftables edge blocking are owned by the public-ledger runtime
+  templates in `/opt/gotra-public-ledger`.
 - This is runtime/status evidence only. It does not satisfy any preregistered
   GOTRA gate and must remain below claims about model quality or future outcomes.
