@@ -2,8 +2,9 @@
 
 This runbook documents the local single-server automation that generates and
 publishes public-safe stock-pool reports for the GOTRA public ledger frontend.
-It preserves the same boundary as the public API adapter: research information
-only, not investment advice, not a trading signal, and not performance proof.
+It preserves the same boundary as the public API adapter: informational
+research context only, without portfolio instructions or return validation
+claims.
 
 ## Scope
 
@@ -38,9 +39,9 @@ Runtime invariants:
 - Port `7777` is not used by this public deployment and must not be opened to
   the public Internet.
 - Public reports are static artifacts under `/var/www/gotra-public-ledger/reports/`.
-- Public evidence from this runtime is `local checks` plus `server runtime
-  evidence`; it is not science/public proof, performance proof, or a trading
-  signal.
+- Evidence from this runtime is operational only: `local checks` plus `server
+  runtime evidence`. It must not be cited as research validation, return
+  validation, or portfolio guidance.
 
 ## Commands
 
