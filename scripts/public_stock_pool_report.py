@@ -70,6 +70,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--static-dir", type=Path, default=STATIC_REPORT_DIR)
     parser.add_argument("--publish-static", action="store_true")
     parser.add_argument("--max-workers", type=int, default=8)
+    parser.add_argument(
+        "--allowed-missing-symbol",
+        action="append",
+        default=[],
+        help=(
+            "Known provider coverage gap to allow without failing the process. "
+            "Repeatable. Supports EXCHANGE:SYMBOL, such as HKEX:0501, or provider tickers, such as 0501.HK."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -86,8 +95,8 @@ def main() -> int:
             args.static_dir,
             args.publish_static,
         )
-        write_failure_status(args=args, exc=exc, stage="run")
-        return 1
+        status = write_failure_status(args=args, exc=exc, stage="run")
+        return int(status["exit_status"]) if status else 1
 
 
 def configure_logging() -> None:
@@ -106,6 +115,7 @@ def run(args: argparse.Namespace) -> int:
         args.report_dir,
         args.static_dir,
     )
+    allowed_missing_symbols = normalize_allowed_missing_symbols(args.allowed_missing_symbol)
     as_of_date = parse_date(args.as_of_date) if args.as_of_date else datetime.now(REPORT_TIMEZONE).date()
     exchange_dates = resolve_exchange_dates(
         mode=args.mode,
@@ -134,6 +144,7 @@ def run(args: argparse.Namespace) -> int:
         exchange_dates=exchange_dates,
         items=items,
         results=results,
+        allowed_missing_symbols=allowed_missing_symbols,
     )
     log_status_summary(paths["status"])
     if args.publish_static:
@@ -154,11 +165,11 @@ def run(args: argparse.Namespace) -> int:
                 )
             log_status_summary(status)
             print(json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True))
-            return 1
+            return int(status["exit_status"])
         LOGGER.info("published static report artifacts static_dir=%s", args.static_dir)
 
     print(json.dumps(paths["status"], ensure_ascii=False, indent=2, sort_keys=True))
-    return 0 if paths["status"]["failed_count"] == 0 else 2
+    return int(paths["status"]["exit_status"])
 
 
 def resolve_exchange_dates(
@@ -316,6 +327,7 @@ def write_outputs(
     exchange_dates: ExchangeDates,
     items: list[dict[str, str]],
     results: list[dict[str, Any]],
+    allowed_missing_symbols: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     report_dir.mkdir(parents=True, exist_ok=True)
     report_path = report_dir / f"public_stock_pool_eod_{exchange_dates.primary_trading_date}.md"
@@ -330,6 +342,7 @@ def write_outputs(
         report_path=report_path,
         latest_path=latest_path,
         status_path=status_path,
+        allowed_missing_symbols=allowed_missing_symbols,
     )
     markdown = render_markdown(status=status, results=results)
     write_text_atomic(report_path, markdown)
@@ -361,10 +374,12 @@ def build_status(
     report_path: Path,
     latest_path: Path,
     status_path: Path,
+    allowed_missing_symbols: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     successes = [row for row in results if row.get("ok")]
     failures = [row for row in results if not row.get("ok")]
     exchanges = ("HKEX", "NASDAQ", "NYSE")
+    allowed_missing = tuple(sorted(set(normalize_allowed_missing_symbols(allowed_missing_symbols))))
     failed_symbols = [
         {
             "exchange": row["exchange"],
@@ -374,10 +389,17 @@ def build_status(
         }
         for row in failures
     ]
-    return {
+    allowed_missing_count = sum(1 for row in failures if is_allowed_missing_failure(row, allowed_missing))
+    unexpected_failed_count = len(failures) - allowed_missing_count
+    run_status = "completed"
+    if failures and unexpected_failed_count == 0:
+        run_status = "completed_with_allowed_data_gaps"
+    elif failures:
+        run_status = "partial"
+    status = {
         "schema": SCHEMA,
         "ok": not failures,
-        "run_status": "completed" if not failures else "partial",
+        "run_status": run_status,
         "mode": mode,
         "as_of_date": as_of_date.isoformat(),
         "trading_date": exchange_dates.primary_trading_date.isoformat(),
@@ -393,6 +415,9 @@ def build_status(
         "universe_count": len(items),
         "success_count": len(successes),
         "failed_count": len(failures),
+        "allowed_missing_symbols": list(allowed_missing),
+        "allowed_missing_count": allowed_missing_count,
+        "unexpected_failed_count": unexpected_failed_count,
         "by_exchange": {
             exchange: {
                 "universe": sum(1 for item in items if item["exchange"] == exchange),
@@ -414,6 +439,8 @@ def build_status(
         "artifact_write_failure_reason": None,
         "failure_stage": None,
     }
+    status["exit_status"] = exit_code_for_status(status)
+    return status
 
 
 def build_failure_status(*, args: argparse.Namespace, exc: Exception, stage: str) -> dict[str, Any]:
@@ -433,6 +460,9 @@ def build_failure_status(*, args: argparse.Namespace, exc: Exception, stage: str
         "universe_count": 0,
         "success_count": 0,
         "failed_count": 0,
+        "allowed_missing_symbols": list(normalize_allowed_missing_symbols(getattr(args, "allowed_missing_symbol", []))),
+        "allowed_missing_count": 0,
+        "unexpected_failed_count": 0,
         "by_exchange": {},
         "missing_symbols": [],
         "failed_symbols": [],
@@ -445,6 +475,7 @@ def build_failure_status(*, args: argparse.Namespace, exc: Exception, stage: str
         "artifact_write_status": "failed",
         "artifact_write_failure_reason": reason,
         "failure_stage": stage,
+        "exit_status": 2,
     }
 
 
@@ -469,10 +500,54 @@ def mark_artifact_write_failure(status: dict[str, Any], *, stage: str, exc: Exce
     failed["artifact_write_failure_reason"] = failure_reason(stage=stage, exc=exc)
     failed["failure_stage"] = stage
     failed["failure_time_utc"] = datetime.now(UTC).replace(microsecond=0).isoformat()
+    failed["exit_status"] = exit_code_for_status(failed)
     return failed
 
 
-def write_failure_status(*, args: argparse.Namespace, exc: Exception, stage: str) -> None:
+def normalize_allowed_missing_symbols(values: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+    normalized: set[str] = set()
+    for raw_value in values or ():
+        value = str(raw_value).strip().upper()
+        if not value:
+            continue
+        if ":" in value:
+            exchange, symbol = value.split(":", 1)
+            exchange = exchange.strip()
+            symbol = symbol.strip()
+            if exchange and symbol:
+                normalized.add(f"{exchange}:{symbol}")
+            continue
+        normalized.add(value)
+    return tuple(sorted(normalized))
+
+
+def failure_symbol_keys(row: dict[str, Any]) -> set[str]:
+    exchange = str(row.get("exchange") or "").strip().upper()
+    symbol = str(row.get("symbol") or "").strip().upper()
+    provider_ticker = str(row.get("provider_ticker") or "").strip().upper()
+    keys = {key for key in (provider_ticker, f"{exchange}:{symbol}" if exchange and symbol else "") if key}
+    if exchange == "HKEX" and symbol:
+        keys.add(f"{symbol}.HK")
+    return keys
+
+
+def is_allowed_missing_failure(row: dict[str, Any], allowed_missing_symbols: tuple[str, ...]) -> bool:
+    if not allowed_missing_symbols:
+        return False
+    return bool(failure_symbol_keys(row) & set(allowed_missing_symbols))
+
+
+def exit_code_for_status(status: dict[str, Any]) -> int:
+    if status.get("artifact_write_status") != "ok":
+        return 2
+    failed_count = int(status.get("failed_count") or 0)
+    if failed_count == 0:
+        return 0
+    unexpected_failed_count = int(status.get("unexpected_failed_count", failed_count) or 0)
+    return 0 if unexpected_failed_count == 0 else 2
+
+
+def write_failure_status(*, args: argparse.Namespace, exc: Exception, stage: str) -> dict[str, Any] | None:
     status = build_failure_status(args=args, exc=exc, stage=stage)
     status_path = args.report_dir / "status.json"
     try:
@@ -485,7 +560,7 @@ def write_failure_status(*, args: argparse.Namespace, exc: Exception, stage: str
         )
     except Exception as status_exc:  # noqa: BLE001 - this exact failure must remain visible in journal.
         LOGGER.exception("status.json write failed path=%s reason=%s", status_path, status_exc)
-        return
+        return None
 
     if args.publish_static:
         try:
@@ -497,6 +572,7 @@ def write_failure_status(*, args: argparse.Namespace, exc: Exception, stage: str
                 args.static_dir,
                 status_exc,
             )
+    return status
 
 
 def log_status_summary(status: dict[str, Any]) -> None:

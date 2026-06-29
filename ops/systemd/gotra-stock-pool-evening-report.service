@@ -6,5 +6,5 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/gotra
-ExecStart=/root/.local/bin/uv run python scripts/public_stock_pool_report.py --mode evening-hk --publish-static
+ExecStart=/root/.local/bin/uv run python scripts/public_stock_pool_report.py --mode evening-hk --publish-static --allowed-missing-symbol HKEX:0501
 Nice=5

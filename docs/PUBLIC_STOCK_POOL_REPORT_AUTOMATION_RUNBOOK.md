@@ -51,7 +51,8 @@ Generate the full-market morning report:
 cd /opt/gotra
 /root/.local/bin/uv run python scripts/public_stock_pool_report.py \
   --mode morning-global \
-  --publish-static
+  --publish-static \
+  --allowed-missing-symbol HKEX:0501
 ```
 
 Generate the HK evening report:
@@ -60,7 +61,8 @@ Generate the HK evening report:
 cd /opt/gotra
 /root/.local/bin/uv run python scripts/public_stock_pool_report.py \
   --mode evening-hk \
-  --publish-static
+  --publish-static \
+  --allowed-missing-symbol HKEX:0501
 ```
 
 Useful dry-run flags:
@@ -71,7 +73,14 @@ Useful dry-run flags:
 --us-trading-date 2026-06-26
 --report-dir /tmp/gotra-report-smoke
 --static-dir /tmp/gotra-report-static
+--allowed-missing-symbol HKEX:0501
 ```
+
+`--allowed-missing-symbol` is a provider coverage-gap allowlist. It accepts
+`EXCHANGE:SYMBOL` values such as `HKEX:0501` and provider tickers such as
+`0501.HK`. It does not remove a stock from the research universe and does not
+mark the report as full success; it only lets systemd treat a successfully
+written data-gap artifact as a successful oneshot process.
 
 ## Output Files
 
@@ -90,9 +99,15 @@ When `--publish-static` is set, it also copies the same public-safe files to:
 `status.json` includes `schema`, `mode`, `as_of_date`, `trading_date`,
 per-exchange trading dates, `universe_count`, `success_count`, `failed_count`,
 `missing_symbols`, `failed_symbols`, `run_status`, `artifact_write_status`,
-`artifact_write_failure_reason`, `source`, public-safety boundary text, and
-generated time. `missing_symbols` is retained for compatibility; use
-`failed_symbols` for new checks.
+`artifact_write_failure_reason`, `allowed_missing_symbols`,
+`allowed_missing_count`, `unexpected_failed_count`, `exit_status`, `source`,
+public-safety boundary text, and generated time. `missing_symbols` is retained
+for compatibility; use `failed_symbols` for new checks.
+
+Known provider coverage gaps should remain visible in `failed_symbols`. When
+all failures are allowlisted coverage gaps and `artifact_write_status` is `ok`,
+`run_status` is `completed_with_allowed_data_gaps`, `ok` remains `false`, and
+`exit_status` is `0` so the systemd oneshot does not become `failed`.
 
 ## Observability And Failure Checks
 
@@ -114,7 +129,7 @@ truth for that write failure.
 Check the current source status:
 
 ```bash
-jq '{ok, run_status, mode, as_of_date, trading_date, success_count, failed_count, artifact_write_status, artifact_write_failure_reason}' \
+jq '{ok, run_status, mode, as_of_date, trading_date, success_count, failed_count, allowed_missing_count, unexpected_failed_count, exit_status, artifact_write_status, artifact_write_failure_reason}' \
   /opt/gotra/data/reports/status.json
 ```
 
@@ -129,7 +144,7 @@ Check the public static status:
 
 ```bash
 curl -fsS http://47.251.249.147/reports/status.json \
-  | jq '{ok, run_status, mode, trading_date, success_count, failed_count, artifact_write_status, artifact_write_failure_reason}'
+  | jq '{ok, run_status, mode, trading_date, success_count, failed_count, allowed_missing_count, unexpected_failed_count, exit_status, artifact_write_status, artifact_write_failure_reason}'
 
 curl -fsS http://47.251.249.147/reports/status.json \
   | jq -r '.failed_symbols[]? | [.exchange, .symbol, .provider_ticker, .reason] | @tsv'
@@ -188,11 +203,11 @@ journalctl -u gotra-stock-pool-evening-report.service -n 120 --no-pager
 Check local and public status JSON:
 
 ```bash
-jq '{ok, run_status, mode, as_of_date, trading_date, success_count, failed_count, artifact_write_status, artifact_write_failure_reason, failed_symbols}' \
+jq '{ok, run_status, mode, as_of_date, trading_date, success_count, failed_count, allowed_missing_count, unexpected_failed_count, exit_status, artifact_write_status, artifact_write_failure_reason, failed_symbols}' \
   /opt/gotra/data/reports/status.json
 
 curl -fsS http://47.251.249.147/reports/status.json \
-  | jq '{ok, run_status, mode, as_of_date, trading_date, success_count, failed_count, artifact_write_status, artifact_write_failure_reason, failed_symbols}'
+  | jq '{ok, run_status, mode, as_of_date, trading_date, success_count, failed_count, allowed_missing_count, unexpected_failed_count, exit_status, artifact_write_status, artifact_write_failure_reason, failed_symbols}'
 ```
 
 ## Smoke Checks
@@ -255,6 +270,10 @@ completions, messages, or hidden model/provider I/O.
 - Holiday calendars are approximated by weekdays unless dates are overridden.
 - Yahoo Finance availability can be delayed or partial; coverage must be read
   from `status.json`.
+- `HKEX:0501` is currently allowlisted as a Yahoo provider coverage gap. Keep
+  the symbol in the research universe and read the gap from `failed_symbols`;
+  this allowlist only controls the process exit code when artifacts were written
+  successfully.
 - HTTPS, security headers, Nginx `/api/` rate limiting, `/data/` static 404
   behavior, and nftables edge blocking are owned by the public-ledger runtime
   templates in `/opt/gotra-public-ledger`.
