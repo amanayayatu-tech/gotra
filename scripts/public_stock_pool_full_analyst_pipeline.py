@@ -335,8 +335,8 @@ def build_prompt(item: dict[str, str], price_row: dict[str, Any], config: FullAn
     return (
         "Return STRICT JSON only. No markdown, no code fences, no commentary.\n"
         "Produce a public-safe analyst pilot summary with positive_case, negative_case, and red_team_review.\n"
-        "Do not provide investment advice, trading signal, buy/sell/hold recommendation, target price, "
-        "position sizing, return promise, performance proof, or science/public proof.\n"
+        "Do not provide investment advice, trading signal, directional recommendation, price objective, "
+        "allocation guidance, outcome promise, performance proof, or science/public proof.\n"
         "Do not include prompt_text, completion, messages, raw_provider_response, stdout, stderr, "
         "Authorization, Bearer, API keys, or secrets.\n"
         "Use arrays for key_updates, positive_case, negative_case, red_team_review, risk_factors, "
@@ -529,8 +529,10 @@ def sanitize_list(value: Any) -> list[str]:
 
 def assert_public_safe(payload: Any) -> None:
     text = json.dumps(payload, ensure_ascii=False, sort_keys=True) if not isinstance(payload, str) else payload
-    if FORBIDDEN_PUBLIC_RE.search(text):
-        raise ValueError("forbidden_public_content_detected")
+    match = FORBIDDEN_PUBLIC_RE.search(text)
+    if match:
+        token = re.sub(r"[^a-z0-9_ -]+", "", match.group(0).lower()).strip().replace(" ", "_")
+        raise ValueError(f"forbidden_public_content_detected:{token[:80] or 'unknown'}")
 
 
 def judge_symbol(symbol_payload: dict[str, Any]) -> tuple[str, list[str]]:
