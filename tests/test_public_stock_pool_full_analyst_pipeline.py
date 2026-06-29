@@ -198,6 +198,28 @@ def test_investment_advice_like_output_is_blocked(tmp_path: Path) -> None:
     assert "forbidden_public_content_detected" in status["blocked_symbols"][0]["reason"]
 
 
+def test_forbidden_public_content_reason_is_public_safe(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    payload = valid_payload()
+    payload["research_summary"] = "The output mentions stdout and should be blocked."
+
+    exit_code = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=StaticRunner(payload),
+        alaya_client=RecordingAlaya(),
+    )
+
+    status_path = cfg.output_dir / "status_full_analyst_evening_hk.json"
+    report_path = cfg.output_dir / "full_analyst_evening_hk_2026-06-29.md"
+    status = json.loads(status_path.read_text())
+    public_text = status_path.read_text() + "\n" + report_path.read_text()
+    assert exit_code == 2
+    assert status["blocked_symbols"][0]["reason"] == "forbidden_public_content_detected"
+    assert "stdout" not in public_text
+
+
 def test_public_artifacts_do_not_expose_forbidden_runtime_surfaces(tmp_path: Path) -> None:
     cfg = config(tmp_path)
 
