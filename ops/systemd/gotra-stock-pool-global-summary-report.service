@@ -1,5 +1,5 @@
 [Unit]
-Description=GOTRA public stock-pool morning/global report
+Description=GOTRA public stock-pool global summary report
 After=network-online.target gotra-public-api.service
 Wants=network-online.target
 

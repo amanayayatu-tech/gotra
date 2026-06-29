@@ -1,0 +1,10 @@
+[Unit]
+Description=Run GOTRA public stock-pool global summary report after US market close
+
+[Timer]
+OnCalendar=Tue..Sat *-*-* 10:30:00 Asia/Shanghai
+Persistent=true
+Unit=gotra-stock-pool-global-summary-report.service
+
+[Install]
+WantedBy=timers.target

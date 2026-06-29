@@ -1,14 +1,20 @@
 import argparse
+import json
 from datetime import date
 from pathlib import Path
 
+from scripts import public_stock_pool_report as report_module
 from scripts.public_stock_pool_report import (
     build_status,
     build_failure_status,
+    exchanges_for_mode,
     exit_code_for_status,
     mark_artifact_write_failure,
+    mode_slug,
     normalize_allowed_missing_symbols,
     resolve_exchange_dates,
+    target_universe_items,
+    write_outputs,
     yahoo_ticker,
 )
 
@@ -41,10 +47,97 @@ def test_evening_hk_keeps_us_on_previous_completed_session() -> None:
     assert dates.nyse_trading_date == date(2026, 6, 26)
 
 
+def test_morning_hk_uses_previous_completed_hk_session() -> None:
+    dates = resolve_exchange_dates(
+        mode="morning-hk",
+        as_of_date=date(2026, 6, 29),
+        trading_date=None,
+        us_trading_date=None,
+    )
+
+    assert dates.primary_trading_date == date(2026, 6, 26)
+    assert dates.hkex_trading_date == date(2026, 6, 26)
+    assert dates.nasdaq_trading_date == date(2026, 6, 26)
+    assert dates.nyse_trading_date == date(2026, 6, 26)
+
+
+def test_us_modes_use_previous_completed_us_session() -> None:
+    morning = resolve_exchange_dates(
+        mode="morning-us",
+        as_of_date=date(2026, 6, 29),
+        trading_date=None,
+        us_trading_date=None,
+    )
+    evening = resolve_exchange_dates(
+        mode="evening-us",
+        as_of_date=date(2026, 6, 30),
+        trading_date=None,
+        us_trading_date=None,
+    )
+
+    assert morning.primary_trading_date == date(2026, 6, 26)
+    assert morning.nasdaq_trading_date == date(2026, 6, 26)
+    assert morning.nyse_trading_date == date(2026, 6, 26)
+    assert evening.primary_trading_date == date(2026, 6, 29)
+    assert evening.nasdaq_trading_date == date(2026, 6, 29)
+    assert evening.nyse_trading_date == date(2026, 6, 29)
+
+
+def test_modes_select_expected_exchanges() -> None:
+    items = [
+        {"symbol": "0700", "exchange": "HKEX"},
+        {"symbol": "NVDA", "exchange": "NASDAQ"},
+        {"symbol": "UBER", "exchange": "NYSE"},
+    ]
+
+    assert exchanges_for_mode("morning-hk") == ("HKEX",)
+    assert exchanges_for_mode("evening-hk") == ("HKEX",)
+    assert exchanges_for_mode("morning-us") == ("NASDAQ", "NYSE")
+    assert exchanges_for_mode("evening-us") == ("NASDAQ", "NYSE")
+    assert exchanges_for_mode("morning-global") == ("HKEX", "NASDAQ", "NYSE")
+    assert [item["symbol"] for item in target_universe_items(items, exchanges_for_mode("morning-hk"))] == ["0700"]
+    assert [item["symbol"] for item in target_universe_items(items, exchanges_for_mode("morning-us"))] == ["NVDA", "UBER"]
+    assert [item["symbol"] for item in target_universe_items(items, exchanges_for_mode("morning-global"))] == [
+        "0700",
+        "NVDA",
+        "UBER",
+    ]
+
+
 def test_yahoo_ticker_maps_hkex_suffix_only() -> None:
     assert yahoo_ticker("0700", "HKEX") == "0700.HK"
     assert yahoo_ticker("NVDA", "NASDAQ") == "NVDA"
     assert yahoo_ticker("UBER", "NYSE") == "UBER"
+
+
+def test_fetch_one_retries_transient_provider_failure(monkeypatch) -> None:
+    calls = {"count": 0}
+
+    def fake_fetch_yahoo_adjusted_close(*_args, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("temporary provider failure")
+        return report_module.pd.DataFrame(
+            [
+                {"date": "2026-06-25", "adj_close": 99.0},
+                {"date": "2026-06-26", "adj_close": 100.0},
+            ]
+        )
+
+    monkeypatch.setattr(report_module, "fetch_yahoo_adjusted_close", fake_fetch_yahoo_adjusted_close)
+    dates = resolve_exchange_dates(
+        mode="morning-us",
+        as_of_date=date(2026, 6, 29),
+        trading_date=date(2026, 6, 26),
+        us_trading_date=None,
+    )
+
+    row = report_module.fetch_one({"symbol": "NVDA", "exchange": "NASDAQ"}, dates, fetch_retries=2)
+
+    assert row["ok"] is True
+    assert row["fetch_attempts"] == 2
+    assert calls["count"] == 2
+    assert row["one_session_change_pct"] == 1.0101
 
 
 def test_build_status_keeps_public_safe_metadata() -> None:
@@ -79,6 +172,9 @@ def test_build_status_keeps_public_safe_metadata() -> None:
     assert status["schema"] == "gotra.public_stock_pool_report.v1"
     assert status["ok"] is False
     assert status["run_status"] == "partial"
+    assert status["mode_label"] == "Global summary report"
+    assert status["mode_slug"] == "morning_global"
+    assert status["target_exchanges"] == ["HKEX", "NASDAQ", "NYSE"]
     assert status["universe_count"] == 3
     assert status["success_count"] == 2
     assert status["failed_count"] == 1
@@ -100,6 +196,70 @@ def test_build_status_keeps_public_safe_metadata() -> None:
     assert status["artifact_write_status"] == "ok"
     assert status["artifact_write_failure_reason"] is None
     assert "not investment advice" in status["boundary"]
+    assert mode_slug("evening-us") == "evening_us"
+
+
+def test_write_outputs_keeps_mode_specific_and_compatibility_aliases(tmp_path: Path) -> None:
+    dates = resolve_exchange_dates(
+        mode="morning-us",
+        as_of_date=date(2026, 6, 30),
+        trading_date=None,
+        us_trading_date=None,
+    )
+    items = [
+        {"symbol": "NVDA", "exchange": "NASDAQ"},
+        {"symbol": "UBER", "exchange": "NYSE"},
+    ]
+    results = [
+        {
+            "ok": True,
+            "symbol": "NVDA",
+            "exchange": "NASDAQ",
+            "provider_ticker": "NVDA",
+            "close_date": "2026-06-29",
+            "adj_close": 150.0,
+            "previous_date": "2026-06-26",
+            "previous_adj_close": 149.0,
+            "one_session_change_pct": 0.6711,
+        },
+        {
+            "ok": True,
+            "symbol": "UBER",
+            "exchange": "NYSE",
+            "provider_ticker": "UBER",
+            "close_date": "2026-06-29",
+            "adj_close": 90.0,
+            "previous_date": "2026-06-26",
+            "previous_adj_close": 91.0,
+            "one_session_change_pct": -1.0989,
+        },
+    ]
+
+    paths = write_outputs(
+        report_dir=tmp_path,
+        mode="morning-us",
+        as_of_date=date(2026, 6, 30),
+        exchange_dates=dates,
+        items=items,
+        results=results,
+        fetch_retries=2,
+    )
+
+    assert Path(paths["report_path"]).name == "public_stock_pool_morning_us_2026-06-29.md"
+    assert Path(paths["latest_path"]).name == "latest_morning_us.md"
+    assert Path(paths["status_path"]).name == "status_morning_us.json"
+    assert (tmp_path / "latest_morning_us.md").is_file()
+    assert (tmp_path / "status_morning_us.json").is_file()
+    assert (tmp_path / "latest.md").is_file()
+    assert (tmp_path / "status.json").is_file()
+    mode_status = json.loads((tmp_path / "status_morning_us.json").read_text(encoding="utf-8"))
+    compat_status = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+    assert mode_status == compat_status
+    assert mode_status["mode"] == "morning-us"
+    assert mode_status["target_exchanges"] == ["NASDAQ", "NYSE"]
+    assert mode_status["fetch_retries"] == 2
+    assert mode_status["status_file"] == "status_morning_us.json"
+    assert mode_status["compat_status_file"] == "status.json"
 
 
 def test_status_exit_zero_when_all_symbols_succeed() -> None:
