@@ -1,0 +1,10 @@
+[Unit]
+Description=GOTRA full-analyst candidate public-safe monitor
+After=network-online.target gotra-full-analyst-evening-hk-candidate.timer
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/gotra
+ExecStart=/root/.local/bin/uv run python scripts/full_analyst_candidate_monitor.py
+Nice=10
