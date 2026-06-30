@@ -454,6 +454,11 @@ def build_prompt(item: dict[str, str], price_row: dict[str, Any], config: FullAn
     retry_note = ""
     if attempt > 1:
         retry_note = f"\nRetry attempt {attempt}. Previous failure: {sanitize_text(last_error)[:160]}."
+        if last_error.startswith("forbidden_public_content_detected:"):
+            retry_note += (
+                " Remove the named public-safety trigger and rewrite that clause as neutral research context "
+                "without advice, target-price, trading-signal, raw-I/O, or secret wording."
+            )
     return (
         "Return STRICT JSON only. No markdown, no code fences, no commentary.\n"
         "Produce a public-safe analyst pilot summary with positive_case, negative_case, and red_team_review.\n"
@@ -604,6 +609,7 @@ def run_symbol(
             attempt_record["failure_reason"] = last_error
             attempts.append(public_attempt(attempt, last_error))
             write_private_attempt(config, item, attempt_record)
+    public_failure_category = public_safe_failure_category(last_error or "unknown_failure")
     return {
         "status": "failed",
         "symbol": item["symbol"],
@@ -611,7 +617,7 @@ def run_symbol(
         "provider_ticker": item["provider_ticker"],
         "price_coverage_status": "ok" if price_row.get("ok") else "data_gap",
         "judge_status": "blocked",
-        "judge_reasons": [last_error or "unknown_failure"],
+        "judge_reasons": [public_failure_category],
         "alaya_sync_status": "skipped",
         "alaya_sync_ref": "",
         "alaya_event_hash": "",
@@ -638,7 +644,9 @@ def normalize_failure_reason(exc: Exception) -> str:
     if text.startswith("forbidden_raw_io_keys"):
         return "forbidden_raw_io_keys_detected"
     if text.startswith("forbidden_public_content_detected"):
-        return "forbidden_public_content_detected"
+        category, _, token = text.partition(":")
+        token = public_safe_failure_category(token) if token else ""
+        return f"{category}:{token}" if token else category
     return f"{type(exc).__name__}: {text[:180]}"
 
 

@@ -13,6 +13,7 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     GotraInternalAlayaSyncClient,
     MockAlayaSyncClient,
     assert_public_safe,
+    build_prompt,
     run,
     update_loop_public_status,
 )
@@ -320,6 +321,21 @@ def test_negated_advice_disclaimer_does_not_trip_public_scanner() -> None:
             "boundary": list(BOUNDARY_LINES),
         }
     )
+
+
+def test_retry_prompt_names_forbidden_public_trigger_privately(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+
+    prompt = build_prompt(
+        universe()[0],
+        price_rows()["HKEX:0700"],
+        cfg,
+        attempt=2,
+        last_error="forbidden_public_content_detected:target_price",
+    )
+
+    assert "Previous failure: forbidden_public_content_detected:target_price" in prompt
+    assert "Remove the named public-safety trigger" in prompt
 
 
 def test_forbidden_public_content_reason_is_public_safe(tmp_path: Path) -> None:
