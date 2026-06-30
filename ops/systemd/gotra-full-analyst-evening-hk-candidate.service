@@ -1,0 +1,13 @@
+[Unit]
+Description=GOTRA full-analyst evening HK production candidate
+After=network-online.target gotra-public-api.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/gotra
+Environment=GOTRA_FULL_ANALYST_CANDIDATE_SERVICE=gotra-full-analyst-evening-hk-candidate.service
+Environment=GOTRA_FULL_ANALYST_CANDIDATE_TIMER=gotra-full-analyst-evening-hk-candidate.timer
+ExecStart=/bin/bash -lc 'set -euo pipefail; AS_OF=$(TZ=Asia/Shanghai date +%%F); RUN_ID=full_analyst_evening_hk_candidate_$(TZ=Asia/Shanghai date +%%Y%%m%%dT%%H%%M%%S%%z); exec /root/.local/bin/uv run python scripts/public_stock_pool_full_analyst_pipeline.py --mode full-analyst-evening-hk-test --run-id "$RUN_ID" --output-dir /opt/gotra/data/reports/full_analyst_candidate --private-audit-root /opt/gotra/data/private/full_analyst_runs/production_candidate --publish-static --as-of-date "$AS_OF" --universe-url local --all-symbols --llm-runner codex-cli --model gpt-5.5 --reasoning-effort high --alaya-mode real --max-concurrency 3 --per-symbol-timeout-seconds 300 --retries 1 --heartbeat-interval-seconds 60 --candidate-service gotra-full-analyst-evening-hk-candidate.service --candidate-timer gotra-full-analyst-evening-hk-candidate.timer'
+TimeoutStartSec=7200
+Nice=10
