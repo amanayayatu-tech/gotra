@@ -178,9 +178,19 @@ def test_build_status_keeps_public_safe_metadata() -> None:
     assert status["universe_count"] == 3
     assert status["success_count"] == 2
     assert status["failed_count"] == 1
+    assert status["data_gap_count"] == 0
     assert status["allowed_missing_symbols"] == []
     assert status["allowed_missing_count"] == 0
     assert status["unexpected_failed_count"] == 1
+    assert status["data_gap_symbols"] == []
+    assert status["unexpected_failed_symbols"] == [
+        {
+            "exchange": "NYSE",
+            "symbol": "UBER",
+            "provider_ticker": "UBER",
+            "reason": "missing",
+        }
+    ]
     assert status["exit_status"] == 2
     assert exit_code_for_status(status) == 2
     assert status["by_exchange"]["NYSE"]["failed"] == 1
@@ -292,7 +302,7 @@ def test_status_exit_zero_when_all_symbols_succeed() -> None:
     assert exit_code_for_status(status) == 0
 
 
-def test_allowed_provider_gap_keeps_partial_status_but_exit_zero() -> None:
+def test_allowed_provider_gap_records_data_gap_and_exits_zero() -> None:
     dates = resolve_exchange_dates(
         mode="morning-global",
         as_of_date=date(2026, 6, 28),
@@ -330,12 +340,108 @@ def test_allowed_provider_gap_keeps_partial_status_but_exit_zero() -> None:
     assert status["ok"] is False
     assert status["run_status"] == "completed_with_allowed_data_gaps"
     assert status["failed_count"] == 1
+    assert status["data_gap_count"] == 1
     assert status["allowed_missing_symbols"] == ["0501.HK", "HKEX:0501"]
     assert status["allowed_missing_count"] == 1
     assert status["unexpected_failed_count"] == 0
+    assert status["data_gap_symbols"] == [
+        {
+            "exchange": "HKEX",
+            "symbol": "0501",
+            "provider_ticker": "0501.HK",
+            "reason": "empty_price_frame",
+        }
+    ]
+    assert status["unexpected_failed_symbols"] == []
     assert status["failed_symbols"][0]["reason"] == "empty_price_frame"
     assert status["exit_status"] == 0
     assert exit_code_for_status(status) == 0
+
+
+def test_us_evening_allowed_cwan_close_gap_exits_zero() -> None:
+    dates = resolve_exchange_dates(
+        mode="evening-us",
+        as_of_date=date(2026, 6, 30),
+        trading_date=date(2026, 6, 29),
+        us_trading_date=None,
+    )
+    items = [
+        {"symbol": "CWAN", "exchange": "NYSE"},
+        {"symbol": "NVDA", "exchange": "NASDAQ"},
+    ]
+    results = [
+        {
+            "ok": False,
+            "symbol": "CWAN",
+            "exchange": "NYSE",
+            "provider_ticker": "CWAN",
+            "reason": "trading_date_close_missing",
+            "close_date": "2026-06-29",
+        },
+        {"ok": True, "symbol": "NVDA", "exchange": "NASDAQ", "provider_ticker": "NVDA"},
+    ]
+
+    status = build_status(
+        mode="evening-us",
+        as_of_date=date(2026, 6, 30),
+        exchange_dates=dates,
+        items=items,
+        results=results,
+        report_path=Path("public_stock_pool_evening_us_2026-06-29.md"),
+        latest_path=Path("latest_evening_us.md"),
+        status_path=Path("status_evening_us.json"),
+        allowed_missing_symbols=normalize_allowed_missing_symbols(["NYSE:CWAN"]),
+    )
+
+    assert status["run_status"] == "completed_with_allowed_data_gaps"
+    assert status["exit_status"] == 0
+    assert status["data_gap_count"] == 1
+    assert status["unexpected_failed_count"] == 0
+    assert status["data_gap_symbols"] == [
+        {
+            "exchange": "NYSE",
+            "symbol": "CWAN",
+            "provider_ticker": "CWAN",
+            "reason": "trading_date_close_missing",
+        }
+    ]
+
+
+def test_allowed_data_gap_markdown_is_publicly_explicit(tmp_path: Path) -> None:
+    dates = resolve_exchange_dates(
+        mode="evening-us",
+        as_of_date=date(2026, 6, 30),
+        trading_date=date(2026, 6, 29),
+        us_trading_date=None,
+    )
+    items = [{"symbol": "CWAN", "exchange": "NYSE"}]
+    results = [
+        {
+            "ok": False,
+            "symbol": "CWAN",
+            "exchange": "NYSE",
+            "provider_ticker": "CWAN",
+            "reason": "trading_date_close_missing",
+            "close_date": "2026-06-29",
+        }
+    ]
+
+    paths = write_outputs(
+        report_dir=tmp_path,
+        mode="evening-us",
+        as_of_date=date(2026, 6, 30),
+        exchange_dates=dates,
+        items=items,
+        results=results,
+        allowed_missing_symbols=normalize_allowed_missing_symbols(["NYSE:CWAN"]),
+    )
+
+    status = paths["status"]
+    markdown = Path(paths["latest_path"]).read_text(encoding="utf-8")
+    assert status["run_status"] == "completed_with_allowed_data_gaps"
+    assert "## Allowed Data Gaps" in markdown
+    assert "- run_status: completed_with_allowed_data_gaps" in markdown
+    assert "| NYSE | CWAN | CWAN | trading_date_close_missing |" in markdown
 
 
 def test_unexpected_provider_gap_exits_two() -> None:
@@ -372,8 +478,18 @@ def test_unexpected_provider_gap_exits_two() -> None:
     assert status["ok"] is False
     assert status["run_status"] == "partial"
     assert status["failed_count"] == 1
+    assert status["data_gap_count"] == 0
     assert status["allowed_missing_count"] == 0
     assert status["unexpected_failed_count"] == 1
+    assert status["data_gap_symbols"] == []
+    assert status["unexpected_failed_symbols"] == [
+        {
+            "exchange": "NYSE",
+            "symbol": "UBER",
+            "provider_ticker": "UBER",
+            "reason": "empty_price_frame",
+        }
+    ]
     assert status["exit_status"] == 2
     assert exit_code_for_status(status) == 2
 
@@ -398,6 +514,8 @@ def test_failure_status_records_write_reason_without_failed_symbols(tmp_path: Pa
     assert status["exit_status"] == 2
     assert status["failed_symbols"] == []
     assert status["missing_symbols"] == []
+    assert status["data_gap_symbols"] == []
+    assert status["unexpected_failed_symbols"] == []
 
 
 def test_mark_artifact_write_failure_preserves_symbol_failures() -> None:

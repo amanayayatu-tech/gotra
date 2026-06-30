@@ -472,17 +472,13 @@ def build_status(
     failures = [row for row in results if not row.get("ok")]
     exchanges = exchanges_for_mode(mode)
     allowed_missing = tuple(sorted(set(normalize_allowed_missing_symbols(allowed_missing_symbols))))
-    failed_symbols = [
-        {
-            "exchange": row["exchange"],
-            "symbol": row["symbol"],
-            "provider_ticker": row["provider_ticker"],
-            "reason": row.get("reason", "unknown"),
-        }
-        for row in failures
-    ]
-    allowed_missing_count = sum(1 for row in failures if is_allowed_missing_failure(row, allowed_missing))
-    unexpected_failed_count = len(failures) - allowed_missing_count
+    failed_symbols = [failure_record(row) for row in failures]
+    allowed_missing_failures = [row for row in failures if is_allowed_missing_failure(row, allowed_missing)]
+    unexpected_failures = [row for row in failures if row not in allowed_missing_failures]
+    data_gap_symbols = [failure_record(row) for row in allowed_missing_failures]
+    unexpected_failed_symbols = [failure_record(row) for row in unexpected_failures]
+    allowed_missing_count = len(data_gap_symbols)
+    unexpected_failed_count = len(unexpected_failed_symbols)
     run_status = "completed"
     if failures and unexpected_failed_count == 0:
         run_status = "completed_with_allowed_data_gaps"
@@ -510,9 +506,12 @@ def build_status(
         "universe_count": len(items),
         "success_count": len(successes),
         "failed_count": len(failures),
+        "data_gap_count": allowed_missing_count,
         "allowed_missing_symbols": list(allowed_missing),
         "allowed_missing_count": allowed_missing_count,
         "unexpected_failed_count": unexpected_failed_count,
+        "data_gap_symbols": data_gap_symbols,
+        "unexpected_failed_symbols": unexpected_failed_symbols,
         "by_exchange": {
             exchange: {
                 "universe": sum(1 for item in items if item["exchange"] == exchange),
@@ -541,6 +540,15 @@ def build_status(
     return status
 
 
+def failure_record(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "exchange": row["exchange"],
+        "symbol": row["symbol"],
+        "provider_ticker": row["provider_ticker"],
+        "reason": row.get("reason", "unknown"),
+    }
+
+
 def build_failure_status(*, args: argparse.Namespace, exc: Exception, stage: str) -> dict[str, Any]:
     as_of = failure_as_of_date(args.as_of_date)
     status_path = mode_status_path(args.report_dir, args.mode)
@@ -561,9 +569,12 @@ def build_failure_status(*, args: argparse.Namespace, exc: Exception, stage: str
         "universe_count": 0,
         "success_count": 0,
         "failed_count": 0,
+        "data_gap_count": 0,
         "allowed_missing_symbols": list(normalize_allowed_missing_symbols(getattr(args, "allowed_missing_symbol", []))),
         "allowed_missing_count": 0,
         "unexpected_failed_count": 0,
+        "data_gap_symbols": [],
+        "unexpected_failed_symbols": [],
         "by_exchange": {},
         "missing_symbols": [],
         "failed_symbols": [],
@@ -711,9 +722,13 @@ def render_markdown(*, status: dict[str, Any], results: list[dict[str, Any]]) ->
         f"- reason: {status['reason']}",
         f"- session_status: {status['session_status']}",
         f"- generated_at_utc: {status['generated_at_utc']}",
+        f"- run_status: {status['run_status']}",
         f"- universe_count: {status['universe_count']}",
         f"- success_count: {status['success_count']}",
         f"- failed_count: {status['failed_count']}",
+        f"- data_gap_count: {status.get('data_gap_count', 0)}",
+        f"- allowed_missing_count: {status['allowed_missing_count']}",
+        f"- unexpected_failed_count: {status['unexpected_failed_count']}",
         f"- source: {status['source']}",
         "",
         "## Public Safety Boundary",
@@ -736,6 +751,23 @@ def render_markdown(*, status: dict[str, Any], results: list[dict[str, Any]]) ->
             f"| {exchange} | {values['trading_date']} | {values['universe']} | "
             f"{values['success']} | {values['failed']} |"
         )
+
+    data_gap_symbols = status.get("data_gap_symbols") or []
+    if data_gap_symbols:
+        lines.extend(
+            [
+                "",
+                "## Allowed Data Gaps",
+                "",
+                "These provider coverage gaps are recorded explicitly and do not make the service fail.",
+                "",
+                "| Exchange | Symbol | Provider Ticker | Reason |",
+                "|---|---:|---|---|",
+            ]
+        )
+        for row in data_gap_symbols:
+            reason = str(row.get("reason", "unknown")).replace("|", "/")
+            lines.append(f"| {row['exchange']} | {row['symbol']} | {row['provider_ticker']} | {reason} |")
 
     if failures:
         lines.extend(
