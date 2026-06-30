@@ -1,0 +1,11 @@
+[Unit]
+Description=Run GOTRA full-analyst candidate public-safe monitor
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=gotra-full-analyst-candidate-monitor.service
+
+[Install]
+WantedBy=timers.target
