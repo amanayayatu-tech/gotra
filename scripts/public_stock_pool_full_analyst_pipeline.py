@@ -761,16 +761,15 @@ def run_jobs(
     *,
     started_at_utc: str,
 ) -> list[dict[str, Any]]:
+    sample_symbols = tuple(f"{item['exchange']}:{item['symbol']}" for item in items)
     if config.max_concurrency == 1:
         results = []
         for item in items:
-            write_heartbeat(
+            refresh_loop_runtime_heartbeat(
                 config,
-                status="running",
                 phase="llm",
-                current_cycle=config.loop_current_cycle,
-                last_successful_cycle=config.loop_last_successful_cycle,
                 started_at_utc=started_at_utc,
+                sample_symbols=sample_symbols,
             )
             results.append(
                 run_symbol(
@@ -784,11 +783,23 @@ def run_jobs(
         return results
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=config.max_concurrency) as executor:
+        refresh_loop_runtime_heartbeat(
+            config,
+            phase="llm",
+            started_at_utc=started_at_utc,
+            sample_symbols=sample_symbols,
+        )
         futures = {
             executor.submit(run_symbol, item, price_rows[f"{item['exchange']}:{item['symbol']}"], config, runner, alaya_client): item
             for item in items
         }
         for future in as_completed(futures):
+            refresh_loop_runtime_heartbeat(
+                config,
+                phase="llm",
+                started_at_utc=started_at_utc,
+                sample_symbols=sample_symbols,
+            )
             results.append(future.result())
     return sorted(results, key=lambda row: (str(row["exchange"]), str(row["symbol"])))
 
@@ -1500,6 +1511,33 @@ def update_loop_public_status(
         publish_static(report_path, status_path, config.static_dir)
 
 
+def refresh_loop_runtime_heartbeat(
+    config: FullAnalystConfig,
+    *,
+    phase: str,
+    started_at_utc: str,
+    sample_symbols: tuple[str, ...] | None = None,
+) -> None:
+    write_heartbeat(
+        config,
+        status="running",
+        phase=phase,
+        current_cycle=config.loop_current_cycle,
+        last_successful_cycle=config.loop_last_successful_cycle,
+        started_at_utc=started_at_utc,
+    )
+    if config.mode in LOOP_MODES:
+        update_loop_public_status(
+            config,
+            current_cycle=config.loop_current_cycle,
+            last_successful_cycle=config.loop_last_successful_cycle,
+            loop_status="running",
+            phase=phase,
+            started_at_utc=started_at_utc,
+            sample_symbols=sample_symbols,
+        )
+
+
 def run_loop(config: FullAnalystConfig) -> int:
     loop_started = time.monotonic()
     loop_started_at_utc = utc_now_iso()
@@ -1554,7 +1592,7 @@ def run_loop(config: FullAnalystConfig) -> int:
             started_at_utc=loop_started_at_utc,
             sample_symbols=cycle_symbols,
         )
-        last_exit = run(cycle_config)
+        last_exit = run(cycle_config, loop_started_at_utc=loop_started_at_utc)
         if last_exit == 0:
             last_successful_cycle = current_cycle
         category = None if last_exit == 0 else "cycle_failed"
@@ -1615,9 +1653,11 @@ def run(
     runner: AnalystRunner | None = None,
     alaya_client: AlayaSyncClient | None = None,
     price_rows: dict[str, dict[str, Any]] | None = None,
+    loop_started_at_utc: str | None = None,
 ) -> int:
     started = time.monotonic()
     started_at_utc = utc_now_iso()
+    heartbeat_started_at_utc = loop_started_at_utc or started_at_utc
     ensure_private_dir(private_run_dir(config))
     report_path, status_path = report_paths(config)
     write_heartbeat(
@@ -1626,7 +1666,7 @@ def run(
         phase="preflight",
         current_cycle=config.loop_current_cycle,
         last_successful_cycle=config.loop_last_successful_cycle,
-        started_at_utc=started_at_utc,
+        started_at_utc=heartbeat_started_at_utc,
     )
     append_event(config, "run_started", {"status": "running", "mode": config.mode})
     try:
@@ -1642,7 +1682,7 @@ def run(
         phase="cycle",
         current_cycle=config.loop_current_cycle,
         last_successful_cycle=config.loop_last_successful_cycle,
-        started_at_utc=started_at_utc,
+        started_at_utc=heartbeat_started_at_utc,
     )
     resolved_price_rows = fetch_price_rows(items, config, price_rows)
     write_heartbeat(
@@ -1651,7 +1691,7 @@ def run(
         phase="llm",
         current_cycle=config.loop_current_cycle,
         last_successful_cycle=config.loop_last_successful_cycle,
-        started_at_utc=started_at_utc,
+        started_at_utc=heartbeat_started_at_utc,
     )
     active_runner = runner or runner_from_config(config)
     results = run_jobs(
@@ -1660,7 +1700,7 @@ def run(
         config,
         active_runner,
         active_alaya,
-        started_at_utc=started_at_utc,
+        started_at_utc=heartbeat_started_at_utc,
     )
     status = build_status(
         config=config,
@@ -1691,7 +1731,7 @@ def run(
             phase="scan",
             current_cycle=config.loop_current_cycle,
             last_successful_cycle=config.loop_last_successful_cycle,
-            started_at_utc=started_at_utc,
+            started_at_utc=heartbeat_started_at_utc,
             last_error_category=category,
         )
         append_event(config, "public_scan_failed", {"status": "failed", "reason": category})
@@ -1716,7 +1756,7 @@ def run(
             phase="artifact",
             current_cycle=config.loop_current_cycle,
             last_successful_cycle=config.loop_last_successful_cycle,
-            started_at_utc=started_at_utc,
+            started_at_utc=heartbeat_started_at_utc,
             last_error_category=category,
         )
         append_event(config, "artifact_write_failed", {"status": "failed", "reason": category})
@@ -1733,7 +1773,7 @@ def run(
         phase="completed",
         current_cycle=config.loop_current_cycle,
         last_successful_cycle=heartbeat_last_successful_cycle,
-        started_at_utc=started_at_utc,
+        started_at_utc=heartbeat_started_at_utc,
         last_error_category=status.get("last_error_category"),
     )
     append_event(config, "run_finished", {"status": runtime_summary["status"], "event_hash": stable_hash(runtime_summary)})
