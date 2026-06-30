@@ -60,5 +60,6 @@ future candidate runs.
 
 ## Evidence Boundary
 
-This rollback surface is operational control for a production canary. It is not
-science/public proof, performance proof, a trading signal, or investment advice.
+This rollback surface is operational control for a production canary. It only
+documents how an operator stops or slows the candidate timer; it does not
+evaluate model quality or recommend any market action.
