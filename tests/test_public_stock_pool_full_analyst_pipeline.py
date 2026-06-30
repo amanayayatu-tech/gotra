@@ -14,7 +14,10 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     MockAlayaSyncClient,
     assert_public_safe,
     build_prompt,
+    config_from_args,
+    parse_args,
     run,
+    selected_universe,
     update_loop_public_status,
 )
 
@@ -191,12 +194,53 @@ def test_fixture_run_writes_independent_public_and_static_artifacts(tmp_path: Pa
     assert status["publish_count"] == 2
     assert status["needs_review_count"] == 1
     assert status["data_gap_count"] == 1
+    assert status["max_concurrency"] == 1
+    assert "candidate_service" in status
+    assert "candidate_timer" in status
+    assert status["candidate_service"] is None
+    assert status["candidate_timer"] is None
+    assert status["symbol_count"] == 3
+    assert status["exchange_counts"] == {"HKEX": 3}
+    assert status["symbol_hash"]
+    assert status["stage_statuses"]["data_fetch"] == "data_gap"
+    assert status["stage_statuses"]["judge_gate"] == "needs_review"
+    assert status["stage_statuses"]["public_safety_scan"] == "ok"
     assert status["alaya_synced_count"] == 2
     assert status["provider_model_io_embedded"] is False
     assert "local checks + one-shot runtime smoke" in status["evidence_layer"]
     assert (cfg.private_audit_root / cfg.run_id / "heartbeat.json").exists()
     assert (cfg.private_audit_root / cfg.run_id / "events.jsonl").exists()
     assert (cfg.private_audit_root / cfg.run_id / "cycle_001_summary.json").exists()
+
+
+def test_all_symbols_config_selects_entire_public_universe() -> None:
+    args = parse_args(
+        [
+            "--mode",
+            MODE,
+            "--all-symbols",
+            "--candidate-service",
+            "gotra-full-analyst-evening-hk-candidate.service",
+            "--candidate-timer",
+            "gotra-full-analyst-evening-hk-candidate.timer",
+            "--max-concurrency",
+            "3",
+        ]
+    )
+
+    cfg = config_from_args(args)
+    selected = selected_universe(universe(), cfg.symbols)
+
+    assert cfg.all_symbols is True
+    assert cfg.symbols == ()
+    assert cfg.max_concurrency == 3
+    assert cfg.candidate_service == "gotra-full-analyst-evening-hk-candidate.service"
+    assert cfg.candidate_timer == "gotra-full-analyst-evening-hk-candidate.timer"
+    assert [f"{item['exchange']}:{item['symbol']}" for item in selected] == [
+        "HKEX:0700",
+        "HKEX:9988",
+        "HKEX:0501",
+    ]
 
 
 def test_all_publish_exits_zero_with_real_alaya_readback_verified(tmp_path: Path) -> None:

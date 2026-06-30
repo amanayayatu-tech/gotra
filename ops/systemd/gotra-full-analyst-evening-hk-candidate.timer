@@ -1,0 +1,10 @@
+[Unit]
+Description=Run GOTRA full-analyst evening HK production candidate
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 19:30:00 Asia/Shanghai
+Persistent=true
+Unit=gotra-full-analyst-evening-hk-candidate.service
+
+[Install]
+WantedBy=timers.target

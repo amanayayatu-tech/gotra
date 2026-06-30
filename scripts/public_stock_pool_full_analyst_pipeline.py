@@ -141,6 +141,9 @@ class FullAnalystConfig:
     heartbeat_interval_seconds: int
     loop_duration_seconds: int
     sample_cadence_seconds: int
+    all_symbols: bool = False
+    candidate_service: str | None = None
+    candidate_timer: str | None = None
     loop_current_cycle: int = 1
     loop_last_successful_cycle: int = 0
 
@@ -309,6 +312,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--trading-date", default="")
     parser.add_argument("--universe-url", default="local")
     parser.add_argument("--symbol", action="append", default=[])
+    parser.add_argument("--all-symbols", action="store_true", help="Run every symbol from the public research universe.")
     parser.add_argument("--llm-runner", choices=("codex-cli", "fixture"), default=os.getenv("GOTRA_FULL_ANALYST_LLM_RUNNER", "codex-cli"))
     parser.add_argument("--alaya-mode", choices=("mock", "off", "real"), default="mock")
     parser.add_argument("--max-concurrency", type=int, default=1)
@@ -320,6 +324,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--heartbeat-interval-seconds", type=int, default=300)
     parser.add_argument("--loop-duration-seconds", type=int, default=36000)
     parser.add_argument("--sample-cadence-seconds", type=int, default=1800)
+    parser.add_argument("--candidate-service", default=os.getenv("GOTRA_FULL_ANALYST_CANDIDATE_SERVICE", ""))
+    parser.add_argument("--candidate-timer", default=os.getenv("GOTRA_FULL_ANALYST_CANDIDATE_TIMER", ""))
     return parser.parse_args(argv)
 
 
@@ -329,6 +335,7 @@ def config_from_args(args: argparse.Namespace) -> FullAnalystConfig:
     is_loop = str(args.mode) in LOOP_MODES
     output_dir = args.output_dir if args.output_dir is not None else (DEFAULT_LOOP_OUTPUT_DIR if is_loop else DEFAULT_OUTPUT_DIR)
     run_id = str(args.run_id or (DEFAULT_LOOP_RUN_ID if is_loop else DEFAULT_RUN_ID))
+    selected_symbols = () if bool(args.all_symbols) else tuple(normalize_symbol_key(value) for value in (args.symbol or list(DEFAULT_SYMBOLS)))
     return FullAnalystConfig(
         run_id=run_id,
         mode=str(args.mode),
@@ -339,7 +346,7 @@ def config_from_args(args: argparse.Namespace) -> FullAnalystConfig:
         as_of_date=as_of_date,
         trading_date=trading_date,
         universe_url=str(args.universe_url),
-        symbols=tuple(normalize_symbol_key(value) for value in (args.symbol or list(DEFAULT_SYMBOLS))),
+        symbols=selected_symbols,
         llm_runner=str(args.llm_runner),
         alaya_mode=str(args.alaya_mode),
         max_concurrency=max(1, int(args.max_concurrency)),
@@ -351,6 +358,9 @@ def config_from_args(args: argparse.Namespace) -> FullAnalystConfig:
         heartbeat_interval_seconds=max(60, int(args.heartbeat_interval_seconds)),
         loop_duration_seconds=max(0, int(args.loop_duration_seconds)),
         sample_cadence_seconds=max(60, int(args.sample_cadence_seconds)),
+        all_symbols=bool(args.all_symbols),
+        candidate_service=str(args.candidate_service or "") or None,
+        candidate_timer=str(args.candidate_timer or "") or None,
     )
 
 
@@ -382,6 +392,8 @@ def load_public_universe(config: FullAnalystConfig) -> list[dict[str, str]]:
 
 
 def selected_universe(universe: list[dict[str, str]], symbols: tuple[str, ...]) -> list[dict[str, str]]:
+    if not symbols:
+        return list(universe)
     by_key = {f"{item['exchange']}:{item['symbol']}": item for item in universe}
     selected: list[dict[str, str]] = []
     missing: list[str] = []
@@ -854,6 +866,8 @@ def build_status(
     last_error_category = first_error_category(failed, blocked, alaya_failed, alaya_readback_failed)
     current_cycle = max(1, config.loop_current_cycle)
     last_successful_cycle = current_cycle if exit_status == 0 else config.loop_last_successful_cycle
+    selected_symbol_keys = symbol_keys_from_results(results)
+    exchange_counts = exchange_counts_from_results(results)
     status = {
         "schema": STATUS_SCHEMA,
         "ok": exit_status == 0,
@@ -866,8 +880,11 @@ def build_status(
         "last_successful_cycle": last_successful_cycle,
         "as_of_date": config.as_of_date.isoformat(),
         "trading_date": config.trading_date.isoformat(),
-        "sample_symbols": list(config.symbols),
+        "sample_symbols": selected_symbol_keys,
         "universe_count": len(results),
+        "symbol_count": len(results),
+        "exchange_counts": exchange_counts,
+        "symbol_hash": stable_hash(selected_symbol_keys),
         "success_count": sum(1 for row in results if row["status"] == "success"),
         "failed_count": len(failed),
         "publish_count": len(publish),
@@ -891,10 +908,14 @@ def build_status(
         "consecutive_failures": 1 if exit_status else 0,
         "llm_runner": config.llm_runner,
         "llm_model": config.model,
+        "max_concurrency": config.max_concurrency,
         "reasoning_effort": config.reasoning_effort,
         "timeout_seconds": config.per_symbol_timeout_seconds,
         "retries": config.retries,
         "alaya_mode": config.alaya_mode,
+        "candidate_service": config.candidate_service,
+        "candidate_timer": config.candidate_timer,
+        "rollback_hint": rollback_hint(config),
         "prompt_template_version": PROMPT_TEMPLATE_VERSION,
         "boundary": list(BOUNDARY_LINES),
         "report_file": report_path.name,
@@ -916,8 +937,59 @@ def build_status(
             "not investment advice",
         ],
     }
+    status["stage_statuses"] = stage_statuses_for_status(status, publish_static=config.publish_static)
     status["exit_status"] = exit_status
     return status
+
+
+def symbol_keys_from_results(results: list[dict[str, Any]]) -> list[str]:
+    return [
+        f"{row['exchange']}:{row['symbol']}"
+        for row in sorted(results, key=lambda row: (str(row["exchange"]), str(row["symbol"])))
+    ]
+
+
+def exchange_counts_from_results(results: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in results:
+        exchange = str(row["exchange"])
+        counts[exchange] = counts.get(exchange, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def exchange_counts_from_symbol_keys(symbols: tuple[str, ...] | list[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for key in symbols:
+        exchange, _, _symbol = str(key).partition(":")
+        if not exchange:
+            continue
+        counts[exchange] = counts.get(exchange, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def stage_statuses_for_status(status: dict[str, Any], *, publish_static: bool) -> dict[str, str]:
+    data_gap_count = int(status.get("data_gap_count") or 0)
+    failed_count = int(status.get("failed_count") or 0)
+    blocked_count = int(status.get("blocked_count") or 0)
+    needs_review_count = int(status.get("needs_review_count") or 0)
+    return {
+        "data_fetch": "data_gap" if data_gap_count else "ok",
+        "llm_analyst": "failed" if failed_count else "ok",
+        "judge_gate": "blocked" if blocked_count else "needs_review" if needs_review_count else "ok",
+        "alaya_sync": str(status.get("alaya_sync_status") or "not_reported"),
+        "alaya_readback": str(status.get("alaya_readback_status") or "not_reported"),
+        "public_safety_scan": str(status.get("public_scan_status") or "not_reported"),
+        "artifact_write": str(status.get("artifact_write_status") or "not_reported"),
+        "public_publish": "published" if publish_static else "local_only",
+    }
+
+
+def rollback_hint(config: FullAnalystConfig) -> str | None:
+    if not config.candidate_service and not config.candidate_timer:
+        return None
+    service = config.candidate_service or "gotra-full-analyst-evening-hk-candidate.service"
+    timer = config.candidate_timer or "gotra-full-analyst-evening-hk-candidate.timer"
+    return f"disable {timer}/{service}, or edit the candidate service to max_concurrency=1 and daemon-reload"
 
 
 def failure_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1064,10 +1136,18 @@ def render_markdown(status: dict[str, Any], results: list[dict[str, Any]]) -> st
         f"- last_heartbeat_utc: {status['last_heartbeat_utc']}",
         f"- trading_date: {status['trading_date']}",
         f"- universe_count: {status['universe_count']}",
+        f"- exchange_counts: {json.dumps(status.get('exchange_counts', {}), sort_keys=True)}",
+        f"- symbol_hash: {status.get('symbol_hash')}",
+        f"- llm_runner: {status['llm_runner']}",
+        f"- llm_model: {status['llm_model']}",
+        f"- max_concurrency: {status.get('max_concurrency')}",
+        f"- candidate_service: {status.get('candidate_service') or 'not_reported'}",
+        f"- candidate_timer: {status.get('candidate_timer') or 'not_reported'}",
         f"- publish_count: {status['publish_count']}",
         f"- needs_review_count: {status['needs_review_count']}",
         f"- blocked_count: {status['blocked_count']}",
         f"- failed_count: {status['failed_count']}",
+        f"- data_gap_count: {status['data_gap_count']}",
         f"- alaya_synced_count: {status['alaya_synced_count']}",
         f"- alaya_failed_count: {status['alaya_failed_count']}",
         f"- alaya_readback_verified_count: {status['alaya_readback_verified_count']}",
@@ -1076,6 +1156,10 @@ def render_markdown(status: dict[str, Any], results: list[dict[str, Any]]) -> st
         f"- alaya_sync_status: {status['alaya_sync_status']}",
         f"- alaya_readback_status: {status['alaya_readback_status']}",
         f"- public_scan_status: {status['public_scan_status']}",
+        "",
+        "## Stage Statuses",
+        "",
+        *[f"- {key}: {value}" for key, value in status.get("stage_statuses", {}).items()],
         "",
         "## Boundary",
         "",
@@ -1266,6 +1350,9 @@ def write_blocker_status(config: FullAnalystConfig, *, started_at_utc: str, reas
         "trading_date": config.trading_date.isoformat(),
         "sample_symbols": list(config.symbols),
         "universe_count": 0,
+        "symbol_count": 0,
+        "exchange_counts": {},
+        "symbol_hash": stable_hash(list(config.symbols)),
         "success_count": 0,
         "failed_count": 0,
         "publish_count": 0,
@@ -1289,10 +1376,14 @@ def write_blocker_status(config: FullAnalystConfig, *, started_at_utc: str, reas
         "consecutive_failures": 1,
         "llm_runner": config.llm_runner,
         "llm_model": config.model,
+        "max_concurrency": config.max_concurrency,
         "reasoning_effort": config.reasoning_effort,
         "timeout_seconds": config.per_symbol_timeout_seconds,
         "retries": config.retries,
         "alaya_mode": config.alaya_mode,
+        "candidate_service": config.candidate_service,
+        "candidate_timer": config.candidate_timer,
+        "rollback_hint": rollback_hint(config),
         "prompt_template_version": PROMPT_TEMPLATE_VERSION,
         "boundary": list(BOUNDARY_LINES),
         "report_file": report_path.name,
@@ -1309,6 +1400,7 @@ def write_blocker_status(config: FullAnalystConfig, *, started_at_utc: str, reas
         "limitations": ["not 10h evidence", "not formal acceptance", "not science/public proof", "not performance proof", "not a trading signal", "not investment advice"],
         "exit_status": 2,
     }
+    failed["stage_statuses"] = stage_statuses_for_status(failed, publish_static=config.publish_static)
     write_heartbeat(config, status="failed", phase="preflight", current_cycle=0, last_successful_cycle=0, started_at_utc=started_at_utc, last_error_category=category)
     append_event(config, "blocker", {"status": "failed", "reason": category})
     config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1366,7 +1458,7 @@ def build_loop_running_status(
     report_path, status_path = report_paths(config)
     started = datetime.fromisoformat(started_at_utc.replace("Z", "+00:00"))
     elapsed = max(0, int((datetime.now(UTC) - started).total_seconds()))
-    return {
+    status = {
         "schema": STATUS_SCHEMA,
         "ok": True,
         "run_status": "running" if loop_status == "running" else loop_status,
@@ -1380,6 +1472,9 @@ def build_loop_running_status(
         "trading_date": config.trading_date.isoformat(),
         "sample_symbols": list(sample_symbols),
         "universe_count": len(sample_symbols),
+        "symbol_count": len(sample_symbols),
+        "exchange_counts": exchange_counts_from_symbol_keys(sample_symbols),
+        "symbol_hash": stable_hash(list(sample_symbols)),
         "success_count": 0,
         "failed_count": 0,
         "publish_count": 0,
@@ -1403,10 +1498,14 @@ def build_loop_running_status(
         "consecutive_failures": 1 if last_error_category else 0,
         "llm_runner": config.llm_runner,
         "llm_model": config.model,
+        "max_concurrency": config.max_concurrency,
         "reasoning_effort": config.reasoning_effort,
         "timeout_seconds": config.per_symbol_timeout_seconds,
         "retries": config.retries,
         "alaya_mode": config.alaya_mode,
+        "candidate_service": config.candidate_service,
+        "candidate_timer": config.candidate_timer,
+        "rollback_hint": rollback_hint(config),
         "prompt_template_version": PROMPT_TEMPLATE_VERSION,
         "boundary": list(BOUNDARY_LINES),
         "report_file": report_path.name,
@@ -1429,6 +1528,8 @@ def build_loop_running_status(
         ],
         "exit_status": None,
     }
+    status["stage_statuses"] = stage_statuses_for_status(status, publish_static=config.publish_static)
+    return status
 
 
 def render_loop_running_markdown(status: dict[str, Any]) -> str:
