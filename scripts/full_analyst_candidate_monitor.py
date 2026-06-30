@@ -177,16 +177,19 @@ def latest_run_status(
     heartbeat_stale_seconds: int,
     artifact_stale_seconds: int,
 ) -> dict[str, Any]:
+    run_status = optional_string(status.get("run_status") or status.get("status")) or "unknown"
     heartbeat_at = parse_iso(str(status.get("last_heartbeat_utc") or ""))
     artifact_updated_at = file_mtime(status_path)
     heartbeat_age = age_seconds(now, heartbeat_at)
     artifact_age = age_seconds(now, artifact_updated_at)
+    heartbeat_required = is_live_status(run_status)
     return {
         "run_id": optional_string(status.get("run_id")),
-        "status": optional_string(status.get("run_status") or status.get("status")) or "unknown",
+        "status": run_status,
         "heartbeat_at": isoformat(heartbeat_at) if heartbeat_at else None,
         "heartbeat_age_seconds": heartbeat_age,
-        "heartbeat_stale": heartbeat_age is None or heartbeat_age > heartbeat_stale_seconds,
+        "heartbeat_required": heartbeat_required,
+        "heartbeat_stale": heartbeat_required and (heartbeat_age is None or heartbeat_age > heartbeat_stale_seconds),
         "artifact_updated_at": isoformat(artifact_updated_at) if artifact_updated_at else None,
         "artifact_age_seconds": artifact_age,
         "artifact_stale": artifact_age is None or artifact_age > artifact_stale_seconds,
@@ -206,10 +209,11 @@ def monitor_checks(
     service_result = service_props.get("Result") or "unknown"
     public_scan = str(status.get("public_scan_status") or "").lower()
     alaya_readback = str(status.get("alaya_readback_status") or "").lower()
+    heartbeat = heartbeat_check(latest_run)
     return {
         "timer": "ok" if timer_active and timer_enabled else "fail" if timer_props else "unknown",
         "service": "fail" if service_state == "failed" or service_result == "failed" else "ok" if service_props else "unknown",
-        "heartbeat": "unknown" if latest_run["heartbeat_age_seconds"] is None else "stale" if latest_run["heartbeat_stale"] else "ok",
+        "heartbeat": heartbeat,
         "artifact": "missing" if latest_run["artifact_age_seconds"] is None else "stale" if latest_run["artifact_stale"] else "ok",
         "public_scan": "ok" if public_scan == "ok" else "fail" if public_scan == "failed" else "unknown",
         "alaya_readback": "ok" if alaya_readback in {"verified", "not_applicable", "skipped"} else "fail" if alaya_readback in {"failed", "mismatch"} else "unknown",
@@ -228,6 +232,7 @@ def overall_status(checks: dict[str, str]) -> str:
 def status_codes(*, status: dict[str, Any], checks: dict[str, str], latest_run: dict[str, Any]) -> list[str]:
     codes: list[str] = []
     run_status = optional_string(status.get("run_status") or status.get("status")) or "unknown"
+    normalized_run_status = normalize_status(run_status)
     supported = {
         "completed",
         "completed_with_review_items",
@@ -235,9 +240,14 @@ def status_codes(*, status: dict[str, Any], checks: dict[str, str], latest_run: 
         "partial",
         "failed",
         "blocked",
+        "running",
+        "in_progress",
+        "processing",
+        "starting",
+        "started",
         "unknown",
     }
-    codes.append(run_status if run_status in supported else "unknown")
+    codes.append(normalized_run_status if normalized_run_status in supported else "unknown")
     if latest_run["heartbeat_stale"]:
         codes.append("heartbeat_stale")
     if latest_run["artifact_stale"]:
@@ -251,6 +261,14 @@ def status_codes(*, status: dict[str, Any], checks: dict[str, str], latest_run: 
     if checks.get("alaya_readback") == "fail":
         codes.append("alaya_readback_failed")
     return sorted(set(codes), key=codes.index)
+
+
+def heartbeat_check(latest_run: dict[str, Any]) -> str:
+    if latest_run["heartbeat_required"]:
+        return "stale" if latest_run["heartbeat_stale"] else "ok"
+    if normalize_status(str(latest_run["status"])) == "unknown":
+        return "unknown"
+    return "not_required"
 
 
 def file_mtime(path: Path) -> datetime | None:
@@ -268,6 +286,16 @@ def parse_iso(value: str) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def is_live_status(value: str) -> bool:
+    normalized = normalize_status(value)
+    live_statuses = {"running", "in_progress", "processing", "starting", "started"}
+    return normalized in live_statuses or normalized.startswith(("running_", "in_progress_", "processing_", "starting_"))
+
+
+def normalize_status(value: str) -> str:
+    return value.strip().lower().replace("-", "_").replace(" ", "_")
 
 
 def normalize_systemd_timestamp(value: str | None) -> str | None:
