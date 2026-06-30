@@ -625,6 +625,53 @@ def test_loop_llm_symbol_heartbeat_refreshes_public_status(monkeypatch, tmp_path
     assert status["sample_symbols"] == ["HKEX:0700", "HKEX:9988"]
 
 
+def test_loop_completed_status_updates_markdown_status_block(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    cfg = FullAnalystConfig(
+        **{
+            **cfg.__dict__,
+            "mode": LOOP_MODE,
+            "output_dir": tmp_path / "loop-public",
+            "run_id": "full_analyst_concurrency3_fullpool_20260630_v1_run1",
+            "loop_current_cycle": 1,
+            "loop_last_successful_cycle": 0,
+            "loop_duration_seconds": 36000,
+        }
+    )
+
+    exit_code = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=StaticRunner(valid_payload()),
+        alaya_client=RecordingAlaya(),
+        loop_started_at_utc="2026-06-29T00:00:00Z",
+    )
+
+    report_path = cfg.output_dir / "full_analyst_loop_latest.md"
+    assert exit_code == 0
+    assert "- phase: artifact" in report_path.read_text()
+
+    update_loop_public_status(
+        cfg,
+        current_cycle=1,
+        last_successful_cycle=1,
+        loop_status="completed",
+        phase="completed",
+        started_at_utc="2026-06-29T00:00:00Z",
+    )
+
+    status = json.loads((cfg.output_dir / "status_full_analyst_loop.json").read_text())
+    markdown = report_path.read_text()
+    assert status["status"] == "completed"
+    assert status["run_status"] == "completed"
+    assert status["phase"] == "completed"
+    assert "- status: completed" in markdown
+    assert "- run_status: completed" in markdown
+    assert "- phase: completed" in markdown
+    assert "- phase: artifact" not in markdown
+
+
 def test_public_artifacts_do_not_expose_forbidden_runtime_surfaces(tmp_path: Path) -> None:
     cfg = config(tmp_path)
 

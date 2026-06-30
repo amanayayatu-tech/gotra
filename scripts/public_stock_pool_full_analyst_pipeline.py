@@ -1453,6 +1453,31 @@ def render_loop_running_markdown(status: dict[str, Any]) -> str:
     ) + "\n"
 
 
+def sync_loop_markdown_status(report_path: Path, status: dict[str, Any]) -> None:
+    if not report_path.exists():
+        return
+    markdown = report_path.read_text(encoding="utf-8")
+    replacements = {
+        "status": status.get("status"),
+        "run_status": status.get("run_status"),
+        "phase": status.get("phase"),
+        "last_heartbeat_utc": status.get("last_heartbeat_utc"),
+        "current_cycle": status.get("current_cycle"),
+        "last_successful_cycle": status.get("last_successful_cycle"),
+    }
+    for key, value in replacements.items():
+        if value is None:
+            continue
+        line = f"- {key}: {value}"
+        pattern = re.compile(rf"^- {re.escape(key)}: .*$", re.MULTILINE)
+        if pattern.search(markdown):
+            markdown = pattern.sub(line, markdown, count=1)
+        elif key == "status":
+            markdown = re.sub(r"(^## Status\n\n)", rf"\1{line}\n", markdown, count=1, flags=re.MULTILINE)
+    scan_public_text(markdown)
+    write_public_text(report_path, markdown)
+
+
 def update_loop_public_status(
     config: FullAnalystConfig,
     *,
@@ -1493,6 +1518,7 @@ def update_loop_public_status(
     started = datetime.fromisoformat(started_at_utc.replace("Z", "+00:00"))
     elapsed = max(0, int((datetime.now(UTC) - started).total_seconds()))
     status["status"] = loop_status
+    status["run_status"] = "running" if loop_status == "running" else loop_status
     status["phase"] = phase
     status["current_cycle"] = current_cycle
     status["last_successful_cycle"] = last_successful_cycle
@@ -1506,6 +1532,8 @@ def update_loop_public_status(
     if last_error_category:
         status["last_error_category"] = last_error_category
         status["last_error_public_message"] = public_error_message(last_error_category)
+    if loop_status != "running":
+        sync_loop_markdown_status(report_path, status)
     write_public_json(status_path, status)
     if config.publish_static:
         publish_static(report_path, status_path, config.static_dir)
