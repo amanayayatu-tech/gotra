@@ -1,5 +1,6 @@
 import json
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
+from itertools import count
 from pathlib import Path
 
 from scripts.public_stock_pool_full_research import RunnerResult
@@ -87,6 +88,20 @@ class StaticRunner:
     def complete(self, prompt_text: str, *, timeout_seconds: int) -> RunnerResult:
         del prompt_text, timeout_seconds
         return RunnerResult(True, text=json.dumps(self.payload), elapsed_seconds=0.01, returncode=0)
+
+
+class StatusReadingRunner(StaticRunner):
+    def __init__(self, payload: dict[str, object], status_path: Path) -> None:
+        super().__init__(payload)
+        self.status_path = status_path
+        self.public_heartbeats: list[str | None] = []
+
+    def complete(self, prompt_text: str, *, timeout_seconds: int) -> RunnerResult:
+        if self.status_path.exists():
+            self.public_heartbeats.append(json.loads(self.status_path.read_text()).get("last_heartbeat_utc"))
+        else:
+            self.public_heartbeats.append(None)
+        return super().complete(prompt_text, timeout_seconds=timeout_seconds)
 
 
 class RecordingAlaya(MockAlayaSyncClient):
@@ -564,6 +579,50 @@ def test_loop_cycles_keep_distinct_private_summaries_and_cycle_heartbeat(tmp_pat
     assert cycle_002["current_cycle"] == 2
     assert heartbeat["current_cycle"] == 2
     assert heartbeat["last_successful_cycle"] == 2
+
+
+def test_loop_llm_symbol_heartbeat_refreshes_public_status(monkeypatch, tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700", "HKEX:9988"))
+    cfg = FullAnalystConfig(
+        **{
+            **cfg.__dict__,
+            "mode": LOOP_MODE,
+            "output_dir": tmp_path / "loop-public",
+            "run_id": "full_analyst_10h_loop_20260629_v1",
+            "loop_current_cycle": 3,
+            "loop_last_successful_cycle": 2,
+            "loop_duration_seconds": 36000,
+        }
+    )
+    from scripts import public_stock_pool_full_analyst_pipeline as module
+
+    ticks = count()
+
+    def ticking_utc_now() -> str:
+        return (
+            datetime(2026, 6, 29, tzinfo=timezone.utc) + timedelta(seconds=next(ticks))
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    monkeypatch.setattr(module, "utc_now_iso", ticking_utc_now)
+    runner = StatusReadingRunner(valid_payload(), cfg.output_dir / "status_full_analyst_loop.json")
+
+    exit_code = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=runner,
+        alaya_client=RecordingAlaya(),
+        loop_started_at_utc="2026-06-29T00:00:00Z",
+    )
+
+    status = json.loads((cfg.output_dir / "status_full_analyst_loop.json").read_text())
+    assert exit_code == 0
+    assert len(runner.public_heartbeats) == 2
+    assert runner.public_heartbeats[0] is not None
+    assert runner.public_heartbeats[1] is not None
+    assert runner.public_heartbeats[1] != runner.public_heartbeats[0]
+    assert status["current_cycle"] == 3
+    assert status["sample_symbols"] == ["HKEX:0700", "HKEX:9988"]
 
 
 def test_public_artifacts_do_not_expose_forbidden_runtime_surfaces(tmp_path: Path) -> None:
