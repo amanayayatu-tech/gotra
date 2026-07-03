@@ -55,9 +55,14 @@ SCHEMA = "gotra.full_analyst.pipeline.v1"
 STATUS_SCHEMA = "gotra.full_analyst.status.v1"
 SYMBOL_SCHEMA_V1 = "gotra.full_analyst.symbol.v1"
 SYMBOL_SCHEMA = "gotra.full_analyst.symbol.v2"
+SYMBOL_SCHEMA_V3 = "gotra.full_analyst.symbol.v3"
 METHODOLOGY_VERSION = "ksana_4_1_lite"
+METHODOLOGY_VERSION_V3 = "ksana_4_1_independent_agents"
 EXECUTION_MODEL = "multi_perspective_single_call"
+EXECUTION_MODEL_V3 = "independent_agent_calls"
 ALAYA_EVENT_SCHEMA = "gotra.cognition_flywheel.full_analyst_memory.v2"
+ALAYA_EVENT_SCHEMA_V3 = "gotra.cognition_flywheel.full_analyst_memory.v3"
+AGENT_OUTPUT_SCHEMA_V3 = "gotra.full_analyst.agent_output.v3"
 PRIVATE_ATTEMPT_SCHEMA = "gotra.full_analyst.private_attempt.v1"
 MODE = "full-analyst-evening-hk-test"
 LOOP_MODE = "full-analyst-production-loop"
@@ -72,6 +77,7 @@ DEFAULT_PRIVATE_AUDIT_ROOT = Path("/opt/gotra/data/private/full_analyst_runs")
 DEFAULT_STATIC_DIR = Path("/var/www/gotra-public-ledger/reports")
 DEFAULT_SYMBOLS = ("HKEX:0700", "HKEX:1810", "HKEX:9688", "HKEX:9969", "HKEX:0501")
 PROMPT_TEMPLATE_VERSION = "gotra.full_analyst.prompt.v2.ksana_4_1_lite"
+PROMPT_TEMPLATE_VERSION_V3 = "gotra.full_analyst.prompt.v3.independent_agents"
 READER_BOUNDARY = "Research content only. This does not constitute investment advice."
 READER_BOUNDARY_ZH = (
     "研究内容仅供参考，不构成任何投资建议。系统可以表达研究状态和不确定性，"
@@ -160,6 +166,31 @@ FORBIDDEN_PUBLIC_RE = re.compile(
     re.IGNORECASE,
 )
 FORBIDDEN_OUTPUT_KEY_RE = re.compile(r"^(prompt_text|prompt|completion|messages|raw_provider_response|stdout|stderr)$", re.I)
+V3_AGENT_IDS = (
+    "k_deep_research",
+    "f_partner_view",
+    "w_partner_view",
+    "g_partner_view",
+    "chairman_synthesis",
+    "red_team_audit",
+)
+V3_KFWG_AGENT_IDS = V3_AGENT_IDS[:4]
+V3_AGENT_TIMING_KEYS = {
+    "k_deep_research": "k_deep_research_seconds",
+    "f_partner_view": "f_partner_seconds",
+    "w_partner_view": "w_partner_seconds",
+    "g_partner_view": "g_partner_seconds",
+    "chairman_synthesis": "chairman_seconds",
+    "red_team_audit": "red_team_seconds",
+}
+V3_AGENT_ROLE_LABELS = {
+    "k_deep_research": "K deep research agent; upstream facts and evidence boundary",
+    "f_partner_view": "F partner agent; constructive research view",
+    "w_partner_view": "W partner agent; skeptical research view",
+    "g_partner_view": "G partner agent; structure, cycle, market environment, and portfolio context without allocation advice",
+    "chairman_synthesis": "Chairman synthesis agent; integrates independent public-safe agent outputs without action instructions",
+    "red_team_audit": "Independent red-team audit agent; attacks assumptions and reports reliability risks",
+}
 
 
 @dataclass(frozen=True)
@@ -190,6 +221,11 @@ class FullAnalystConfig:
     candidate_timer: str | None = None
     loop_current_cycle: int = 1
     loop_last_successful_cycle: int = 0
+    v3_independent_agents: bool = False
+    execution_model: str = EXECUTION_MODEL
+    requested_execution_model: str = EXECUTION_MODEL
+    agent_concurrency: int = 4
+    explicit_v2_fallback: bool = False
 
 
 class AnalystRunner(Protocol):
@@ -214,6 +250,9 @@ class FixtureAnalystRunner:
     def complete(self, prompt_text: str, *, timeout_seconds: int) -> RunnerResult:
         del timeout_seconds
         payload = prompt_input_payload(prompt_text)
+        if payload.get("required_schema") == AGENT_OUTPUT_SCHEMA_V3:
+            response = fixture_v3_agent_output(payload)
+            return RunnerResult(True, text=json.dumps(response, ensure_ascii=False), elapsed_seconds=0.001, returncode=0)
         symbol = str(payload["symbol"])
         exchange = str(payload["exchange"])
         price_gap = payload["price_coverage_status"] == "data_gap"
@@ -274,6 +313,7 @@ class MockAlayaSyncClient:
     def sync(self, payload: dict[str, Any]) -> dict[str, Any]:
         started = time.monotonic()
         public_payload = build_alaya_public_payload(payload)
+        event_schema = alaya_event_schema_for_payload(payload)
         stable = stable_hash(
             {
                 "run_id": payload["run_id"],
@@ -281,12 +321,13 @@ class MockAlayaSyncClient:
                 "exchange": payload["exchange"],
                 "judge_status": payload["judge_status"],
                 "public_payload_hash": public_payload["public_payload_hash"],
+                "agent_hashes": payload.get("agent_hashes", {}),
             }
         )
         return {
             "status": "synced",
             "mode": "mock",
-            "event_schema": ALAYA_EVENT_SCHEMA,
+            "event_schema": event_schema,
             "event_id": f"mock-alaya-{stable[:16]}",
             "event_hash": stable,
             "public_payload_hash": public_payload["public_payload_hash"],
@@ -318,12 +359,14 @@ class GotraInternalAlayaSyncClient:
         started = time.monotonic()
         public_payload = build_alaya_public_payload(payload)
         public_payload_hash = str(public_payload["public_payload_hash"])
+        is_v3_payload = payload.get("schema") == SYMBOL_SCHEMA_V3
+        event_schema = ALAYA_EVENT_SCHEMA_V3 if is_v3_payload else ALAYA_EVENT_SCHEMA
         event = {
             "event_type": "full_analyst_memory_sync",
-            "event_schema": ALAYA_EVENT_SCHEMA,
+            "event_schema": event_schema,
             "audit_actor": self.actor,
             "run_id": payload["run_id"],
-            "cognition_flywheel_layer": "full_analyst_ksana_4_1_lite",
+            "cognition_flywheel_layer": "full_analyst_independent_agents" if is_v3_payload else "full_analyst_ksana_4_1_lite",
             "feedback_ref": f"full_analyst:{payload['run_id']}:{payload['exchange']}:{payload['symbol']}",
             "knowledge_id": f"full_analyst:{payload['exchange']}:{payload['symbol']}",
             "knowledge_flag": "full_analyst_candidate",
@@ -337,14 +380,6 @@ class GotraInternalAlayaSyncClient:
             "judge_status": payload["judge_status"],
             "price_coverage_status": payload["price_coverage_status"],
             "execution_model": payload["execution_model"],
-            "agent_outputs": {
-                "k_deep_research": payload["k_deep_research"],
-                "f_partner_view": payload["f_partner_view"],
-                "w_partner_view": payload["w_partner_view"],
-                "g_partner_view": payload["g_partner_view"],
-                "chairman_synthesis": payload["chairman_synthesis"],
-                "red_team_audit": payload["red_team_audit"],
-            },
             "evidence_gaps": payload["evidence_gaps"],
             "watch_conditions": payload["watch_conditions"],
             "boundary_policy": public_payload["boundary_policy"],
@@ -352,6 +387,27 @@ class GotraInternalAlayaSyncClient:
             "source_payload_hash": public_payload_hash,
             "public_payload": public_payload,
         }
+        if is_v3_payload:
+            event.update(
+                {
+                    "agent_hashes": payload["agent_hashes"],
+                    "agent_timings": payload["agent_timings"],
+                    "agent_statuses": agent_statuses(payload),
+                    "chairman_hash": payload["agent_hashes"].get("chairman_synthesis", ""),
+                    "red_team_hash": payload["agent_hashes"].get("red_team_audit", ""),
+                    "red_team_verdict": red_team_verdict(payload),
+                    "failure_records": payload.get("failure_records", []),
+                }
+            )
+        else:
+            event["agent_outputs"] = {
+                "k_deep_research": payload["k_deep_research"],
+                "f_partner_view": payload["f_partner_view"],
+                "w_partner_view": payload["w_partner_view"],
+                "g_partner_view": payload["g_partner_view"],
+                "chairman_synthesis": payload["chairman_synthesis"],
+                "red_team_audit": payload["red_team_audit"],
+            }
         write_seconds = 0.0
         readback_seconds = 0.0
         try:
@@ -430,10 +486,39 @@ class GotraInternalAlayaSyncClient:
                 "readback_seconds": round(readback_seconds, 3),
                 "total_seconds": round(time.monotonic() - started, 3),
             }
+        if is_v3_payload:
+            readback_agent_hashes = readback[0].get("agent_hashes") if isinstance(readback[0].get("agent_hashes"), dict) else {}
+            if readback_agent_hashes != payload.get("agent_hashes"):
+                return {
+                    "status": "failed",
+                    "mode": "real",
+                    "reason": "gotra_internal_state_agent_hash_readback_mismatch",
+                    "event_id": event_hash,
+                    "event_hash": event_hash,
+                    "public_payload_hash": public_payload_hash,
+                    "readback_status": "mismatch",
+                    "write_seconds": round(write_seconds, 3),
+                    "readback_seconds": round(readback_seconds, 3),
+                    "total_seconds": round(time.monotonic() - started, 3),
+                }
+            failure_records = readback[0].get("failure_records") if isinstance(readback[0].get("failure_records"), list) else []
+            if payload.get("failure_records") and not failure_records:
+                return {
+                    "status": "failed",
+                    "mode": "real",
+                    "reason": "gotra_internal_state_failure_record_readback_missing",
+                    "event_id": event_hash,
+                    "event_hash": event_hash,
+                    "public_payload_hash": public_payload_hash,
+                    "readback_status": "mismatch",
+                    "write_seconds": round(write_seconds, 3),
+                    "readback_seconds": round(readback_seconds, 3),
+                    "total_seconds": round(time.monotonic() - started, 3),
+                }
         return {
             "status": "synced",
             "mode": "real",
-            "event_schema": ALAYA_EVENT_SCHEMA,
+            "event_schema": event_schema,
             "event_id": event_hash,
             "event_hash": event_hash,
             "public_payload_hash": public_payload_hash,
@@ -460,6 +545,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--llm-runner", choices=("codex-cli", "fixture"), default=os.getenv("GOTRA_FULL_ANALYST_LLM_RUNNER", "codex-cli"))
     parser.add_argument("--alaya-mode", choices=("mock", "off", "real"), default="mock")
     parser.add_argument("--max-concurrency", type=int, default=1)
+    parser.add_argument("--v3-independent-agents", action="store_true", help="run v3 as true independent per-agent calls")
+    parser.add_argument(
+        "--execution-model",
+        choices=(EXECUTION_MODEL, EXECUTION_MODEL_V3),
+        default=EXECUTION_MODEL,
+        help="explicit execution model for public artifacts",
+    )
+    parser.add_argument("--agent-concurrency", type=int, default=4, help="per-symbol K/F/W/G agent concurrency for v3")
+    parser.add_argument("--fallback-to-v2", action="store_true", help="explicitly request v2 fallback instead of v3")
     parser.add_argument("--per-symbol-timeout-seconds", type=int, default=int(os.getenv("GOTRA_FULL_ANALYST_TIMEOUT_SECONDS", "300")))
     parser.add_argument("--retries", type=int, default=int(os.getenv("GOTRA_FULL_ANALYST_RETRIES", "0")))
     parser.add_argument("--codex-bin", default="codex")
@@ -480,6 +574,10 @@ def config_from_args(args: argparse.Namespace) -> FullAnalystConfig:
     output_dir = args.output_dir if args.output_dir is not None else (DEFAULT_LOOP_OUTPUT_DIR if is_loop else DEFAULT_OUTPUT_DIR)
     run_id = str(args.run_id or (DEFAULT_LOOP_RUN_ID if is_loop else DEFAULT_RUN_ID))
     selected_symbols = () if bool(args.all_symbols) else tuple(normalize_symbol_key(value) for value in (args.symbol or list(DEFAULT_SYMBOLS)))
+    requested_execution_model = EXECUTION_MODEL_V3 if bool(args.v3_independent_agents) else str(args.execution_model)
+    v3_requested = bool(args.v3_independent_agents) or str(args.execution_model) == EXECUTION_MODEL_V3
+    explicit_v2_fallback = bool(args.fallback_to_v2 and v3_requested)
+    active_execution_model = EXECUTION_MODEL if explicit_v2_fallback else (EXECUTION_MODEL_V3 if v3_requested else EXECUTION_MODEL)
     return FullAnalystConfig(
         run_id=run_id,
         mode=str(args.mode),
@@ -505,6 +603,11 @@ def config_from_args(args: argparse.Namespace) -> FullAnalystConfig:
         all_symbols=bool(args.all_symbols),
         candidate_service=str(args.candidate_service or "") or None,
         candidate_timer=str(args.candidate_timer or "") or None,
+        v3_independent_agents=active_execution_model == EXECUTION_MODEL_V3,
+        execution_model=active_execution_model,
+        requested_execution_model=requested_execution_model,
+        agent_concurrency=max(1, int(args.agent_concurrency)),
+        explicit_v2_fallback=explicit_v2_fallback,
     )
 
 
@@ -643,6 +746,112 @@ def build_prompt(item: dict[str, str], price_row: dict[str, Any], config: FullAn
     )
 
 
+def build_v3_agent_prompt(
+    agent_id: str,
+    item: dict[str, str],
+    price_row: dict[str, Any],
+    config: FullAnalystConfig,
+    *,
+    dependencies: dict[str, Any] | None = None,
+    attempt: int = 1,
+    last_error: str = "",
+) -> tuple[str, str]:
+    if agent_id not in V3_AGENT_IDS:
+        raise ValueError(f"unsupported_v3_agent:{agent_id}")
+    dependency_packet = dependencies or {}
+    public_context = {
+        "run_id": config.run_id,
+        "symbol": item["symbol"],
+        "exchange": item["exchange"],
+        "provider_ticker": item["provider_ticker"],
+        "as_of_date": config.as_of_date.isoformat(),
+        "trading_date": trading_date_for_exchange(item["exchange"], exchange_dates_for_config(config)).isoformat(),
+        "price_coverage_status": "ok" if price_row.get("ok") else "data_gap",
+        "price_context": public_price_context(price_row),
+        "agent_id": agent_id,
+        "agent_role": V3_AGENT_ROLE_LABELS[agent_id],
+        "dependencies": dependency_packet,
+        "alaya_readback_summary": "current-symbol v3 memory write occurs after judge gate; no external Alaya service is used",
+    }
+    input_context_hash = stable_hash(public_context)
+    payload = {
+        **public_context,
+        "required_schema": AGENT_OUTPUT_SCHEMA_V3,
+        "required_keys": [
+            "agent_id",
+            "agent_role",
+            "schema",
+            "symbol",
+            "exchange",
+            "run_id",
+            "started_at",
+            "finished_at",
+            "duration_seconds",
+            "model",
+            "prompt_template_version",
+            "input_context_hash",
+            "output_hash",
+            "status",
+            "findings",
+            "evidence_refs",
+            "evidence_gaps",
+            "uncertainties",
+            "watch_conditions",
+            "boundary",
+        ],
+        "model": config.model,
+        "prompt_template_version": PROMPT_TEMPLATE_VERSION_V3,
+        "input_context_hash": input_context_hash,
+        "methodology_version": METHODOLOGY_VERSION_V3,
+        "execution_model": EXECUTION_MODEL_V3,
+        "allowed_status": ["ok", "needs_review", "failed"],
+        "allowed_research_status": ["candidate", "watch", "avoid", "needs_review", "data_gap", "high_uncertainty"],
+        "boundary": "research content only; does not constitute investment advice",
+    }
+    role_instruction = {
+        "k_deep_research": (
+            "K goal: establish company/ticker identity, latest public context, price/data coverage, business/sector/event frame, "
+            "known evidence, missing evidence, stale/data_gap handling, and next verification steps."
+        ),
+        "f_partner_view": (
+            "F goal: constructive view. Include positive thesis, what improved or may be improving, supporting evidence, "
+            "conditions required for the thesis to remain valid, and risks to that thesis."
+        ),
+        "w_partner_view": (
+            "W goal: skeptical view. Include bear case, what worsened or may be weakening, evidence for negative view, "
+            "fragility points, and what would invalidate the bear case."
+        ),
+        "g_partner_view": (
+            "G goal: macro/sector/liquidity/market-structure and scenario context. Do not provide allocation, position, "
+            "or action advice. Keep output as non-actionable research status."
+        ),
+        "chairman_synthesis": (
+            "Chairman goal: read only K/F/W/G public-safe outputs, hashes, evidence gaps, price/data context, and Alaya readback summary. "
+            "Return consensus points, conflicts, strongest evidence, weakest assumptions, research_status, confidence_boundary, "
+            "watch_conditions, and next verification steps. Do not turn this into a trading instruction."
+        ),
+        "red_team_audit": (
+            "Red Team goal: independently attack K/F/W/G and Chairman. Include possible hallucinations, missing evidence, "
+            "overconfidence risks, contradiction list, data_gap impact, what would make report unreliable, and final_red_team_verdict "
+            "as pass, needs_review, or blocked."
+        ),
+    }[agent_id]
+    retry_note = ""
+    if attempt > 1:
+        retry_note = f"\nRetry attempt {attempt}. Previous failure: {sanitize_text(last_error)[:160]}."
+    prompt = (
+        "Return STRICT JSON only. No markdown, no code fences, no commentary.\n"
+        "This is GOTRA Full Analyst v3. You are one independent agent call, not a field inside a shared prompt.\n"
+        f"{role_instruction}\n"
+        "Public safety: research content only; no investment advice, trading signal, directional recommendation, price objective, "
+        "allocation guidance, outcome promise, performance proof, or science/public proof. Do not include raw provider/model I/O, "
+        "prompt text, stdout, stderr, credentials, Authorization, Bearer, or secret material.\n"
+        "If evidence is missing, mark data_gap or needs_review and make the gap specific. Do not invent facts.\n"
+        f"Input JSON: {json.dumps(payload, ensure_ascii=False, sort_keys=True)}{retry_note}"
+    )
+    return prompt, input_context_hash
+
+
 def prompt_input_payload(prompt_text: str) -> dict[str, Any]:
     marker = "Input JSON:"
     index = prompt_text.find(marker)
@@ -652,6 +861,96 @@ def prompt_input_payload(prompt_text: str) -> dict[str, Any]:
     if "\nRetry attempt" in payload:
         payload = payload.split("\nRetry attempt", 1)[0].strip()
     return json.loads(payload)
+
+
+def fixture_v3_agent_output(payload: dict[str, Any]) -> dict[str, Any]:
+    agent_id = sanitize_text(str(payload.get("agent_id") or "unknown_agent"))
+    symbol = sanitize_text(str(payload.get("symbol") or ""))
+    exchange = sanitize_text(str(payload.get("exchange") or ""))
+    price_gap = str(payload.get("price_coverage_status") or "") == "data_gap"
+    role_specific: dict[str, dict[str, Any]] = {
+        "k_deep_research": {
+            "findings": [
+                f"{exchange}:{symbol} identity and public-source frame are established from supplied context.",
+                "Latest public context must be refreshed before stronger conclusions.",
+                "Price coverage is explicitly marked as a data gap." if price_gap else "Price coverage is available in the supplied public context.",
+            ],
+            "evidence_gaps": [
+                "Independent issuer filing refresh is not present in fixture mode.",
+                "Latest news/event verification is required before stronger claims.",
+            ],
+            "watch_conditions": ["Next public filing, exchange announcement, or verified market-data refresh."],
+        },
+        "f_partner_view": {
+            "findings": [
+                "Constructive thesis depends on durable business quality and verifiable operating improvement.",
+                "Positive view remains conditional on fresh public evidence rather than model confidence.",
+            ],
+            "evidence_gaps": ["Need current evidence for demand, margin, and competitive-position improvement."],
+            "watch_conditions": ["Observable improvement in next public operating update."],
+        },
+        "w_partner_view": {
+            "findings": [
+                "Bear case focuses on valuation sensitivity, competition, and execution risk.",
+                "The cautious view is invalidated only by fresh evidence that reduces those pressure points.",
+            ],
+            "evidence_gaps": ["Need current evidence on margin pressure, regulation, and peer competition."],
+            "watch_conditions": ["Watch whether public updates weaken or confirm the bear-case pressure points."],
+        },
+        "g_partner_view": {
+            "findings": [
+                "Macro, liquidity, sector cycle, and market-structure context must stay separated from allocation advice.",
+                "Scenario map remains non-actionable and bounded by evidence freshness.",
+            ],
+            "evidence_gaps": ["Need current sector, liquidity, and sentiment evidence before stronger environment claims."],
+            "watch_conditions": ["Monitor sector-cycle and market-structure changes through public sources."],
+        },
+        "chairman_synthesis": {
+            "findings": [
+                "Consensus: evidence freshness and data coverage are the key constraints.",
+                "Conflict: constructive durability arguments remain contested by valuation and execution fragility.",
+                "Weakest assumption is that fixture context represents current public reality.",
+            ],
+            "evidence_gaps": ["Chairman requires refreshed K/F/W/G evidence before stronger synthesis."],
+            "watch_conditions": ["Verify public filings, market data, and agent conflicts in the next run."],
+            "research_status": "data_gap" if price_gap else "watch",
+        },
+        "red_team_audit": {
+            "findings": [
+                "Possible hallucination risk: stale or missing public evidence may be over-read.",
+                "Overconfidence risk: independent-agent structure does not by itself validate the research conclusion.",
+                "Contradictions must remain visible when K/F/W/G disagree.",
+            ],
+            "evidence_gaps": ["Missing external public-source refresh can make the report unreliable."],
+            "watch_conditions": ["Block promotion if evidence gaps remain vague or action-like language appears."],
+            "final_red_team_verdict": "needs_review" if price_gap else "pass",
+        },
+    }
+    details = role_specific.get(agent_id, {})
+    return {
+        "agent_id": agent_id,
+        "agent_role": V3_AGENT_ROLE_LABELS.get(agent_id, agent_id),
+        "schema": AGENT_OUTPUT_SCHEMA_V3,
+        "symbol": symbol,
+        "exchange": exchange,
+        "run_id": sanitize_text(str(payload.get("run_id") or "")),
+        "started_at": "",
+        "finished_at": "",
+        "duration_seconds": 0,
+        "model": sanitize_text(str(payload.get("model") or "fixture")),
+        "prompt_template_version": PROMPT_TEMPLATE_VERSION_V3,
+        "input_context_hash": sanitize_text(str(payload.get("input_context_hash") or "")),
+        "output_hash": "",
+        "status": "needs_review" if price_gap and agent_id in {"k_deep_research", "chairman_synthesis", "red_team_audit"} else "ok",
+        "findings": details.get("findings", ["Fixture agent output remains public-safe and bounded."]),
+        "evidence_refs": ["fixture_public_context"],
+        "evidence_gaps": details.get("evidence_gaps", ["Fixture evidence requires public refresh."]),
+        "uncertainties": ["Fixture mode is not a live-source refresh.", "This is research content only."],
+        "watch_conditions": details.get("watch_conditions", ["Next verified public update."]),
+        "boundary": "research content only; does not constitute investment advice",
+        **({"research_status": details["research_status"]} if "research_status" in details else {}),
+        **({"final_red_team_verdict": details["final_red_team_verdict"]} if "final_red_team_verdict" in details else {}),
+    }
 
 
 def public_price_context(price_row: dict[str, Any]) -> dict[str, Any]:
@@ -666,6 +965,46 @@ def public_price_context(price_row: dict[str, Any]) -> dict[str, Any]:
         "close_date": price_row.get("close_date"),
         "reason": sanitize_text(str(price_row.get("reason") or "unknown")),
     }
+
+
+def is_v3_config(config: FullAnalystConfig) -> bool:
+    return bool(config.v3_independent_agents or config.execution_model == EXECUTION_MODEL_V3)
+
+
+def symbol_schema_for_config(config: FullAnalystConfig) -> str:
+    return SYMBOL_SCHEMA_V3 if is_v3_config(config) else SYMBOL_SCHEMA
+
+
+def prompt_template_for_config(config: FullAnalystConfig) -> str:
+    return PROMPT_TEMPLATE_VERSION_V3 if is_v3_config(config) else PROMPT_TEMPLATE_VERSION
+
+
+def methodology_for_config(config: FullAnalystConfig) -> str:
+    return METHODOLOGY_VERSION_V3 if is_v3_config(config) else METHODOLOGY_VERSION
+
+
+def execution_model_for_config(config: FullAnalystConfig) -> str:
+    return EXECUTION_MODEL_V3 if is_v3_config(config) else EXECUTION_MODEL
+
+
+def alaya_event_schema_for_payload(payload: dict[str, Any]) -> str:
+    return ALAYA_EVENT_SCHEMA_V3 if payload.get("schema") == SYMBOL_SCHEMA_V3 else ALAYA_EVENT_SCHEMA
+
+
+def agent_statuses(payload: dict[str, Any]) -> dict[str, str]:
+    outputs = payload.get("agent_outputs") if isinstance(payload.get("agent_outputs"), dict) else {}
+    return {
+        agent_id: sanitize_text(str((outputs.get(agent_id) or {}).get("status") or "not_reported"))[:80]
+        for agent_id in V3_AGENT_IDS
+    }
+
+
+def red_team_verdict(payload: dict[str, Any]) -> str:
+    red_team = (payload.get("agent_outputs") or {}).get("red_team_audit") if isinstance(payload.get("agent_outputs"), dict) else {}
+    verdict = ""
+    if isinstance(red_team, dict):
+        verdict = sanitize_text(str(red_team.get("final_red_team_verdict") or red_team.get("red_team_verdict") or ""))[:80]
+    return verdict if verdict in {"pass", "needs_review", "blocked"} else "needs_review"
 
 
 def sanitize_public_value(value: Any, *, max_text_length: int = 900) -> Any:
@@ -761,6 +1100,52 @@ def v1_payload_to_v2(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_alaya_public_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("schema") == SYMBOL_SCHEMA_V3:
+        public_payload_hash_basis = {
+            "schema": SYMBOL_SCHEMA_V3,
+            "run_id": payload["run_id"],
+            "symbol": payload["symbol"],
+            "exchange": payload["exchange"],
+            "as_of_date": payload["as_of_date"],
+            "research_status": payload["research_status"],
+            "judge_status": payload["judge_status"],
+            "agent_hashes": payload["agent_hashes"],
+            "agent_statuses": agent_statuses(payload),
+            "evidence_gaps": payload["evidence_gaps"],
+            "watch_conditions": payload["watch_conditions"],
+        }
+        public_payload = {
+            "schema": ALAYA_EVENT_SCHEMA_V3,
+            "event_schema": ALAYA_EVENT_SCHEMA_V3,
+            "gotra_schema": SYMBOL_SCHEMA_V3,
+            "run_id": payload["run_id"],
+            "symbol": payload["symbol"],
+            "exchange": payload["exchange"],
+            "as_of_date": payload["as_of_date"],
+            "trading_date": payload["trading_date"],
+            "methodology_version": METHODOLOGY_VERSION_V3,
+            "prompt_template_version": PROMPT_TEMPLATE_VERSION_V3,
+            "research_packet_hash": payload.get("research_packet_hash", ""),
+            "public_payload_hash": stable_hash(public_payload_hash_basis),
+            "judge_status": payload["judge_status"],
+            "price_coverage_status": payload["price_coverage_status"],
+            "execution_model": EXECUTION_MODEL_V3,
+            "agent_hashes": payload["agent_hashes"],
+            "agent_timings": payload["agent_timings"],
+            "agent_statuses": public_payload_hash_basis["agent_statuses"],
+            "chairman_hash": payload["agent_hashes"].get("chairman_synthesis", ""),
+            "red_team_hash": payload["agent_hashes"].get("red_team_audit", ""),
+            "red_team_verdict": red_team_verdict(payload),
+            "evidence_gaps": payload["evidence_gaps"],
+            "watch_conditions": payload["watch_conditions"],
+            "research_status": payload["research_status"],
+            "public_summary": payload["public_summary"],
+            "reader_boundary": payload["reader_boundary"],
+            "boundary_policy": "public-safe research only; no trade instruction, allocation guidance, price objective, promised outcome, raw provider I/O, or secrets",
+            "boundary": payload["boundary"],
+        }
+        assert_public_safe(public_payload)
+        return public_payload
     public_payload_hash_basis = {
         "schema": SYMBOL_SCHEMA,
         "run_id": payload["run_id"],
@@ -810,6 +1195,364 @@ def build_alaya_public_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return public_payload
 
 
+def public_dependency_packet(outputs: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    return {
+        agent_id: {
+            "status": output.get("status"),
+            "output_hash": output.get("output_hash"),
+            "findings": output.get("findings", [])[:4],
+            "evidence_gaps": output.get("evidence_gaps", [])[:4],
+            "watch_conditions": output.get("watch_conditions", [])[:4],
+            **({"research_status": output.get("research_status")} if output.get("research_status") else {}),
+            **({"final_red_team_verdict": output.get("final_red_team_verdict")} if output.get("final_red_team_verdict") else {}),
+        }
+        for agent_id, output in outputs.items()
+    }
+
+
+def run_v3_agent(
+    agent_id: str,
+    item: dict[str, str],
+    price_row: dict[str, Any],
+    config: FullAnalystConfig,
+    runner: AnalystRunner,
+    *,
+    dependencies: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    started_at = utc_now_iso()
+    started = time.monotonic()
+    prompt, input_context_hash = build_v3_agent_prompt(
+        agent_id,
+        item,
+        price_row,
+        config,
+        dependencies=public_dependency_packet(dependencies or {}),
+    )
+    prompt_hash = stable_hash({"prompt": prompt})
+    private_record: dict[str, Any] = {
+        "schema": "gotra.full_analyst.private_agent_attempt.v3",
+        "run_id": config.run_id,
+        "symbol": item["symbol"],
+        "exchange": item["exchange"],
+        "agent_id": agent_id,
+        "prompt_template_version": PROMPT_TEMPLATE_VERSION_V3,
+        "prompt_hash": prompt_hash,
+        "prompt_text": scrub_secret_text(prompt),
+        "input_context_hash": input_context_hash,
+        "model": config.model,
+        "reasoning_effort": config.reasoning_effort,
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "status": "failed",
+        "failure_reason": "",
+    }
+    result = runner.complete(prompt, timeout_seconds=config.per_symbol_timeout_seconds)
+    finished_at = utc_now_iso()
+    duration = time.monotonic() - started
+    private_record["stdout_bytes"] = result.stdout_bytes
+    private_record["stderr_bytes"] = result.stderr_bytes
+    private_record["returncode"] = result.returncode
+    if not result.ok:
+        reason = result.reason or "runner_failed"
+        output = v3_agent_failure_record(
+            agent_id=agent_id,
+            item=item,
+            config=config,
+            input_context_hash=input_context_hash,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_seconds=duration,
+            reason=reason,
+        )
+        private_record["failure_reason"] = public_safe_failure_category(reason)
+        private_record["public_output"] = output
+        write_v3_agent_private_record(config, item, agent_id, private_record)
+        return output
+    try:
+        output = sanitize_v3_agent_output(
+            parse_model_json(result.text),
+            agent_id=agent_id,
+            item=item,
+            config=config,
+            input_context_hash=input_context_hash,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_seconds=duration,
+        )
+        private_record["status"] = "success"
+        private_record["public_output"] = output
+        write_v3_agent_private_record(config, item, agent_id, private_record)
+        return output
+    except Exception as exc:  # noqa: BLE001 - preserve failed independent agent record.
+        reason = normalize_failure_reason(exc)
+        output = v3_agent_failure_record(
+            agent_id=agent_id,
+            item=item,
+            config=config,
+            input_context_hash=input_context_hash,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_seconds=duration,
+            reason=reason,
+        )
+        private_record["failure_reason"] = output["failure_reason"]
+        private_record["public_output"] = output
+        write_v3_agent_private_record(config, item, agent_id, private_record)
+        return output
+
+
+def run_v3_kfwg_agents(
+    item: dict[str, str],
+    price_row: dict[str, Any],
+    config: FullAnalystConfig,
+    runner: AnalystRunner,
+) -> dict[str, dict[str, Any]]:
+    if config.agent_concurrency == 1:
+        return {
+            agent_id: run_v3_agent(agent_id, item, price_row, config, runner)
+            for agent_id in V3_KFWG_AGENT_IDS
+        }
+    outputs: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=min(config.agent_concurrency, len(V3_KFWG_AGENT_IDS))) as executor:
+        futures = {
+            executor.submit(run_v3_agent, agent_id, item, price_row, config, runner): agent_id
+            for agent_id in V3_KFWG_AGENT_IDS
+        }
+        for future in as_completed(futures):
+            agent_id = futures[future]
+            outputs[agent_id] = future.result()
+    return {agent_id: outputs[agent_id] for agent_id in V3_KFWG_AGENT_IDS}
+
+
+def v3_section_list(output: dict[str, Any], fallback: str) -> list[str]:
+    values = []
+    values.extend(sanitize_list(output.get("findings")))
+    values.extend([f"evidence gap: {item}" for item in sanitize_list(output.get("evidence_gaps"))[:3]])
+    return values[:8] or [fallback]
+
+
+def aggregate_v3_symbol_payload(
+    *,
+    item: dict[str, str],
+    price_row: dict[str, Any],
+    config: FullAnalystConfig,
+    agent_outputs: dict[str, dict[str, Any]],
+    started_at_utc: str,
+    wall_clock_seconds: float,
+) -> dict[str, Any]:
+    price_coverage_status = "ok" if price_row.get("ok") else "data_gap"
+    agent_hashes = {agent_id: str(agent_outputs[agent_id].get("output_hash") or "") for agent_id in V3_AGENT_IDS}
+    agent_timings = {
+        V3_AGENT_TIMING_KEYS[agent_id]: float(agent_outputs[agent_id].get("duration_seconds") or 0.0)
+        for agent_id in V3_AGENT_IDS
+    }
+    agent_timings["total_wall_clock_seconds"] = round(wall_clock_seconds, 3)
+    statuses = {agent_id: str(agent_outputs[agent_id].get("status") or "") for agent_id in V3_AGENT_IDS}
+    all_gaps: list[str] = []
+    all_watch: list[str] = []
+    for output in agent_outputs.values():
+        all_gaps.extend(sanitize_list(output.get("evidence_gaps")))
+        all_watch.extend(sanitize_list(output.get("watch_conditions")))
+    evidence_gaps = dedupe_preserve_order(all_gaps)[:12] or ["No specific evidence gap was reported."]
+    watch_conditions = dedupe_preserve_order(all_watch)[:12] or ["Next verified public update."]
+    chairman = agent_outputs["chairman_synthesis"]
+    red_team = agent_outputs["red_team_audit"]
+    failed_agents = [agent_id for agent_id, status in statuses.items() if status == "failed"]
+    red_verdict = str(red_team.get("final_red_team_verdict") or "needs_review")
+    research_status = str(chairman.get("research_status") or "")
+    if price_coverage_status == "data_gap":
+        research_status = "data_gap"
+    elif failed_agents or red_verdict in {"needs_review", "blocked"}:
+        research_status = "needs_review" if red_verdict != "blocked" else "high_uncertainty"
+    elif research_status not in {"candidate", "watch", "avoid", "needs_review", "data_gap", "high_uncertainty"}:
+        research_status = "watch"
+    public_summary = section_summary(
+        {"summary": "; ".join(sanitize_list(chairman.get("findings"))[:3])},
+        f"Independent-agent research synthesis for {item['exchange']}:{item['symbol']}.",
+    )
+    payload = {
+        "schema": SYMBOL_SCHEMA_V3,
+        "prompt_template_version": PROMPT_TEMPLATE_VERSION_V3,
+        "methodology_version": METHODOLOGY_VERSION_V3,
+        "execution_model": EXECUTION_MODEL_V3,
+        "run_id": config.run_id,
+        "symbol": item["symbol"],
+        "exchange": item["exchange"],
+        "provider_ticker": item["provider_ticker"],
+        "as_of_date": config.as_of_date.isoformat(),
+        "trading_date": trading_date_for_exchange(item["exchange"], exchange_dates_for_config(config)).isoformat(),
+        "price_coverage_status": price_coverage_status,
+        "price_context": public_price_context(price_row),
+        "agent_outputs": agent_outputs,
+        "agent_hashes": agent_hashes,
+        "agent_timings": agent_timings,
+        "parallelism": {
+            "symbol_parallelism": config.max_concurrency,
+            "agent_parallelism": config.agent_concurrency,
+            "kfwg_ran_in_parallel": config.agent_concurrency > 1,
+        },
+        "research_status": research_status,
+        "judge_status": "pending",
+        "evidence_gaps": evidence_gaps,
+        "watch_conditions": watch_conditions,
+        "public_summary": public_summary,
+        "reader_boundary": READER_BOUNDARY,
+        "reader_boundary_zh": READER_BOUNDARY_ZH,
+        "boundary": list(BOUNDARY_LINES),
+        "started_at_utc": started_at_utc,
+        "finished_at_utc": utc_now_iso(),
+        "red_team_verdict": red_verdict,
+        "agent_statuses": statuses,
+        "failure_records": [
+            {
+                "agent_id": agent_id,
+                "status": "failed",
+                "failure_reason": agent_outputs[agent_id].get("failure_reason", "agent_failed"),
+                "output_hash": agent_hashes[agent_id],
+            }
+            for agent_id in failed_agents
+        ],
+        # v2-compatible summary fields for public readers that consume Markdown-derived sections.
+        "research_summary": public_summary,
+        "key_updates": v3_section_list(agent_outputs["k_deep_research"], "K agent did not report findings."),
+        "research_context": {"summary": public_summary, "price_context": public_price_context(price_row)},
+        "k_deep_research": {"summary": "; ".join(v3_section_list(agent_outputs["k_deep_research"], "K agent unavailable."))},
+        "f_partner_view": {"summary": "; ".join(v3_section_list(agent_outputs["f_partner_view"], "F agent unavailable."))},
+        "w_partner_view": {"summary": "; ".join(v3_section_list(agent_outputs["w_partner_view"], "W agent unavailable."))},
+        "g_partner_view": {"summary": "; ".join(v3_section_list(agent_outputs["g_partner_view"], "G agent unavailable."))},
+        "chairman_synthesis": {"summary": "; ".join(v3_section_list(chairman, "Chairman unavailable."))},
+        "red_team_audit": {"summary": "; ".join(v3_section_list(red_team, "Red-team unavailable."))},
+        "positive_case": v3_section_list(agent_outputs["f_partner_view"], "F agent unavailable."),
+        "negative_case": v3_section_list(agent_outputs["w_partner_view"], "W agent unavailable."),
+        "red_team_review": v3_section_list(red_team, "Red-team unavailable."),
+        "risk_factors": v3_section_list(agent_outputs["g_partner_view"], "G agent unavailable."),
+        "watch_items": watch_conditions,
+        "source_notes": ["Public-safe independent-agent outputs; raw provider I/O is not embedded."],
+        "confidence_boundary": str(chairman.get("confidence_boundary") or "Confidence is bounded by evidence freshness, data coverage, and red-team verdict."),
+    }
+    payload["research_packet_hash"] = stable_hash(
+        {
+            "schema": SYMBOL_SCHEMA_V3,
+            "run_id": config.run_id,
+            "symbol": item["symbol"],
+            "exchange": item["exchange"],
+            "agent_hashes": agent_hashes,
+            "research_status": research_status,
+        }
+    )
+    assert_public_safe(payload)
+    return payload
+
+
+def dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = sanitize_text(str(value))[:500]
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def judge_symbol_v3(symbol_payload: dict[str, Any]) -> tuple[str, list[str]]:
+    assert_public_safe(symbol_payload)
+    statuses = agent_statuses(symbol_payload)
+    failed_agents = [agent_id for agent_id, status in statuses.items() if status == "failed"]
+    if failed_agents:
+        return "blocked", [f"independent agent failure: {','.join(failed_agents)}"]
+    if symbol_payload["price_coverage_status"] == "data_gap":
+        return "needs_review", ["price coverage is data_gap; v3 cannot promote this symbol"]
+    verdict = red_team_verdict(symbol_payload)
+    if verdict == "blocked":
+        return "blocked", ["red-team verdict blocked"]
+    if verdict == "needs_review":
+        return "needs_review", ["red-team verdict needs_review"]
+    empty_hashes = [agent_id for agent_id, value in symbol_payload["agent_hashes"].items() if not value]
+    if empty_hashes:
+        return "blocked", [f"missing independent agent hash: {','.join(empty_hashes)}"]
+    return "publish", ["public-safe v3 independent-agent research object passed local judge gate"]
+
+
+def run_symbol_v3(
+    item: dict[str, str],
+    price_row: dict[str, Any],
+    config: FullAnalystConfig,
+    runner: AnalystRunner,
+    alaya_client: AlayaSyncClient,
+) -> dict[str, Any]:
+    started_at = utc_now_iso()
+    started = time.monotonic()
+    kfwg_outputs = run_v3_kfwg_agents(item, price_row, config, runner)
+    chairman_output = run_v3_agent(
+        "chairman_synthesis",
+        item,
+        price_row,
+        config,
+        runner,
+        dependencies=kfwg_outputs,
+    )
+    outputs_for_red_team = {**kfwg_outputs, "chairman_synthesis": chairman_output}
+    red_team_output = run_v3_agent(
+        "red_team_audit",
+        item,
+        price_row,
+        config,
+        runner,
+        dependencies=outputs_for_red_team,
+    )
+    agent_outputs = {**outputs_for_red_team, "red_team_audit": red_team_output}
+    symbol_payload = aggregate_v3_symbol_payload(
+        item=item,
+        price_row=price_row,
+        config=config,
+        agent_outputs=agent_outputs,
+        started_at_utc=started_at,
+        wall_clock_seconds=time.monotonic() - started,
+    )
+    judge_status, judge_reasons = judge_symbol_v3(symbol_payload)
+    symbol_payload["judge_status"] = judge_status
+    symbol_payload["judge_reasons"] = judge_reasons
+    alaya_result = alaya_sync(symbol_payload, alaya_client, config)
+    symbol_payload["alaya_sync_status"] = alaya_result["status"]
+    symbol_payload["alaya_sync_ref"] = alaya_result.get("event_id", "")
+    symbol_payload["alaya_event_hash"] = alaya_result.get("event_hash", "")
+    symbol_payload["alaya_event_schema"] = alaya_result.get("event_schema", ALAYA_EVENT_SCHEMA_V3)
+    symbol_payload["public_payload_hash"] = alaya_result.get("public_payload_hash", "")
+    symbol_payload["alaya_readback_status"] = alaya_result.get("readback_status", "not_applicable")
+    symbol_payload["alaya_failure_reason"] = alaya_result.get("reason", "")
+    symbol_payload["alaya_write_seconds"] = float(alaya_result.get("write_seconds") or 0.0)
+    symbol_payload["alaya_readback_seconds"] = float(alaya_result.get("readback_seconds") or 0.0)
+    symbol_payload["alaya_total_seconds"] = float(alaya_result.get("total_seconds") or 0.0)
+    return {
+        "status": "success",
+        "symbol": item["symbol"],
+        "exchange": item["exchange"],
+        "provider_ticker": item["provider_ticker"],
+        "price_coverage_status": symbol_payload["price_coverage_status"],
+        "judge_status": judge_status,
+        "judge_reasons": judge_reasons,
+        "alaya_sync_status": alaya_result["status"],
+        "alaya_sync_ref": alaya_result.get("event_id", ""),
+        "alaya_event_hash": alaya_result.get("event_hash", ""),
+        "alaya_event_schema": alaya_result.get("event_schema", ALAYA_EVENT_SCHEMA_V3),
+        "public_payload_hash": alaya_result.get("public_payload_hash", ""),
+        "alaya_readback_status": alaya_result.get("readback_status", "not_applicable"),
+        "alaya_failure_reason": alaya_result.get("reason", ""),
+        "alaya_write_seconds": float(alaya_result.get("write_seconds") or 0.0),
+        "alaya_readback_seconds": float(alaya_result.get("readback_seconds") or 0.0),
+        "alaya_total_seconds": float(alaya_result.get("total_seconds") or 0.0),
+        "attempts": 1,
+        "attempt_metrics": [],
+        "started_at_utc": started_at,
+        "finished_at_utc": utc_now_iso(),
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "agent_calls_total": len(V3_AGENT_IDS),
+        "research": symbol_payload,
+    }
+
+
 def run_symbol(
     item: dict[str, str],
     price_row: dict[str, Any],
@@ -817,6 +1560,8 @@ def run_symbol(
     runner: AnalystRunner,
     alaya_client: AlayaSyncClient,
 ) -> dict[str, Any]:
+    if is_v3_config(config):
+        return run_symbol_v3(item, price_row, config, runner, alaya_client)
     started_at = utc_now_iso()
     started = time.monotonic()
     attempts: list[dict[str, Any]] = []
@@ -1036,6 +1781,142 @@ def sanitize_symbol_payload(
     return sanitized
 
 
+def sanitize_v3_agent_output(
+    payload: dict[str, Any],
+    *,
+    agent_id: str,
+    item: dict[str, str],
+    config: FullAnalystConfig,
+    input_context_hash: str,
+    started_at: str,
+    finished_at: str,
+    duration_seconds: float,
+) -> dict[str, Any]:
+    forbidden_keys = [key for key in payload if FORBIDDEN_OUTPUT_KEY_RE.match(str(key))]
+    if forbidden_keys:
+        raise ValueError(f"forbidden_raw_io_keys: {','.join(sorted(forbidden_keys))}")
+    required = (
+        "agent_id",
+        "agent_role",
+        "schema",
+        "symbol",
+        "exchange",
+        "run_id",
+        "status",
+        "findings",
+        "evidence_refs",
+        "evidence_gaps",
+        "uncertainties",
+        "watch_conditions",
+        "boundary",
+    )
+    missing = [key for key in required if key not in payload]
+    if missing:
+        raise ValueError(f"missing_required_fields:{','.join(missing)}")
+    status = sanitize_text(str(payload.get("status") or "")).lower()
+    if status not in {"ok", "needs_review", "failed"}:
+        status = "needs_review"
+    output: dict[str, Any] = {
+        "agent_id": agent_id,
+        "agent_role": sanitize_text(str(payload.get("agent_role") or V3_AGENT_ROLE_LABELS[agent_id]))[:240],
+        "schema": AGENT_OUTPUT_SCHEMA_V3,
+        "symbol": item["symbol"],
+        "exchange": item["exchange"],
+        "run_id": config.run_id,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_seconds": round(duration_seconds, 3),
+        "model": sanitize_text(str(payload.get("model") or config.model))[:120],
+        "prompt_template_version": PROMPT_TEMPLATE_VERSION_V3,
+        "input_context_hash": input_context_hash,
+        "output_hash": "",
+        "status": status,
+        "findings": sanitize_list(payload.get("findings")) or ["No public-safe findings were returned."],
+        "evidence_refs": sanitize_list(payload.get("evidence_refs")),
+        "evidence_gaps": sanitize_list(payload.get("evidence_gaps")) or ["Evidence gap not specified."],
+        "uncertainties": sanitize_list(payload.get("uncertainties")) or ["Uncertainty not specified."],
+        "watch_conditions": sanitize_list(payload.get("watch_conditions")) or ["Next verified public update."],
+        "boundary": "research content only; does not constitute investment advice",
+    }
+    if agent_id == "chairman_synthesis":
+        output["research_status"] = normalize_research_status(
+            payload.get("research_status"),
+            price_coverage_status="data_gap" if "data_gap" in " ".join(output["evidence_gaps"]).lower() else "ok",
+        )
+        output["confidence_boundary"] = sanitize_text(str(payload.get("confidence_boundary") or "Confidence is bounded by evidence freshness and data coverage."))[:500]
+        output["next_verification_steps"] = sanitize_list(payload.get("next_verification_steps")) or output["watch_conditions"]
+    if agent_id == "red_team_audit":
+        verdict = sanitize_text(str(payload.get("final_red_team_verdict") or payload.get("red_team_verdict") or "needs_review")).lower()
+        output["final_red_team_verdict"] = verdict if verdict in {"pass", "needs_review", "blocked"} else "needs_review"
+        output["contradiction_list"] = sanitize_list(payload.get("contradiction_list"))
+        output["possible_hallucinations"] = sanitize_list(payload.get("possible_hallucinations"))
+        output["overconfidence_risks"] = sanitize_list(payload.get("overconfidence_risks"))
+    output["output_hash"] = v3_agent_output_hash(output)
+    assert_public_safe(output)
+    return output
+
+
+def v3_agent_output_hash(output: dict[str, Any]) -> str:
+    hash_basis = {
+        key: value
+        for key, value in output.items()
+        if key not in {"started_at", "finished_at", "duration_seconds", "output_hash"}
+    }
+    return stable_hash(hash_basis)
+
+
+def v3_agent_failure_record(
+    *,
+    agent_id: str,
+    item: dict[str, str],
+    config: FullAnalystConfig,
+    input_context_hash: str,
+    started_at: str,
+    finished_at: str,
+    duration_seconds: float,
+    reason: str,
+) -> dict[str, Any]:
+    public_reason = public_safe_failure_category(reason)
+    output = {
+        "agent_id": agent_id,
+        "agent_role": V3_AGENT_ROLE_LABELS.get(agent_id, agent_id),
+        "schema": AGENT_OUTPUT_SCHEMA_V3,
+        "symbol": item["symbol"],
+        "exchange": item["exchange"],
+        "run_id": config.run_id,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_seconds": round(duration_seconds, 3),
+        "model": config.model,
+        "prompt_template_version": PROMPT_TEMPLATE_VERSION_V3,
+        "input_context_hash": input_context_hash,
+        "output_hash": "",
+        "status": "failed",
+        "failure_reason": public_reason,
+        "findings": [f"{agent_id} failed with public-safe category {public_reason}."],
+        "evidence_refs": [],
+        "evidence_gaps": [f"{agent_id} output unavailable; failure record preserved."],
+        "uncertainties": ["The symbol cannot be promoted without reviewing this failed independent agent call."],
+        "watch_conditions": ["Review the independent agent failure record and rerun after fixing the blocker."],
+        "boundary": "research content only; does not constitute investment advice",
+    }
+    if agent_id == "red_team_audit":
+        output["final_red_team_verdict"] = "blocked"
+    output["output_hash"] = v3_agent_output_hash(output)
+    assert_public_safe(output)
+    return output
+
+
+def write_v3_agent_private_record(
+    config: FullAnalystConfig,
+    item: dict[str, str],
+    agent_id: str,
+    payload: dict[str, Any],
+) -> None:
+    path = private_run_dir(config) / "agents" / f"{item['exchange']}_{item['symbol']}_{agent_id}.json"
+    write_private_json_atomic(path, payload)
+
+
 def sanitize_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [sanitize_text(str(item))[:500] for item in value if str(item).strip()][:12]
@@ -1109,7 +1990,7 @@ def judge_symbol(symbol_payload: dict[str, Any]) -> tuple[str, list[str]]:
 
 
 def alaya_sync(symbol_payload: dict[str, Any], alaya_client: AlayaSyncClient, config: FullAnalystConfig) -> dict[str, Any]:
-    if symbol_payload["judge_status"] != "publish":
+    if symbol_payload["judge_status"] != "publish" and symbol_payload.get("schema") != SYMBOL_SCHEMA_V3:
         return {
             "status": "skipped",
             "reason": "judge_status_not_publish",
@@ -1207,6 +2088,10 @@ def build_status(
     report_path: Path,
     status_path: Path,
 ) -> dict[str, Any]:
+    active_schema = symbol_schema_for_config(config)
+    active_prompt_template = prompt_template_for_config(config)
+    active_methodology = methodology_for_config(config)
+    active_execution_model = execution_model_for_config(config)
     failed = [row for row in results if row["status"] != "success"]
     blocked = [row for row in results if row["judge_status"] == "blocked"]
     needs_review = [row for row in results if row["judge_status"] == "needs_review"]
@@ -1289,6 +2174,12 @@ def build_status(
         "llm_runner": config.llm_runner,
         "llm_model": config.model,
         "max_concurrency": config.max_concurrency,
+        "agent_concurrency": config.agent_concurrency if is_v3_config(config) else None,
+        "agent_parallelism": config.agent_concurrency if is_v3_config(config) else None,
+        "v3_independent_agents": is_v3_config(config),
+        "requested_execution_model": config.requested_execution_model,
+        "explicit_v2_fallback": config.explicit_v2_fallback,
+        "agent_calls_total": sum(int(row.get("agent_calls_total") or 0) for row in results),
         "reasoning_effort": config.reasoning_effort,
         "timeout_seconds": config.per_symbol_timeout_seconds,
         "retries": config.retries,
@@ -1296,11 +2187,11 @@ def build_status(
         "candidate_service": config.candidate_service,
         "candidate_timer": config.candidate_timer,
         "rollback_hint": rollback_hint(config),
-        "prompt_template_version": PROMPT_TEMPLATE_VERSION,
-        "symbol_schema": SYMBOL_SCHEMA,
-        "methodology_version": METHODOLOGY_VERSION,
-        "execution_model": EXECUTION_MODEL,
-        "alaya_event_schema": ALAYA_EVENT_SCHEMA,
+        "prompt_template_version": active_prompt_template,
+        "symbol_schema": active_schema,
+        "methodology_version": active_methodology,
+        "execution_model": active_execution_model,
+        "alaya_event_schema": ALAYA_EVENT_SCHEMA_V3 if is_v3_config(config) else ALAYA_EVENT_SCHEMA,
         "boundary": list(BOUNDARY_LINES),
         "report_file": report_path.name,
         "latest_public_report_file": report_path.name,
@@ -1525,6 +2416,11 @@ def render_markdown(status: dict[str, Any], results: list[dict[str, Any]]) -> st
         f"- llm_runner: {status['llm_runner']}",
         f"- llm_model: {status['llm_model']}",
         f"- max_concurrency: {status.get('max_concurrency')}",
+        f"- agent_concurrency: {status.get('agent_concurrency') if status.get('agent_concurrency') is not None else 'not_applicable'}",
+        f"- v3_independent_agents: {status.get('v3_independent_agents')}",
+        f"- requested_execution_model: {status.get('requested_execution_model')}",
+        f"- explicit_v2_fallback: {status.get('explicit_v2_fallback')}",
+        f"- agent_calls_total: {status.get('agent_calls_total')}",
         f"- prompt_template_version: {status.get('prompt_template_version')}",
         f"- symbol_schema: {status.get('symbol_schema')}",
         f"- methodology_version: {status.get('methodology_version')}",
@@ -1566,6 +2462,9 @@ def render_markdown(status: dict[str, Any], results: list[dict[str, Any]]) -> st
             [
                 f"### {row['exchange']}:{row['symbol']}",
                 "",
+                f"- execution_model: {research.get('execution_model', status.get('execution_model', 'not_reported')) if research else status.get('execution_model', 'not_reported')}",
+                f"- prompt_template_version: {research.get('prompt_template_version', status.get('prompt_template_version', 'not_reported')) if research else status.get('prompt_template_version', 'not_reported')}",
+                f"- methodology_version: {research.get('methodology_version', status.get('methodology_version', 'not_reported')) if research else status.get('methodology_version', 'not_reported')}",
                 f"- price_coverage_status: {row['price_coverage_status']}",
                 f"- judge_status: {row['judge_status']}",
                 f"- research_status: {research.get('research_status', 'not_reported') if research else 'not_reported'}",
@@ -1600,6 +2499,34 @@ def render_markdown(status: dict[str, Any], results: list[dict[str, Any]]) -> st
                 "",
             ]
         )
+        if research.get("schema") == SYMBOL_SCHEMA_V3:
+            lines.extend(
+                [
+                    "- agent_statuses:",
+                    *[
+                        f"  - {agent_id}: {research.get('agent_statuses', {}).get(agent_id, 'not_reported')}"
+                        for agent_id in V3_AGENT_IDS
+                    ],
+                    "- agent_hashes:",
+                    *[
+                        f"  - {agent_id}: {research.get('agent_hashes', {}).get(agent_id, '')}"
+                        for agent_id in V3_AGENT_IDS
+                    ],
+                    "- agent_timings:",
+                    *[
+                        f"  - {key}: {value}"
+                        for key, value in research.get("agent_timings", {}).items()
+                    ],
+                    "- parallelism:",
+                    *[
+                        f"  - {key}: {value}"
+                        for key, value in research.get("parallelism", {}).items()
+                    ],
+                    f"- red_team_verdict: {research.get('red_team_verdict', 'not_reported')}",
+                    f"- public_payload_hash: {research.get('public_payload_hash', row.get('public_payload_hash', ''))}",
+                    "",
+                ]
+            )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -1694,6 +2621,20 @@ def append_event(config: FullAnalystConfig, event_type: str, payload: dict[str, 
 def write_failure_records(config: FullAnalystConfig, results: list[dict[str, Any]], status: dict[str, Any]) -> None:
     failures = []
     for row in results:
+        research = row.get("research") if isinstance(row.get("research"), dict) else {}
+        for failure in research.get("failure_records", []) if isinstance(research.get("failure_records"), list) else []:
+            failures.append(
+                {
+                    "run_id": config.run_id,
+                    "created_at_utc": utc_now_iso(),
+                    "exchange": row["exchange"],
+                    "symbol": row["symbol"],
+                    "agent_id": failure.get("agent_id", "unknown_agent"),
+                    "agent_output_hash": failure.get("output_hash", ""),
+                    "category": public_safe_failure_category(str(failure.get("failure_reason") or "agent_failed")),
+                    "stage": "independent_agent_call",
+                }
+            )
         if row["status"] == "success" and row["judge_status"] != "blocked" and row["alaya_sync_status"] != "failed":
             continue
         failures.append(

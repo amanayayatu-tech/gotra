@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from itertools import count
 from pathlib import Path
@@ -10,16 +12,23 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     LOOP_SMOKE_MODE,
     MODE,
     ALAYA_EVENT_SCHEMA,
+    ALAYA_EVENT_SCHEMA_V3,
     EXECUTION_MODEL,
+    EXECUTION_MODEL_V3,
     FullAnalystConfig,
     GotraInternalAlayaSyncClient,
     METHODOLOGY_VERSION,
+    METHODOLOGY_VERSION_V3,
     MockAlayaSyncClient,
     PROMPT_TEMPLATE_VERSION,
+    PROMPT_TEMPLATE_VERSION_V3,
     SYMBOL_SCHEMA,
+    SYMBOL_SCHEMA_V3,
     assert_public_safe,
     build_prompt,
     config_from_args,
+    fixture_v3_agent_output,
+    prompt_input_payload,
     parse_args,
     run,
     selected_universe,
@@ -97,6 +106,59 @@ class StaticRunner:
     def complete(self, prompt_text: str, *, timeout_seconds: int) -> RunnerResult:
         del prompt_text, timeout_seconds
         return RunnerResult(True, text=json.dumps(self.payload), elapsed_seconds=0.01, returncode=0)
+
+
+class V3FixtureRunner:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def complete(self, prompt_text: str, *, timeout_seconds: int) -> RunnerResult:
+        del timeout_seconds
+        payload = prompt_input_payload(prompt_text)
+        self.calls.append(str(payload["agent_id"]))
+        return RunnerResult(True, text=json.dumps(fixture_v3_agent_output(payload)), elapsed_seconds=0.01, returncode=0)
+
+
+class V3FailingAgentRunner(V3FixtureRunner):
+    def __init__(self, failed_agent: str) -> None:
+        super().__init__()
+        self.failed_agent = failed_agent
+
+    def complete(self, prompt_text: str, *, timeout_seconds: int) -> RunnerResult:
+        payload = prompt_input_payload(prompt_text)
+        self.calls.append(str(payload["agent_id"]))
+        if payload["agent_id"] == self.failed_agent:
+            return RunnerResult(False, reason="simulated independent agent failure", elapsed_seconds=0.01, returncode=1)
+        return RunnerResult(True, text=json.dumps(fixture_v3_agent_output(payload)), elapsed_seconds=0.01, returncode=0)
+
+
+class V3OrderingRunner(V3FixtureRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lock = threading.Lock()
+        self.started: dict[str, float] = {}
+        self.finished: dict[str, float] = {}
+        self.order_errors: list[str] = []
+
+    def complete(self, prompt_text: str, *, timeout_seconds: int) -> RunnerResult:
+        del timeout_seconds
+        payload = prompt_input_payload(prompt_text)
+        agent_id = str(payload["agent_id"])
+        with self.lock:
+            self.calls.append(agent_id)
+            self.started[agent_id] = time.monotonic()
+            if agent_id == "chairman_synthesis":
+                missing = [key for key in ("k_deep_research", "f_partner_view", "w_partner_view", "g_partner_view") if key not in self.finished]
+                if missing:
+                    self.order_errors.append(f"chairman_started_before:{','.join(missing)}")
+            if agent_id == "red_team_audit" and "chairman_synthesis" not in self.finished:
+                self.order_errors.append("red_team_started_before_chairman")
+        if agent_id in {"k_deep_research", "f_partner_view", "w_partner_view", "g_partner_view"}:
+            time.sleep(0.05)
+        response = fixture_v3_agent_output(payload)
+        with self.lock:
+            self.finished[agent_id] = time.monotonic()
+        return RunnerResult(True, text=json.dumps(response), elapsed_seconds=0.01, returncode=0)
 
 
 class StatusReadingRunner(StaticRunner):
@@ -378,6 +440,141 @@ def test_v2_payload_preserves_ksana_sections_and_compatibility_fields(tmp_path: 
     assert symbol_payload["red_team_review"]
     assert symbol_payload["evidence_gaps"] == ["Source freshness still needs regular review."]
     assert symbol_payload["watch_conditions"] == ["Next verified public filing."]
+
+
+def test_v3_fixture_run_writes_independent_agent_schema_and_hashes(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    cfg = FullAnalystConfig(
+        **{
+            **cfg.__dict__,
+            "v3_independent_agents": True,
+            "execution_model": EXECUTION_MODEL_V3,
+            "requested_execution_model": EXECUTION_MODEL_V3,
+            "agent_concurrency": 4,
+            "alaya_mode": "real",
+        }
+    )
+    state_path = cfg.private_audit_root / "cognition_flywheel" / "full_analyst_memory_events.jsonl"
+    runner = V3FixtureRunner()
+
+    exit_code = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=runner,
+        alaya_client=GotraInternalAlayaSyncClient(state_path=state_path, actor="test/full_analyst_pipeline"),
+    )
+
+    status = json.loads((cfg.output_dir / "status_full_analyst_evening_hk.json").read_text())
+    symbol_payload = json.loads((cfg.output_dir / "symbols" / "HKEX_0700.json").read_text())
+    records = [json.loads(line) for line in state_path.read_text().splitlines() if line.strip()]
+    assert exit_code == 0
+    assert runner.calls.count("k_deep_research") == 1
+    assert runner.calls.count("f_partner_view") == 1
+    assert runner.calls.count("w_partner_view") == 1
+    assert runner.calls.count("g_partner_view") == 1
+    assert runner.calls.count("chairman_synthesis") == 1
+    assert runner.calls.count("red_team_audit") == 1
+    assert status["prompt_template_version"] == PROMPT_TEMPLATE_VERSION_V3
+    assert status["symbol_schema"] == SYMBOL_SCHEMA_V3
+    assert status["methodology_version"] == METHODOLOGY_VERSION_V3
+    assert status["execution_model"] == EXECUTION_MODEL_V3
+    assert status["agent_parallelism"] == 4
+    assert status["agent_calls_total"] == 6
+    assert status["alaya_event_schema"] == ALAYA_EVENT_SCHEMA_V3
+    assert symbol_payload["schema"] == SYMBOL_SCHEMA_V3
+    assert symbol_payload["execution_model"] == EXECUTION_MODEL_V3
+    assert set(symbol_payload["agent_outputs"]) == {
+        "k_deep_research",
+        "f_partner_view",
+        "w_partner_view",
+        "g_partner_view",
+        "chairman_synthesis",
+        "red_team_audit",
+    }
+    assert all(symbol_payload["agent_hashes"].values())
+    assert symbol_payload["agent_hashes"]["chairman_synthesis"] == symbol_payload["agent_outputs"]["chairman_synthesis"]["output_hash"]
+    assert symbol_payload["parallelism"]["kfwg_ran_in_parallel"] is True
+    assert symbol_payload["agent_timings"]["total_wall_clock_seconds"] >= 0
+    assert records[0]["event_schema"] == ALAYA_EVENT_SCHEMA_V3
+    assert records[0]["cognition_flywheel_layer"] == "full_analyst_independent_agents"
+    assert records[0]["agent_hashes"] == symbol_payload["agent_hashes"]
+    assert records[0]["public_payload_hash"] == symbol_payload["public_payload_hash"]
+
+
+def test_v3_kfwg_parallel_then_chairman_then_red_team(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    cfg = FullAnalystConfig(
+        **{
+            **cfg.__dict__,
+            "v3_independent_agents": True,
+            "execution_model": EXECUTION_MODEL_V3,
+            "requested_execution_model": EXECUTION_MODEL_V3,
+            "agent_concurrency": 4,
+        }
+    )
+    runner = V3OrderingRunner()
+
+    exit_code = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=runner,
+        alaya_client=RecordingAlaya(),
+    )
+
+    assert exit_code == 0
+    assert runner.order_errors == []
+    kfwg_starts = [runner.started[key] for key in ("k_deep_research", "f_partner_view", "w_partner_view", "g_partner_view")]
+    assert max(kfwg_starts) - min(kfwg_starts) < 0.08
+    assert runner.started["chairman_synthesis"] >= max(runner.finished[key] for key in ("k_deep_research", "f_partner_view", "w_partner_view", "g_partner_view"))
+    assert runner.started["red_team_audit"] >= runner.finished["chairman_synthesis"]
+
+
+def test_v3_agent_failure_blocks_symbol_and_preserves_failure_readback(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    cfg = FullAnalystConfig(
+        **{
+            **cfg.__dict__,
+            "v3_independent_agents": True,
+            "execution_model": EXECUTION_MODEL_V3,
+            "requested_execution_model": EXECUTION_MODEL_V3,
+            "agent_concurrency": 4,
+            "alaya_mode": "real",
+        }
+    )
+    state_path = cfg.private_audit_root / "cognition_flywheel" / "full_analyst_memory_events.jsonl"
+
+    exit_code = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=V3FailingAgentRunner("w_partner_view"),
+        alaya_client=GotraInternalAlayaSyncClient(state_path=state_path, actor="test/full_analyst_pipeline"),
+    )
+
+    status = json.loads((cfg.output_dir / "status_full_analyst_evening_hk.json").read_text())
+    symbol_payload = json.loads((cfg.output_dir / "symbols" / "HKEX_0700.json").read_text())
+    records = [json.loads(line) for line in state_path.read_text().splitlines() if line.strip()]
+    failures = [json.loads(line) for line in (cfg.private_audit_root / cfg.run_id / "failures.jsonl").read_text().splitlines()]
+    assert exit_code == 2
+    assert status["blocked_count"] == 1
+    assert status["alaya_readback_status"] == "verified"
+    assert symbol_payload["agent_outputs"]["w_partner_view"]["status"] == "failed"
+    assert symbol_payload["failure_records"][0]["agent_id"] == "w_partner_view"
+    assert records[0]["failure_records"][0]["agent_id"] == "w_partner_view"
+    assert any(row.get("agent_id") == "w_partner_view" for row in failures)
+
+
+def test_v3_requested_can_explicitly_fallback_to_v2() -> None:
+    args = parse_args(["--mode", MODE, "--v3-independent-agents", "--fallback-to-v2"])
+
+    cfg = config_from_args(args)
+
+    assert cfg.requested_execution_model == EXECUTION_MODEL_V3
+    assert cfg.execution_model == EXECUTION_MODEL
+    assert cfg.v3_independent_agents is False
+    assert cfg.explicit_v2_fallback is True
 
 
 def test_missing_required_field_becomes_blocked_failure(tmp_path: Path) -> None:
