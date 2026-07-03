@@ -9,9 +9,14 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     LOOP_MODE,
     LOOP_SMOKE_MODE,
     MODE,
+    ALAYA_EVENT_SCHEMA,
+    EXECUTION_MODEL,
     FullAnalystConfig,
     GotraInternalAlayaSyncClient,
+    METHODOLOGY_VERSION,
     MockAlayaSyncClient,
+    PROMPT_TEMPLATE_VERSION,
+    SYMBOL_SCHEMA,
     assert_public_safe,
     build_prompt,
     config_from_args,
@@ -174,6 +179,39 @@ def valid_payload(symbol: str = "0700") -> dict[str, object]:
     }
 
 
+def valid_v2_payload(symbol: str = "0700") -> dict[str, object]:
+    return {
+        "schema": SYMBOL_SCHEMA,
+        "prompt_template_version": PROMPT_TEMPLATE_VERSION,
+        "methodology_version": METHODOLOGY_VERSION,
+        "execution_model": EXECUTION_MODEL,
+        "symbol": symbol,
+        "exchange": "HKEX",
+        "provider_ticker": f"{symbol}.HK",
+        "as_of_date": "2026-06-29",
+        "price_coverage_status": "ok",
+        "research_context": {
+            "scope": "Public-source research frame.",
+            "source_freshness": "Use verified public updates.",
+        },
+        "k_deep_research": {
+            "summary": "K view maps upstream drivers and source freshness.",
+            "evidence_focus": ["public filings", "market structure"],
+        },
+        "f_partner_view": {"summary": "Constructive case depends on verified demand signals."},
+        "w_partner_view": {"summary": "Cautious case highlights valuation and competition pressure."},
+        "g_partner_view": {"summary": "Governance view keeps evidence gaps visible."},
+        "chairman_synthesis": {"summary": "Integrated research status remains watch."},
+        "red_team_audit": {"summary": "Do not turn uncertainty into an action-like answer."},
+        "evidence_gaps": ["Source freshness still needs regular review."],
+        "watch_conditions": ["Next verified public filing."],
+        "research_status": "watch",
+        "confidence_boundary": "Bounded by public evidence freshness.",
+        "source_notes": ["Public-safe source note."],
+        "reader_boundary": "Research content only. This does not constitute investment advice.",
+    }
+
+
 def test_fixture_run_writes_independent_public_and_static_artifacts(tmp_path: Path) -> None:
     cfg = config(tmp_path)
 
@@ -207,6 +245,11 @@ def test_fixture_run_writes_independent_public_and_static_artifacts(tmp_path: Pa
     assert status["stage_statuses"]["public_safety_scan"] == "ok"
     assert status["alaya_synced_count"] == 2
     assert status["provider_model_io_embedded"] is False
+    assert status["prompt_template_version"] == PROMPT_TEMPLATE_VERSION
+    assert status["symbol_schema"] == SYMBOL_SCHEMA
+    assert status["methodology_version"] == METHODOLOGY_VERSION
+    assert status["execution_model"] == EXECUTION_MODEL
+    assert status["alaya_event_schema"] == ALAYA_EVENT_SCHEMA
     assert "local checks + one-shot runtime smoke" in status["evidence_layer"]
     assert (cfg.private_audit_root / cfg.run_id / "heartbeat.json").exists()
     assert (cfg.private_audit_root / cfg.run_id / "events.jsonl").exists()
@@ -292,8 +335,40 @@ def test_real_alaya_uses_gotra_internal_state_hash_chain(tmp_path: Path) -> None
     assert status["alaya_readback_status"] == "verified"
     assert status["alaya_readback_verified_count"] == 1
     assert records[0]["event_type"] == "full_analyst_memory_sync"
-    assert records[0]["cognition_flywheel_layer"] == "full_analyst_public_research"
+    assert records[0]["event_schema"] == ALAYA_EVENT_SCHEMA
+    assert records[0]["cognition_flywheel_layer"] == "full_analyst_ksana_4_1_lite"
+    assert records[0]["methodology_version"] == METHODOLOGY_VERSION
+    assert records[0]["execution_model"] == EXECUTION_MODEL
+    assert records[0]["agent_outputs"]["k_deep_research"]
+    assert records[0]["public_payload_hash"] == event_meta["public_payload_hash"]
     assert records[0]["event_hash"] == event_meta["event_hash"]
+
+
+def test_v2_payload_preserves_ksana_sections_and_compatibility_fields(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+
+    exit_code = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=StaticRunner(valid_v2_payload()),
+        alaya_client=RecordingAlaya(),
+    )
+
+    symbol_payload = json.loads((cfg.output_dir / "symbols" / "HKEX_0700.json").read_text())
+    assert exit_code == 0
+    assert symbol_payload["schema"] == SYMBOL_SCHEMA
+    assert symbol_payload["prompt_template_version"] == PROMPT_TEMPLATE_VERSION
+    assert symbol_payload["methodology_version"] == METHODOLOGY_VERSION
+    assert symbol_payload["execution_model"] == EXECUTION_MODEL
+    assert symbol_payload["k_deep_research"]["summary"].startswith("K view")
+    assert symbol_payload["chairman_synthesis"]["summary"] == "Integrated research status remains watch."
+    assert symbol_payload["research_summary"] == "Integrated research status remains watch."
+    assert symbol_payload["positive_case"]
+    assert symbol_payload["negative_case"]
+    assert symbol_payload["red_team_review"]
+    assert symbol_payload["evidence_gaps"] == ["Source freshness still needs regular review."]
+    assert symbol_payload["watch_conditions"] == ["Next verified public filing."]
 
 
 def test_missing_required_field_becomes_blocked_failure(tmp_path: Path) -> None:
