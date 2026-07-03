@@ -1795,24 +1795,6 @@ def sanitize_v3_agent_output(
     forbidden_keys = [key for key in payload if FORBIDDEN_OUTPUT_KEY_RE.match(str(key))]
     if forbidden_keys:
         raise ValueError(f"forbidden_raw_io_keys: {','.join(sorted(forbidden_keys))}")
-    required = (
-        "agent_id",
-        "agent_role",
-        "schema",
-        "symbol",
-        "exchange",
-        "run_id",
-        "status",
-        "findings",
-        "evidence_refs",
-        "evidence_gaps",
-        "uncertainties",
-        "watch_conditions",
-        "boundary",
-    )
-    missing = [key for key in required if key not in payload]
-    if missing:
-        raise ValueError(f"missing_required_fields:{','.join(missing)}")
     status = sanitize_text(str(payload.get("status") or "")).lower()
     if status not in {"ok", "needs_review", "failed"}:
         status = "needs_review"
