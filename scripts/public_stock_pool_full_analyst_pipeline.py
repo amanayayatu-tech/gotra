@@ -53,7 +53,11 @@ from gotra.public_api.app import research_universe_items  # noqa: E402
 
 SCHEMA = "gotra.full_analyst.pipeline.v1"
 STATUS_SCHEMA = "gotra.full_analyst.status.v1"
-SYMBOL_SCHEMA = "gotra.full_analyst.symbol.v1"
+SYMBOL_SCHEMA_V1 = "gotra.full_analyst.symbol.v1"
+SYMBOL_SCHEMA = "gotra.full_analyst.symbol.v2"
+METHODOLOGY_VERSION = "ksana_4_1_lite"
+EXECUTION_MODEL = "multi_perspective_single_call"
+ALAYA_EVENT_SCHEMA = "gotra.cognition_flywheel.full_analyst_memory.v2"
 PRIVATE_ATTEMPT_SCHEMA = "gotra.full_analyst.private_attempt.v1"
 MODE = "full-analyst-evening-hk-test"
 LOOP_MODE = "full-analyst-production-loop"
@@ -67,7 +71,12 @@ DEFAULT_LOOP_OUTPUT_DIR = Path("/opt/gotra/data/reports/full_analyst_loop")
 DEFAULT_PRIVATE_AUDIT_ROOT = Path("/opt/gotra/data/private/full_analyst_runs")
 DEFAULT_STATIC_DIR = Path("/var/www/gotra-public-ledger/reports")
 DEFAULT_SYMBOLS = ("HKEX:0700", "HKEX:1810", "HKEX:9688", "HKEX:9969", "HKEX:0501")
-PROMPT_TEMPLATE_VERSION = "gotra.full_analyst.prompt.v1"
+PROMPT_TEMPLATE_VERSION = "gotra.full_analyst.prompt.v2.ksana_4_1_lite"
+READER_BOUNDARY = "Research content only. This does not constitute investment advice."
+READER_BOUNDARY_ZH = (
+    "研究内容仅供参考，不构成任何投资建议。系统可以表达研究状态和不确定性，"
+    "但不提供交易指令、仓位建议、价格目标或收益承诺。"
+)
 BOUNDARY_LINES = (
     "research information only",
     "not investment advice",
@@ -80,7 +89,7 @@ BOUNDARY_LINES = (
     "no outcome promise",
     "no provider/model I/O is embedded",
 )
-REQUIRED_SYMBOL_KEYS = (
+REQUIRED_SYMBOL_KEYS_V1 = (
     "schema",
     "run_id",
     "symbol",
@@ -98,6 +107,39 @@ REQUIRED_SYMBOL_KEYS = (
     "source_notes",
     "boundary",
 )
+REQUIRED_SYMBOL_KEYS = (
+    "schema",
+    "prompt_template_version",
+    "methodology_version",
+    "execution_model",
+    "symbol",
+    "exchange",
+    "provider_ticker",
+    "as_of_date",
+    "price_coverage_status",
+    "research_context",
+    "k_deep_research",
+    "f_partner_view",
+    "w_partner_view",
+    "g_partner_view",
+    "chairman_synthesis",
+    "red_team_audit",
+    "evidence_gaps",
+    "watch_conditions",
+    "research_status",
+    "confidence_boundary",
+    "source_notes",
+    "reader_boundary",
+)
+SECTION_KEYS = {
+    "research_context",
+    "k_deep_research",
+    "f_partner_view",
+    "w_partner_view",
+    "g_partner_view",
+    "chairman_synthesis",
+    "red_team_audit",
+}
 LIST_KEYS = {
     "key_updates",
     "positive_case",
@@ -107,6 +149,8 @@ LIST_KEYS = {
     "watch_items",
     "source_notes",
     "boundary",
+    "evidence_gaps",
+    "watch_conditions",
 }
 FORBIDDEN_PUBLIC_RE = re.compile(
     r"OPENAI_API_KEY|sk-[A-Za-z0-9_-]+|Bearer\s+|Authorization|PRIVATE KEY|"
@@ -172,42 +216,79 @@ class FixtureAnalystRunner:
         payload = prompt_input_payload(prompt_text)
         symbol = str(payload["symbol"])
         exchange = str(payload["exchange"])
+        price_gap = payload["price_coverage_status"] == "data_gap"
         response = {
             "schema": SYMBOL_SCHEMA,
-            "run_id": payload["run_id"],
+            "prompt_template_version": PROMPT_TEMPLATE_VERSION,
+            "methodology_version": METHODOLOGY_VERSION,
+            "execution_model": EXECUTION_MODEL,
             "symbol": symbol,
             "exchange": exchange,
+            "provider_ticker": payload["provider_ticker"],
             "as_of_date": payload["as_of_date"],
-            "trading_date": payload["trading_date"],
             "price_coverage_status": payload["price_coverage_status"],
-            "research_summary": f"Public-safe analyst pilot summary for {exchange}:{symbol}.",
-            "key_updates": ["No proprietary or raw provider input is exposed."],
-            "positive_case": ["Business quality and market structure should be reviewed with public sources."],
-            "negative_case": ["Valuation, competition, and execution risks remain material watch items."],
-            "red_team_review": ["Do not infer a trading action from this pilot summary."],
-            "risk_factors": ["Data coverage and source freshness need continued monitoring."],
-            "watch_items": ["Next public filing or verified market data update."],
+            "research_context": {
+                "scope": f"Ksana 4.1-lite public research frame for {exchange}:{symbol}.",
+                "price_context": payload["price_context"],
+                "source_freshness": "Fixture uses bounded public inputs and must be refreshed before stronger claims.",
+            },
+            "k_deep_research": {
+                "summary": "Map upstream drivers, business quality, and source freshness before forming a view.",
+                "evidence_focus": ["public filings", "verified market data", "industry structure"],
+                "uncertainty": "Fixture evidence is limited and must remain reviewable.",
+            },
+            "f_partner_view": {
+                "summary": "The constructive case depends on durable business quality and verified public updates.",
+                "supporting_questions": ["What changed in filings?", "Which demand signals are fresh?"],
+            },
+            "w_partner_view": {
+                "summary": "The cautious case emphasizes valuation, competition, and execution sensitivity.",
+                "pressure_points": ["source freshness", "margin pressure", "market structure"],
+            },
+            "g_partner_view": {
+                "summary": "The governance view keeps incomplete coverage visible and separates facts from scenarios.",
+                "quality_controls": ["data gap handling", "public-safe wording", "judge gate"],
+            },
+            "chairman_synthesis": {
+                "summary": f"{exchange}:{symbol} remains a public research candidate for continued monitoring.",
+                "decision_frame": "Use this as research context, not as an action instruction.",
+            },
+            "red_team_audit": {
+                "summary": "Do not compress uncertainty into a false answer.",
+                "overclaim_risks": ["stale data", "single-source interpretation", "action-like wording"],
+            },
+            "evidence_gaps": [
+                "Fixture output does not include independent source refresh.",
+                "Price coverage requires review." if price_gap else "No material price coverage gap in fixture input.",
+            ],
+            "watch_conditions": ["Next verified public filing or market-data refresh."],
+            "research_status": "data_gap" if price_gap else "watch",
+            "confidence_boundary": "Confidence is bounded by public source freshness and data coverage.",
             "source_notes": ["Fixture runner; replace with real public-source research before stronger claims."],
-            "boundary": list(BOUNDARY_LINES),
+            "reader_boundary": READER_BOUNDARY,
         }
         return RunnerResult(True, text=json.dumps(response, ensure_ascii=False), elapsed_seconds=0.001, returncode=0)
 
 
 class MockAlayaSyncClient:
     def sync(self, payload: dict[str, Any]) -> dict[str, Any]:
+        public_payload = build_alaya_public_payload(payload)
         stable = stable_hash(
             {
                 "run_id": payload["run_id"],
                 "symbol": payload["symbol"],
                 "exchange": payload["exchange"],
                 "judge_status": payload["judge_status"],
+                "public_payload_hash": public_payload["public_payload_hash"],
             }
         )
         return {
             "status": "synced",
             "mode": "mock",
+            "event_schema": ALAYA_EVENT_SCHEMA,
             "event_id": f"mock-alaya-{stable[:16]}",
             "event_hash": stable,
+            "public_payload_hash": public_payload["public_payload_hash"],
             "readback_status": "not_applicable",
         }
 
@@ -231,20 +312,39 @@ class GotraInternalAlayaSyncClient:
 
     def sync(self, payload: dict[str, Any]) -> dict[str, Any]:
         public_payload = build_alaya_public_payload(payload)
-        source_payload_hash = stable_hash(public_payload)
+        public_payload_hash = str(public_payload["public_payload_hash"])
         event = {
             "event_type": "full_analyst_memory_sync",
+            "event_schema": ALAYA_EVENT_SCHEMA,
             "audit_actor": self.actor,
             "run_id": payload["run_id"],
-            "cognition_flywheel_layer": "full_analyst_public_research",
+            "cognition_flywheel_layer": "full_analyst_ksana_4_1_lite",
             "feedback_ref": f"full_analyst:{payload['run_id']}:{payload['exchange']}:{payload['symbol']}",
             "knowledge_id": f"full_analyst:{payload['exchange']}:{payload['symbol']}",
             "knowledge_flag": "full_analyst_candidate",
             "symbol": payload["symbol"],
             "exchange": payload["exchange"],
+            "methodology_version": payload["methodology_version"],
+            "prompt_template_version": payload["prompt_template_version"],
+            "prompt_hash": payload.get("prompt_hash", ""),
+            "research_packet_hash": payload.get("research_packet_hash", ""),
+            "public_payload_hash": public_payload_hash,
             "judge_status": payload["judge_status"],
             "price_coverage_status": payload["price_coverage_status"],
-            "source_payload_hash": source_payload_hash,
+            "execution_model": payload["execution_model"],
+            "agent_outputs": {
+                "k_deep_research": payload["k_deep_research"],
+                "f_partner_view": payload["f_partner_view"],
+                "w_partner_view": payload["w_partner_view"],
+                "g_partner_view": payload["g_partner_view"],
+                "chairman_synthesis": payload["chairman_synthesis"],
+                "red_team_audit": payload["red_team_audit"],
+            },
+            "evidence_gaps": payload["evidence_gaps"],
+            "watch_conditions": payload["watch_conditions"],
+            "boundary_policy": public_payload["boundary_policy"],
+            "readback_status": "pending",
+            "source_payload_hash": public_payload_hash,
             "public_payload": public_payload,
         }
         try:
@@ -282,20 +382,34 @@ class GotraInternalAlayaSyncClient:
                 "readback_status": "failed",
             }
         readback_payload_hash = str(readback[0].get("source_payload_hash") or "")
-        if readback_payload_hash != source_payload_hash:
+        readback_knowledge_id = str(readback[0].get("knowledge_id") or "")
+        if readback_knowledge_id != event["knowledge_id"]:
             return {
                 "status": "failed",
                 "mode": "real",
                 "reason": "gotra_internal_state_readback_mismatch",
                 "event_id": event_hash,
                 "event_hash": event_hash,
+                "public_payload_hash": public_payload_hash,
+                "readback_status": "mismatch",
+            }
+        if readback_payload_hash != public_payload_hash:
+            return {
+                "status": "failed",
+                "mode": "real",
+                "reason": "gotra_internal_state_readback_mismatch",
+                "event_id": event_hash,
+                "event_hash": event_hash,
+                "public_payload_hash": public_payload_hash,
                 "readback_status": "mismatch",
             }
         return {
             "status": "synced",
             "mode": "real",
+            "event_schema": ALAYA_EVENT_SCHEMA,
             "event_id": event_hash,
             "event_hash": event_hash,
+            "public_payload_hash": public_payload_hash,
             "readback_status": "verified",
         }
 
@@ -461,7 +575,10 @@ def build_prompt(item: dict[str, str], price_row: dict[str, Any], config: FullAn
         "price_context": public_price_context(price_row),
         "required_schema": SYMBOL_SCHEMA,
         "required_keys": list(REQUIRED_SYMBOL_KEYS),
+        "methodology_version": METHODOLOGY_VERSION,
+        "execution_model": EXECUTION_MODEL,
         "boundary": list(BOUNDARY_LINES),
+        "reader_boundary": READER_BOUNDARY,
     }
     retry_note = ""
     if attempt > 1:
@@ -473,16 +590,25 @@ def build_prompt(item: dict[str, str], price_row: dict[str, Any], config: FullAn
             )
     return (
         "Return STRICT JSON only. No markdown, no code fences, no commentary.\n"
-        "Produce a public-safe analyst pilot summary with positive_case, negative_case, and red_team_review.\n"
+        "Produce a GOTRA Full Analyst v2 public-safe research object using Ksana 4.1-lite methodology.\n"
+        "This is one LLM call that returns multiple research perspectives. Set execution_model exactly to "
+        f"{EXECUTION_MODEL}; do not claim independent agents or separate processes.\n"
+        "Use these perspectives: k_deep_research, f_partner_view, w_partner_view, g_partner_view, "
+        "chairman_synthesis, and red_team_audit. Treat K as deep upstream research, F/W/G as partner views, "
+        "chairman_synthesis as the bounded integrated view, and red_team_audit as risk/overclaim review.\n"
+        "Preserve evidence gaps, stale data, data gaps, source freshness, watch conditions, waiting conditions, "
+        "and uncertainty boundary. Do not fill missing evidence with invented facts.\n"
+        "Allowed research_status values: candidate, watch, avoid, needs_review, data_gap. If price_coverage_status "
+        "is data_gap, set research_status to data_gap or needs_review and explain the gap.\n"
         "Do not provide investment advice, trading signal, directional recommendation, price objective, "
         "allocation guidance, outcome promise, performance proof, or science/public proof.\n"
-        "Avoid the literal phrases buy recommendation, sell recommendation, hold recommendation, "
-        "target price, stdout, stderr, completion, messages, and raw_provider_response in all JSON values.\n"
-        "Copy the boundary array exactly from the Input JSON.\n"
+        "Avoid action-like recommendation language, stdout, stderr, completion, messages, and raw_provider_response "
+        "in all JSON values.\n"
+        "Set reader_boundary exactly from the Input JSON.\n"
         "Do not include prompt_text, completion, messages, raw_provider_response, stdout, stderr, "
         "Authorization, Bearer, API keys, or secrets.\n"
-        "Use arrays for key_updates, positive_case, negative_case, red_team_review, risk_factors, "
-        "watch_items, source_notes, and boundary.\n"
+        "Use objects for research_context, k_deep_research, f_partner_view, w_partner_view, g_partner_view, "
+        "chairman_synthesis, and red_team_audit. Use arrays for evidence_gaps, watch_conditions, and source_notes.\n"
         f"Input JSON: {json.dumps(payload, ensure_ascii=False, sort_keys=True)}{retry_note}"
     )
 
@@ -512,25 +638,142 @@ def public_price_context(price_row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def sanitize_public_value(value: Any, *, max_text_length: int = 900) -> Any:
+    if isinstance(value, dict):
+        return {
+            sanitize_text(str(key))[:80]: sanitize_public_value(item, max_text_length=max_text_length)
+            for key, item in value.items()
+            if str(key).strip()
+        }
+    if isinstance(value, list):
+        return [sanitize_public_value(item, max_text_length=max_text_length) for item in value if str(item).strip()][:12]
+    if value is None:
+        return ""
+    return sanitize_text(str(value))[:max_text_length]
+
+
+def sanitize_record(value: Any) -> dict[str, Any]:
+    sanitized = sanitize_public_value(value)
+    return sanitized if isinstance(sanitized, dict) else {"summary": sanitize_text(str(sanitized or ""))[:900]}
+
+
+def section_summary(section: Any, fallback: str) -> str:
+    if isinstance(section, dict):
+        for key in ("summary", "thesis", "view", "decision_frame", "uncertainty"):
+            value = section.get(key)
+            if value:
+                return sanitize_text(str(value))[:500]
+        values = [sanitize_text(str(value))[:220] for value in section.values() if str(value).strip()]
+        if values:
+            return "; ".join(values)[:500]
+    if isinstance(section, list) and section:
+        return sanitize_text(str(section[0]))[:500]
+    if section:
+        return sanitize_text(str(section))[:500]
+    return fallback
+
+
+def section_list(section: Any, fallback: str) -> list[str]:
+    if isinstance(section, dict):
+        values: list[str] = []
+        for key, value in section.items():
+            if isinstance(value, list):
+                values.extend(sanitize_text(str(item))[:320] for item in value if str(item).strip())
+            elif isinstance(value, dict):
+                values.append(section_summary(value, ""))
+            elif str(value).strip():
+                label = str(key).replace("_", " ")
+                values.append(f"{label}: {sanitize_text(str(value))[:260]}")
+        return [value for value in values if value][:8] or [fallback]
+    if isinstance(section, list):
+        return sanitize_list(section) or [fallback]
+    if section:
+        return [sanitize_text(str(section))[:500]]
+    return [fallback]
+
+
+def normalize_research_status(value: Any, *, price_coverage_status: str) -> str:
+    raw = sanitize_text(str(value or "")).lower()
+    allowed = {"candidate", "watch", "avoid", "needs_review", "data_gap"}
+    if price_coverage_status == "data_gap":
+        return raw if raw in {"needs_review", "data_gap"} else "data_gap"
+    return raw if raw in allowed else "watch"
+
+
+def v1_payload_to_v2(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": SYMBOL_SCHEMA,
+        "prompt_template_version": PROMPT_TEMPLATE_VERSION,
+        "methodology_version": METHODOLOGY_VERSION,
+        "execution_model": EXECUTION_MODEL,
+        "symbol": payload.get("symbol", ""),
+        "exchange": payload.get("exchange", ""),
+        "provider_ticker": payload.get("provider_ticker", ""),
+        "as_of_date": payload.get("as_of_date", ""),
+        "price_coverage_status": payload.get("price_coverage_status", "data_gap"),
+        "research_context": {
+            "scope": payload.get("research_summary", ""),
+            "key_updates": payload.get("key_updates", []),
+        },
+        "k_deep_research": {"summary": payload.get("research_summary", "")},
+        "f_partner_view": {"summary": "; ".join(sanitize_list(payload.get("positive_case")))},
+        "w_partner_view": {"summary": "; ".join(sanitize_list(payload.get("negative_case")))},
+        "g_partner_view": {"summary": "; ".join(sanitize_list(payload.get("risk_factors")))},
+        "chairman_synthesis": {"summary": payload.get("research_summary", "")},
+        "red_team_audit": {"summary": "; ".join(sanitize_list(payload.get("red_team_review")))},
+        "evidence_gaps": sanitize_list(payload.get("risk_factors")),
+        "watch_conditions": sanitize_list(payload.get("watch_items")),
+        "research_status": "data_gap" if payload.get("price_coverage_status") == "data_gap" else "watch",
+        "confidence_boundary": "Converted from v1 public-safe summary; confidence remains bounded by source freshness.",
+        "source_notes": sanitize_list(payload.get("source_notes")),
+        "reader_boundary": READER_BOUNDARY,
+    }
+
+
 def build_alaya_public_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    public_payload_hash_basis = {
+        "schema": SYMBOL_SCHEMA,
+        "run_id": payload["run_id"],
+        "symbol": payload["symbol"],
+        "exchange": payload["exchange"],
+        "as_of_date": payload["as_of_date"],
+        "research_status": payload["research_status"],
+        "agent_outputs": {
+            "k_deep_research": payload["k_deep_research"],
+            "f_partner_view": payload["f_partner_view"],
+            "w_partner_view": payload["w_partner_view"],
+            "g_partner_view": payload["g_partner_view"],
+            "chairman_synthesis": payload["chairman_synthesis"],
+            "red_team_audit": payload["red_team_audit"],
+        },
+        "evidence_gaps": payload["evidence_gaps"],
+        "watch_conditions": payload["watch_conditions"],
+    }
     public_payload = {
-        "schema": "gotra.cognition_flywheel.full_analyst_memory.v1",
+        "schema": ALAYA_EVENT_SCHEMA,
+        "event_schema": ALAYA_EVENT_SCHEMA,
         "gotra_schema": SYMBOL_SCHEMA,
         "run_id": payload["run_id"],
         "symbol": payload["symbol"],
         "exchange": payload["exchange"],
         "as_of_date": payload["as_of_date"],
         "trading_date": payload["trading_date"],
+        "methodology_version": payload["methodology_version"],
+        "prompt_template_version": payload["prompt_template_version"],
+        "prompt_hash": payload.get("prompt_hash", ""),
+        "research_packet_hash": payload.get("research_packet_hash", ""),
+        "public_payload_hash": stable_hash(public_payload_hash_basis),
         "judge_status": payload["judge_status"],
         "price_coverage_status": payload["price_coverage_status"],
-        "research_summary": payload["research_summary"],
-        "key_updates": payload["key_updates"],
-        "positive_case": payload["positive_case"],
-        "negative_case": payload["negative_case"],
-        "red_team_review": payload["red_team_review"],
-        "risk_factors": payload["risk_factors"],
-        "watch_items": payload["watch_items"],
+        "execution_model": payload["execution_model"],
+        "agent_outputs": public_payload_hash_basis["agent_outputs"],
+        "evidence_gaps": payload["evidence_gaps"],
+        "watch_conditions": payload["watch_conditions"],
+        "research_status": payload["research_status"],
+        "confidence_boundary": payload["confidence_boundary"],
         "source_notes": payload["source_notes"],
+        "reader_boundary": payload["reader_boundary"],
+        "boundary_policy": "public-safe research only; no trade instruction, allocation guidance, price objective, promised outcome, raw provider I/O, or secrets",
         "boundary": payload["boundary"],
     }
     assert_public_safe(public_payload)
@@ -584,6 +827,20 @@ def run_symbol(
                 price_row=price_row,
                 config=config,
             )
+            symbol_payload["prompt_hash"] = prompt_hash
+            symbol_payload["research_packet_hash"] = stable_hash(
+                {
+                    "run_id": config.run_id,
+                    "symbol": item["symbol"],
+                    "exchange": item["exchange"],
+                    "provider_ticker": item["provider_ticker"],
+                    "as_of_date": config.as_of_date.isoformat(),
+                    "trading_date": symbol_payload["trading_date"],
+                    "price_context": symbol_payload["price_context"],
+                    "methodology_version": METHODOLOGY_VERSION,
+                    "execution_model": EXECUTION_MODEL,
+                }
+            )
             judge_status, judge_reasons = judge_symbol(symbol_payload)
             symbol_payload["judge_status"] = judge_status
             symbol_payload["judge_reasons"] = judge_reasons
@@ -591,6 +848,8 @@ def run_symbol(
             symbol_payload["alaya_sync_status"] = alaya_result["status"]
             symbol_payload["alaya_sync_ref"] = alaya_result.get("event_id", "")
             symbol_payload["alaya_event_hash"] = alaya_result.get("event_hash", "")
+            symbol_payload["alaya_event_schema"] = alaya_result.get("event_schema", ALAYA_EVENT_SCHEMA)
+            symbol_payload["public_payload_hash"] = alaya_result.get("public_payload_hash", "")
             symbol_payload["alaya_readback_status"] = alaya_result.get("readback_status", "not_applicable")
             symbol_payload["alaya_failure_reason"] = alaya_result.get("reason", "")
             attempt_record["status"] = "success"
@@ -607,6 +866,8 @@ def run_symbol(
                 "alaya_sync_status": alaya_result["status"],
                 "alaya_sync_ref": alaya_result.get("event_id", ""),
                 "alaya_event_hash": alaya_result.get("event_hash", ""),
+                "alaya_event_schema": alaya_result.get("event_schema", ALAYA_EVENT_SCHEMA),
+                "public_payload_hash": alaya_result.get("public_payload_hash", ""),
                 "alaya_readback_status": alaya_result.get("readback_status", "not_applicable"),
                 "alaya_failure_reason": alaya_result.get("reason", ""),
                 "attempts": attempt,
@@ -677,6 +938,11 @@ def sanitize_symbol_payload(
     forbidden_keys = [key for key in payload if FORBIDDEN_OUTPUT_KEY_RE.match(str(key))]
     if forbidden_keys:
         raise ValueError(f"forbidden_raw_io_keys: {','.join(sorted(forbidden_keys))}")
+    if payload.get("schema") == SYMBOL_SCHEMA_V1:
+        missing_v1 = [key for key in REQUIRED_SYMBOL_KEYS_V1 if key not in payload]
+        if missing_v1:
+            raise ValueError(f"missing_required_fields: {','.join(missing_v1)}")
+        payload = v1_payload_to_v2(payload)
     missing = [key for key in REQUIRED_SYMBOL_KEYS if key not in payload]
     if missing:
         raise ValueError(f"missing_required_fields: {','.join(missing)}")
@@ -685,17 +951,48 @@ def sanitize_symbol_payload(
         value = payload.get(key)
         if key in LIST_KEYS:
             sanitized[key] = sanitize_list(value)
+        elif key in SECTION_KEYS:
+            sanitized[key] = sanitize_record(value)
         else:
             sanitized[key] = sanitize_text(str(value or ""))
     sanitized["schema"] = SYMBOL_SCHEMA
     sanitized["run_id"] = config.run_id
     sanitized["symbol"] = item["symbol"]
     sanitized["exchange"] = item["exchange"]
+    sanitized["provider_ticker"] = item["provider_ticker"]
     sanitized["as_of_date"] = config.as_of_date.isoformat()
     sanitized["trading_date"] = trading_date_for_exchange(item["exchange"], exchange_dates_for_config(config)).isoformat()
     sanitized["price_coverage_status"] = "ok" if price_row.get("ok") else "data_gap"
     sanitized["price_context"] = public_price_context(price_row)
+    sanitized["prompt_template_version"] = PROMPT_TEMPLATE_VERSION
+    sanitized["methodology_version"] = METHODOLOGY_VERSION
+    sanitized["execution_model"] = EXECUTION_MODEL
+    sanitized["research_status"] = normalize_research_status(
+        sanitized.get("research_status"),
+        price_coverage_status=sanitized["price_coverage_status"],
+    )
+    sanitized["reader_boundary"] = READER_BOUNDARY
+    sanitized["reader_boundary_zh"] = READER_BOUNDARY_ZH
     sanitized["boundary"] = list(BOUNDARY_LINES)
+    sanitized["research_summary"] = section_summary(
+        sanitized["chairman_synthesis"],
+        f"Public-safe Ksana 4.1-lite research synthesis for {item['exchange']}:{item['symbol']}.",
+    )
+    sanitized["key_updates"] = section_list(
+        sanitized["research_context"],
+        "Review public-source freshness before using this research context.",
+    )
+    sanitized["positive_case"] = section_list(sanitized["f_partner_view"], "Constructive case requires fresh public evidence.")
+    sanitized["negative_case"] = section_list(sanitized["w_partner_view"], "Cautious case remains under review.")
+    sanitized["red_team_review"] = section_list(sanitized["red_team_audit"], "Red-team review keeps uncertainty visible.")
+    sanitized["risk_factors"] = section_list(sanitized["g_partner_view"], "Governance and data-quality risks remain visible.")
+    sanitized["watch_items"] = sanitized["watch_conditions"] or ["Next verified public update."]
+    if not sanitized["source_notes"]:
+        sanitized["source_notes"] = ["Public-safe source freshness must be checked before stronger claims."]
+    if not sanitized["evidence_gaps"]:
+        sanitized["evidence_gaps"] = ["No material public evidence gap was reported by this run."]
+    if not sanitized["watch_conditions"]:
+        sanitized["watch_conditions"] = ["Next verified public update."]
     assert_public_safe(sanitized)
     return sanitized
 
@@ -733,6 +1030,14 @@ def normalize_negated_boundary_text(text: str) -> str:
             re.compile(r"\b(?:not\s+(?:a|an)\s+|no\s+)target\s+price\b", re.IGNORECASE),
             "no_price_objective",
         ),
+        (
+            re.compile(r"不(?:提供|构成)[^。；;]{0,30}(?:仓位|目标价|收益承诺)"),
+            "no_trading_instruction_zh",
+        ),
+        (
+            re.compile(r"不(?:输出|提供|构成)[^。；;]{0,30}(?:买入|卖出|持有建议)"),
+            "no_directional_action_zh",
+        ),
     )
     normalized = text
     for pattern, replacement in replacements:
@@ -744,11 +1049,24 @@ def judge_symbol(symbol_payload: dict[str, Any]) -> tuple[str, list[str]]:
     if symbol_payload["price_coverage_status"] == "data_gap":
         return "needs_review", ["price coverage is data_gap; do not promote to publish"]
     assert_public_safe(symbol_payload)
-    required_lists = ("positive_case", "negative_case", "red_team_review", "risk_factors", "watch_items", "source_notes")
-    empty = [key for key in required_lists if not symbol_payload.get(key)]
+    required_sections = (
+        "research_context",
+        "k_deep_research",
+        "f_partner_view",
+        "w_partner_view",
+        "g_partner_view",
+        "chairman_synthesis",
+        "red_team_audit",
+    )
+    empty_sections = [key for key in required_sections if not section_summary(symbol_payload.get(key), "")]
+    required_lists = ("evidence_gaps", "watch_conditions", "source_notes")
+    empty_lists = [key for key in required_lists if not symbol_payload.get(key)]
+    empty = empty_sections + empty_lists
     if empty:
         return "blocked", [f"empty required analyst sections: {','.join(empty)}"]
-    return "publish", ["public-safe structured analyst summary passed local judge gate"]
+    if symbol_payload["execution_model"] != EXECUTION_MODEL:
+        return "blocked", ["execution_model must be multi_perspective_single_call for v2"]
+    return "publish", ["public-safe Ksana 4.1-lite research object passed local judge gate"]
 
 
 def alaya_sync(symbol_payload: dict[str, Any], alaya_client: AlayaSyncClient, config: FullAnalystConfig) -> dict[str, Any]:
@@ -917,6 +1235,10 @@ def build_status(
         "candidate_timer": config.candidate_timer,
         "rollback_hint": rollback_hint(config),
         "prompt_template_version": PROMPT_TEMPLATE_VERSION,
+        "symbol_schema": SYMBOL_SCHEMA,
+        "methodology_version": METHODOLOGY_VERSION,
+        "execution_model": EXECUTION_MODEL,
+        "alaya_event_schema": ALAYA_EVENT_SCHEMA,
         "boundary": list(BOUNDARY_LINES),
         "report_file": report_path.name,
         "latest_public_report_file": report_path.name,
@@ -1141,6 +1463,11 @@ def render_markdown(status: dict[str, Any], results: list[dict[str, Any]]) -> st
         f"- llm_runner: {status['llm_runner']}",
         f"- llm_model: {status['llm_model']}",
         f"- max_concurrency: {status.get('max_concurrency')}",
+        f"- prompt_template_version: {status.get('prompt_template_version')}",
+        f"- symbol_schema: {status.get('symbol_schema')}",
+        f"- methodology_version: {status.get('methodology_version')}",
+        f"- execution_model: {status.get('execution_model')}",
+        f"- alaya_event_schema: {status.get('alaya_event_schema')}",
         f"- candidate_service: {status.get('candidate_service') or 'not_reported'}",
         f"- candidate_timer: {status.get('candidate_timer') or 'not_reported'}",
         f"- publish_count: {status['publish_count']}",
@@ -1176,6 +1503,7 @@ def render_markdown(status: dict[str, Any], results: list[dict[str, Any]]) -> st
                 "",
                 f"- price_coverage_status: {row['price_coverage_status']}",
                 f"- judge_status: {row['judge_status']}",
+                f"- research_status: {research.get('research_status', 'not_reported') if research else 'not_reported'}",
                 f"- alaya_sync_status: {row['alaya_sync_status']}",
                 f"- alaya_readback_status: {row.get('alaya_readback_status', 'not_applicable')}",
                 f"- judge_reasons: {'; '.join(row.get('judge_reasons') or [])}",
@@ -1186,19 +1514,22 @@ def render_markdown(status: dict[str, Any], results: list[dict[str, Any]]) -> st
             continue
         lines.extend(
             [
-                f"- research_summary: {research['research_summary']}",
-                "- key_updates:",
-                *[f"  - {item}" for item in research["key_updates"]],
-                "- positive_case:",
-                *[f"  - {item}" for item in research["positive_case"]],
-                "- negative_case:",
-                *[f"  - {item}" for item in research["negative_case"]],
-                "- red_team_review:",
-                *[f"  - {item}" for item in research["red_team_review"]],
-                "- risk_factors:",
-                *[f"  - {item}" for item in research["risk_factors"]],
-                "- watch_items:",
-                *[f"  - {item}" for item in research["watch_items"]],
+                f"- chairman_synthesis: {section_summary(research['chairman_synthesis'], research['research_summary'])}",
+                "- k_deep_research:",
+                *[f"  - {item}" for item in section_list(research["k_deep_research"], "No K research summary reported.")],
+                "- f_partner_view:",
+                *[f"  - {item}" for item in section_list(research["f_partner_view"], "No F partner view reported.")],
+                "- w_partner_view:",
+                *[f"  - {item}" for item in section_list(research["w_partner_view"], "No W partner view reported.")],
+                "- g_partner_view:",
+                *[f"  - {item}" for item in section_list(research["g_partner_view"], "No G partner view reported.")],
+                "- red_team_audit:",
+                *[f"  - {item}" for item in section_list(research["red_team_audit"], "No red-team audit reported.")],
+                "- evidence_gaps:",
+                *[f"  - {item}" for item in research["evidence_gaps"]],
+                "- watch_conditions:",
+                *[f"  - {item}" for item in research["watch_conditions"]],
+                f"- confidence_boundary: {research['confidence_boundary']}",
                 "- source_notes:",
                 *[f"  - {item}" for item in research["source_notes"]],
                 "",
@@ -1217,8 +1548,14 @@ def sanitize_private_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     allowed = {
         "status",
         "mode",
+        "event_schema",
         "event_id",
         "event_hash",
+        "knowledge_id",
+        "feedback_ref",
+        "prompt_hash",
+        "research_packet_hash",
+        "public_payload_hash",
         "readback_status",
         "reason",
         "schema",
