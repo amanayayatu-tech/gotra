@@ -316,7 +316,7 @@ def outcome_and_auto_quarantine(
     if config.dry_run:
         return DaemonStepResult("auto_quarantine", "success", "dry_run")
     client = HttpAlayaAutoQuarantineClient(
-        base_url=os.getenv("ALAYA_BASE_URL", "http://localhost:5000"),
+        base_url=os.getenv("GOTRA_INTERNAL_COGNITION_BASE_URL", "http://localhost:5000"),
         project_id=config.project_id,
         api_key=os.getenv("ALAYA_AUTOMATION_API_KEY") or os.getenv("ALAYA_API_KEY"),
     )
@@ -393,7 +393,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--date", default=datetime.now().date().isoformat())
     parser.add_argument("--data-dir", default="engine/ksana/data")
     parser.add_argument("--lock-path", default=str(DEFAULT_LOCK_PATH))
-    parser.add_argument("--project-id", default=os.getenv("ALAYA_PROJECT_ID"))
+    parser.add_argument("--project-id", default=os.getenv("GOTRA_INTERNAL_COGNITION_PROJECT_ID"))
     return parser.parse_args(argv)
 
 

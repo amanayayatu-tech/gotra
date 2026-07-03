@@ -167,7 +167,7 @@ LIST_KEYS = {
 }
 FORBIDDEN_PUBLIC_RE = re.compile(
     r"OPENAI_API_KEY|sk-[A-Za-z0-9_-]+|Bearer\s+|Authorization|PRIVATE KEY|"
-    r"prompt_text|messages|completion|raw_provider_response|stdout|stderr|"
+    r"prompt_text|\"(?:messages|completion)\"\s*:|raw_provider_response|stdout|stderr|"
     r"target price|\b(?:buy|sell|hold)\s+(?:recommendation|rating|signal)\b|position sizing|return promise|"
     r"目标价|买入|卖出|持有建议|仓位|收益承诺",
     re.IGNORECASE,
@@ -1779,6 +1779,7 @@ def run_v3_agent(
 ) -> dict[str, Any]:
     last_error = ""
     last_output: dict[str, Any] | None = None
+    public_safety_triggers: list[str] = []
     for attempt in range(1, config.retries + 2):
         started_at = utc_now_iso()
         started = time.monotonic()
@@ -1818,6 +1819,9 @@ def run_v3_agent(
         private_record["returncode"] = result.returncode
         if not result.ok:
             last_error = result.reason or "runner_failed"
+            trigger = public_safe_trigger_label(last_error)
+            if trigger and trigger not in public_safety_triggers:
+                public_safety_triggers.append(trigger)
             last_output = v3_agent_failure_record(
                 agent_id=agent_id,
                 item=item,
@@ -1827,8 +1831,12 @@ def run_v3_agent(
                 finished_at=finished_at,
                 duration_seconds=duration,
                 reason=last_error,
+                retry_count=max(0, attempt - 1),
+                public_safety_triggers=public_safety_triggers,
             )
             private_record["failure_reason"] = public_safe_failure_category(last_error)
+            private_record["retry_count"] = max(0, attempt - 1)
+            private_record["public_safety_triggers"] = public_safety_triggers
             private_record["public_output"] = last_output
             write_v3_agent_attempt_private_record(config, item, agent_id, attempt, private_record)
             write_v3_agent_private_record(config, item, agent_id, private_record)
@@ -1844,13 +1852,22 @@ def run_v3_agent(
                 finished_at=finished_at,
                 duration_seconds=duration,
             )
+            output["retry_count"] = max(0, attempt - 1)
+            output["public_safety_triggers"] = list(public_safety_triggers)
+            output["output_hash"] = v3_agent_output_hash(output)
+            assert_public_safe(output)
             private_record["status"] = "success"
+            private_record["retry_count"] = max(0, attempt - 1)
+            private_record["public_safety_triggers"] = public_safety_triggers
             private_record["public_output"] = output
             write_v3_agent_attempt_private_record(config, item, agent_id, attempt, private_record)
             write_v3_agent_private_record(config, item, agent_id, private_record)
             return output
         except Exception as exc:  # noqa: BLE001 - retry then preserve failed independent agent record.
             last_error = normalize_failure_reason(exc)
+            trigger = public_safe_trigger_label(last_error)
+            if trigger and trigger not in public_safety_triggers:
+                public_safety_triggers.append(trigger)
             last_output = v3_agent_failure_record(
                 agent_id=agent_id,
                 item=item,
@@ -1860,8 +1877,12 @@ def run_v3_agent(
                 finished_at=finished_at,
                 duration_seconds=duration,
                 reason=last_error,
+                retry_count=max(0, attempt - 1),
+                public_safety_triggers=public_safety_triggers,
             )
             private_record["failure_reason"] = last_output["failure_reason"]
+            private_record["retry_count"] = max(0, attempt - 1)
+            private_record["public_safety_triggers"] = public_safety_triggers
             private_record["public_output"] = last_output
             write_v3_agent_attempt_private_record(config, item, agent_id, attempt, private_record)
             write_v3_agent_private_record(config, item, agent_id, private_record)
@@ -1928,6 +1949,11 @@ def aggregate_v3_symbol_payload(
         agent_timings["research_task_seconds"] = round(research_task_seconds, 3)
         agent_timings["evidence_packet_seconds"] = round(evidence_packet_seconds, 3)
     statuses = {agent_id: str(agent_outputs[agent_id].get("status") or "") for agent_id in V3_AGENT_IDS}
+    agent_retry_counts = {agent_id: int(agent_outputs[agent_id].get("retry_count") or 0) for agent_id in V3_AGENT_IDS}
+    agent_public_safety_triggers = {
+        agent_id: sanitize_list(agent_outputs[agent_id].get("public_safety_triggers"))
+        for agent_id in V3_AGENT_IDS
+    }
     all_gaps: list[str] = []
     all_watch: list[str] = []
     for output in agent_outputs.values():
@@ -1987,6 +2013,8 @@ def aggregate_v3_symbol_payload(
         "finished_at_utc": utc_now_iso(),
         "red_team_verdict": red_verdict,
         "agent_statuses": statuses,
+        "agent_retry_counts": agent_retry_counts,
+        "agent_public_safety_triggers": agent_public_safety_triggers,
         "failure_records": [
             {
                 "agent_id": agent_id,
@@ -2510,6 +2538,7 @@ def sanitize_v3_agent_output(
             "overconfidence_risks",
         ):
             output[key] = neutralize_red_team_public_terms(output.get(key))
+        output = neutralize_red_team_public_terms(output)
     output["output_hash"] = v3_agent_output_hash(output)
     assert_public_safe(output)
     return output
@@ -2534,8 +2563,11 @@ def v3_agent_failure_record(
     finished_at: str,
     duration_seconds: float,
     reason: str,
+    retry_count: int = 0,
+    public_safety_triggers: list[str] | None = None,
 ) -> dict[str, Any]:
     public_reason = public_safe_failure_category(reason)
+    safe_triggers = dedupe_preserve_order(sanitize_list(public_safety_triggers or []))
     output = {
         "agent_id": agent_id,
         "agent_role": V3_AGENT_ROLE_LABELS.get(agent_id, agent_id),
@@ -2552,6 +2584,8 @@ def v3_agent_failure_record(
         "output_hash": "",
         "status": "failed",
         "failure_reason": public_reason,
+        "retry_count": max(0, int(retry_count)),
+        "public_safety_triggers": safe_triggers,
         "findings": [f"{agent_id} failed with public-safe category {public_reason}."],
         "evidence_refs": [],
         "evidence_gaps": [f"{agent_id} output unavailable; failure record preserved."],
@@ -3095,6 +3129,36 @@ def public_safe_failure_category(reason: str) -> str:
     if "artifact" in text or "permission" in text:
         return "artifact_write_failed"
     return re.sub(r"[^a-z0-9_]+", "_", text)[:80].strip("_") or "unknown_failure"
+
+
+def public_safe_trigger_label(reason: str) -> str:
+    """Expose retry trigger classes without republishing unsafe terms."""
+
+    text = sanitize_text(str(reason or "")).lower()
+    if not text:
+        return ""
+    token = text.rsplit(":", 1)[-1] if "forbidden_public_content_detected" in text else text
+    if "target" in token or "price_objective" in token:
+        return "price_objective_wording"
+    if any(term in token for term in ("buy", "sell", "hold", "directional", "trading_signal", "trading signal")):
+        return "directional_action_wording"
+    if "position" in token or "allocation" in token or "仓位" in token:
+        return "allocation_guidance_wording"
+    if "return" in token or "outcome" in token or "收益" in token:
+        return "outcome_promise_wording"
+    if (
+        "raw" in token
+        or "stdout" in token
+        or "stderr" in token
+        or "prompt" in token
+        or "completion" in token
+        or "message" in token
+        or "secret" in token
+    ):
+        return "raw_io_or_secret_wording"
+    if "forbidden_public_content_detected" in text:
+        return "public_boundary_wording"
+    return ""
 
 
 def evidence_layer_for_mode(mode: str) -> str:

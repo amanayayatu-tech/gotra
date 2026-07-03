@@ -1,4 +1,5 @@
 import json
+import subprocess
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -43,6 +44,7 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     sanitize_v3_agent_output,
     selected_universe,
     update_loop_public_status,
+    v3_agent_failure_record,
 )
 
 
@@ -702,13 +704,20 @@ def test_v3_agent_retries_public_safety_failure_then_publishes(tmp_path: Path) -
     k_attempt_2 = json.loads(
         (cfg.private_audit_root / cfg.run_id / "agents" / "HKEX_0700_k_deep_research_attempt_2.json").read_text()
     )
+    symbol_payload = json.loads((cfg.output_dir / "symbols" / "HKEX_0700.json").read_text())
+
     assert exit_code == 0
     assert status["publish_count"] == 1
     assert runner.calls.count("k_deep_research") == 2
     assert k_attempt_1["status"] == "failed"
     assert k_attempt_1["failure_reason"] == "forbidden_public_content_detected"
+    assert k_attempt_1["public_safety_triggers"] == ["price_objective_wording"]
     assert "Retry attempt 2" in k_attempt_2["prompt_text"]
     assert k_latest["status"] == "success"
+    assert k_latest["public_output"]["retry_count"] == 1
+    assert k_latest["public_output"]["public_safety_triggers"] == ["price_objective_wording"]
+    assert symbol_payload["agent_retry_counts"]["k_deep_research"] == 1
+    assert symbol_payload["agent_public_safety_triggers"]["k_deep_research"] == ["price_objective_wording"]
 
 
 def test_v3_agent_failure_blocks_symbol_and_preserves_failure_readback(tmp_path: Path) -> None:
@@ -982,6 +991,41 @@ def test_list_style_boundary_terms_do_not_trip_public_scanner() -> None:
     )
 
 
+
+def test_full_analyst_code_does_not_use_external_alaya_env_names() -> None:
+    forbidden_env_names = ["ALAYA" + "_BASE_URL", "ALAYA" + "_WRITE_PATH"]
+    tracked = subprocess.run(
+        ["git", "ls-files", "scripts", "gotra", "tests"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    source_suffixes = {".py", ".md", ".txt", ".toml", ".yaml", ".yml", ".json"}
+    offenders: list[str] = []
+    for rel in tracked:
+        candidate = Path(rel)
+        if candidate.suffix not in source_suffixes or not candidate.exists():
+            continue
+        source = candidate.read_text(errors="ignore")
+        for name in forbidden_env_names:
+            if name in source:
+                offenders.append(f"{rel}:{name}")
+
+    assert offenders == []
+
+def test_source_completion_word_does_not_trip_raw_io_scanner() -> None:
+    assert_public_safe({"summary": "Evidence completion remains incomplete because required public sources are missing."})
+
+
+def test_completion_key_still_trips_raw_io_scanner() -> None:
+    try:
+        assert_public_safe({"completion": {"text": "raw provider field"}})
+    except ValueError as exc:
+        assert "forbidden_public_content_detected" in str(exc)
+    else:
+        raise AssertionError("raw completion key should remain blocked")
+
+
 def test_red_team_absence_audit_terms_do_not_trip_public_scanner() -> None:
     assert_public_safe(
         {
@@ -1043,6 +1087,60 @@ def test_red_team_output_neutralizes_audited_forbidden_terms(tmp_path: Path) -> 
     assert "price-objective wording" in text
     assert "directional-action wording" in text
     assert "allocation-guidance wording" in text
+    assert_public_safe(output)
+
+
+def test_red_team_output_neutralizes_boundary_terms_outside_findings(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    output = sanitize_v3_agent_output(
+        {
+            "agent_role": "Red team checks target price, buy recommendation, and position sizing wording.",
+            "status": "needs_review",
+            "findings": ["No issuer conclusion can be promoted."],
+            "evidence_refs": ["price_context"],
+            "evidence_gaps": ["Official source coverage is missing."],
+            "uncertainties": ["Boundary language must stay visible."],
+            "watch_conditions": ["Keep the audit strict."],
+            "final_red_team_verdict": "needs_review",
+        },
+        agent_id="red_team_audit",
+        item=universe()[0],
+        config=cfg,
+        input_context_hash="input-hash",
+        started_at="2026-07-03T00:00:00Z",
+        finished_at="2026-07-03T00:00:01Z",
+        duration_seconds=1.0,
+    )
+
+    text = json.dumps(output, ensure_ascii=False).lower()
+    assert "target price" not in text
+    assert "buy recommendation" not in text
+    assert "position sizing" not in text
+    assert "price-objective wording" in text
+    assert "directional-action wording" in text
+    assert "allocation-guidance wording" in text
+    assert_public_safe(output)
+
+
+def test_red_team_failure_record_keeps_public_safety_trigger_auditable(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    output = v3_agent_failure_record(
+        agent_id="red_team_audit",
+        item=universe()[0],
+        config=cfg,
+        input_context_hash="input-hash",
+        started_at="2026-07-03T00:00:00Z",
+        finished_at="2026-07-03T00:00:01Z",
+        duration_seconds=1.0,
+        reason="forbidden_public_content_detected:target_price",
+        retry_count=1,
+        public_safety_triggers=["price_objective_wording"],
+    )
+
+    assert output["failure_reason"] == "forbidden_public_content_detected"
+    assert output["retry_count"] == 1
+    assert output["public_safety_triggers"] == ["price_objective_wording"]
+    assert "target_price" not in json.dumps(output, ensure_ascii=False).lower()
     assert_public_safe(output)
 
 
