@@ -13,24 +13,33 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     MODE,
     ALAYA_EVENT_SCHEMA,
     ALAYA_EVENT_SCHEMA_V3,
+    ALAYA_EVENT_SCHEMA_V35,
+    EVIDENCE_PACKET_SCHEMA,
     EXECUTION_MODEL,
     EXECUTION_MODEL_V3,
+    EXECUTION_MODEL_V35,
     FullAnalystConfig,
     GotraInternalAlayaSyncClient,
     METHODOLOGY_VERSION,
     METHODOLOGY_VERSION_V3,
+    METHODOLOGY_VERSION_V35,
     MockAlayaSyncClient,
     PROMPT_TEMPLATE_VERSION,
     PROMPT_TEMPLATE_VERSION_V3,
+    PROMPT_TEMPLATE_VERSION_V35,
+    RESEARCH_TASK_SCHEMA,
     SYMBOL_SCHEMA,
     SYMBOL_SCHEMA_V3,
+    SYMBOL_SCHEMA_V35,
     assert_public_safe,
     build_prompt,
     config_from_args,
+    fixture_research_task_output,
     fixture_v3_agent_output,
     prompt_input_payload,
     parse_args,
     run,
+    sanitize_research_task,
     sanitize_v3_agent_output,
     selected_universe,
     update_loop_public_status,
@@ -112,10 +121,15 @@ class StaticRunner:
 class V3FixtureRunner:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.payloads: list[dict[str, object]] = []
 
     def complete(self, prompt_text: str, *, timeout_seconds: int) -> RunnerResult:
         del timeout_seconds
         payload = prompt_input_payload(prompt_text)
+        self.payloads.append(payload)
+        if payload.get("required_schema") == RESEARCH_TASK_SCHEMA:
+            self.calls.append("research_task_planner")
+            return RunnerResult(True, text=json.dumps(fixture_research_task_output(payload)), elapsed_seconds=0.01, returncode=0)
         self.calls.append(str(payload["agent_id"]))
         return RunnerResult(True, text=json.dumps(fixture_v3_agent_output(payload)), elapsed_seconds=0.01, returncode=0)
 
@@ -127,6 +141,10 @@ class V3FailingAgentRunner(V3FixtureRunner):
 
     def complete(self, prompt_text: str, *, timeout_seconds: int) -> RunnerResult:
         payload = prompt_input_payload(prompt_text)
+        self.payloads.append(payload)
+        if payload.get("required_schema") == RESEARCH_TASK_SCHEMA:
+            self.calls.append("research_task_planner")
+            return RunnerResult(True, text=json.dumps(fixture_research_task_output(payload)), elapsed_seconds=0.01, returncode=0)
         self.calls.append(str(payload["agent_id"]))
         if payload["agent_id"] == self.failed_agent:
             return RunnerResult(False, reason="simulated independent agent failure", elapsed_seconds=0.01, returncode=1)
@@ -142,6 +160,10 @@ class V3RetrySafetyRunner(V3FixtureRunner):
     def complete(self, prompt_text: str, *, timeout_seconds: int) -> RunnerResult:
         del timeout_seconds
         payload = prompt_input_payload(prompt_text)
+        self.payloads.append(payload)
+        if payload.get("required_schema") == RESEARCH_TASK_SCHEMA:
+            self.calls.append("research_task_planner")
+            return RunnerResult(True, text=json.dumps(fixture_research_task_output(payload)), elapsed_seconds=0.01, returncode=0)
         agent_id = str(payload["agent_id"])
         self.calls.append(agent_id)
         self.agent_attempts[agent_id] = self.agent_attempts.get(agent_id, 0) + 1
@@ -163,6 +185,10 @@ class V3OrderingRunner(V3FixtureRunner):
     def complete(self, prompt_text: str, *, timeout_seconds: int) -> RunnerResult:
         del timeout_seconds
         payload = prompt_input_payload(prompt_text)
+        self.payloads.append(payload)
+        if payload.get("required_schema") == RESEARCH_TASK_SCHEMA:
+            self.calls.append("research_task_planner")
+            return RunnerResult(True, text=json.dumps(fixture_research_task_output(payload)), elapsed_seconds=0.01, returncode=0)
         agent_id = str(payload["agent_id"])
         with self.lock:
             self.calls.append(agent_id)
@@ -560,7 +586,10 @@ def test_v3_agent_sanitizer_fills_pipeline_owned_metadata(tmp_path: Path) -> Non
         "uncertainties": ["Public context may be stale."],
         "watch_conditions": ["Next verified public filing."],
         "research_status": "watch",
-        "confidence_boundary": "Confidence is limited by public evidence freshness.",
+        "confidence_boundary": {
+            "overall": "Confidence is limited by public evidence freshness.",
+            "not_supported": "No stronger issuer conclusion is supported without official-source refresh.",
+        },
     }
 
     output = sanitize_v3_agent_output(
@@ -580,7 +609,65 @@ def test_v3_agent_sanitizer_fills_pipeline_owned_metadata(tmp_path: Path) -> Non
     assert output["symbol"] == "0700"
     assert output["run_id"] == cfg.run_id
     assert output["boundary"] == "research content only; does not constitute investment advice"
+    assert "{" not in output["confidence_boundary"]
+    assert "}" not in output["confidence_boundary"]
     assert output["output_hash"]
+
+
+def test_v35_structured_task_and_evidence_refs_are_not_python_dict_text(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    task = sanitize_research_task(
+        {
+            "schema": RESEARCH_TASK_SCHEMA,
+            "run_id": cfg.run_id,
+            "symbol": "0700",
+            "exchange": "HKEX",
+            "provider_ticker": "0700.HK",
+            "as_of_date": cfg.as_of_date.isoformat(),
+            "selection_reason": {
+                "why_today": "Coverage is current enough for a bounded research task.",
+                "data_gap": "Official issuer source coverage is incomplete.",
+            },
+            "trigger_context": {"coverage_status": "ok"},
+            "research_mission": {"summary": "Map evidence strength before any synthesis."},
+            "core_questions": ["Question one?", "Question two?", "Question three?"],
+            "required_sources": [{"source_type": "price_data", "purpose": "confirm coverage", "required": True}],
+            "must_not_conclude_without": ["official issuer evidence"],
+            "evidence_gap_policy": ["keep missing official source visible"],
+            "agent_briefs": {"k_deep_research": {"summary": "Use packet evidence only."}},
+            "reader_boundary": "Research content only. This does not constitute investment advice.",
+        },
+        item=universe()[0],
+        price_row=price_rows()["HKEX:0700"],
+        config=cfg,
+    )
+    output = sanitize_v3_agent_output(
+        {
+            "status": "ok",
+            "findings": [{"summary": "Structured finding should become reader text."}],
+            "evidence_refs": [
+                {"evidence_id": "price_context", "source_type": "price_data"},
+                {"evidence_id": "public_stock_pool_metadata", "source_type": "public_stock_pool_metadata"},
+            ],
+            "evidence_gaps": [{"summary": "Official issuer evidence is missing."}],
+            "uncertainties": ["Source coverage is incomplete."],
+            "watch_conditions": ["Next verified public update."],
+        },
+        agent_id="k_deep_research",
+        item=universe()[0],
+        config=cfg,
+        input_context_hash="input-hash",
+        started_at="2026-07-03T00:00:00Z",
+        finished_at="2026-07-03T00:00:01Z",
+        duration_seconds=1.0,
+    )
+
+    assert "{" not in task["selection_reason"]
+    assert "}" not in task["selection_reason"]
+    assert task["research_mission"] == "Map evidence strength before any synthesis."
+    assert output["evidence_refs"] == ["price_context", "public_stock_pool_metadata"]
+    assert all("{" not in item and "}" not in item for item in output["findings"])
+    assert all("{" not in item and "}" not in item for item in output["evidence_gaps"])
 
 
 def test_v3_agent_retries_public_safety_failure_then_publishes(tmp_path: Path) -> None:
@@ -668,6 +755,145 @@ def test_v3_requested_can_explicitly_fallback_to_v2() -> None:
     assert cfg.execution_model == EXECUTION_MODEL
     assert cfg.v3_independent_agents is False
     assert cfg.explicit_v2_fallback is True
+
+
+def test_v35_fixture_run_builds_task_evidence_and_alaya_hash_readback(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    cfg = FullAnalystConfig(
+        **{
+            **cfg.__dict__,
+            "v3_independent_agents": True,
+            "v35_research_system": True,
+            "execution_model": EXECUTION_MODEL_V35,
+            "requested_execution_model": EXECUTION_MODEL_V35,
+            "agent_concurrency": 4,
+            "alaya_mode": "real",
+        }
+    )
+    state_path = cfg.private_audit_root / "cognition_flywheel" / "full_analyst_memory_events.jsonl"
+    runner = V3FixtureRunner()
+
+    exit_code = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=runner,
+        alaya_client=GotraInternalAlayaSyncClient(state_path=state_path, actor="test/full_analyst_pipeline"),
+    )
+
+    status = json.loads((cfg.output_dir / "status_full_analyst_evening_hk.json").read_text())
+    symbol_payload = json.loads((cfg.output_dir / "symbols" / "HKEX_0700.json").read_text())
+    records = [json.loads(line) for line in state_path.read_text().splitlines() if line.strip()]
+
+    assert exit_code == 0
+    assert runner.calls[0] == "research_task_planner"
+    assert status["run_status"] == "completed_with_review_items"
+    assert status["prompt_template_version"] == PROMPT_TEMPLATE_VERSION_V35
+    assert status["symbol_schema"] == SYMBOL_SCHEMA_V35
+    assert status["methodology_version"] == METHODOLOGY_VERSION_V35
+    assert status["execution_model"] == EXECUTION_MODEL_V35
+    assert status["agent_parallelism"] == 4
+    assert status["agent_calls_total"] == 7
+    assert status["publish_count"] == 0
+    assert status["needs_review_count"] == 1
+    assert status["blocked_count"] == 0
+    assert status["alaya_event_schema"] == ALAYA_EVENT_SCHEMA_V35
+    assert status["alaya_readback_status"] == "verified"
+    assert status["research_task_seconds"] >= 0
+    assert status["evidence_packet_seconds"] >= 0
+
+    assert symbol_payload["schema"] == SYMBOL_SCHEMA_V35
+    assert symbol_payload["prompt_template_version"] == PROMPT_TEMPLATE_VERSION_V35
+    assert symbol_payload["methodology_version"] == METHODOLOGY_VERSION_V35
+    assert symbol_payload["execution_model"] == EXECUTION_MODEL_V35
+    assert symbol_payload["research_task"]["schema"] == RESEARCH_TASK_SCHEMA
+    assert symbol_payload["research_task"]["selection_reason"]
+    assert symbol_payload["research_task_hash"] == symbol_payload["research_task"]["task_hash"]
+    assert symbol_payload["evidence_packet"]["schema"] == EVIDENCE_PACKET_SCHEMA
+    assert symbol_payload["evidence_packet"]["evidence_items"]
+    assert symbol_payload["evidence_packet_hash"] == symbol_payload["evidence_packet"]["evidence_packet_hash"]
+    assert symbol_payload["missing_required_sources"]
+    assert symbol_payload["research_status"] == "needs_review"
+    assert symbol_payload["judge_status"] == "needs_review"
+    assert symbol_payload["agent_timings"]["research_task_seconds"] >= 0
+    assert symbol_payload["agent_timings"]["evidence_packet_seconds"] >= 0
+    assert symbol_payload["agent_hashes"]["chairman_synthesis"]
+    assert symbol_payload["agent_hashes"]["red_team_audit"]
+
+    assert records[0]["event_schema"] == ALAYA_EVENT_SCHEMA_V35
+    assert records[0]["cognition_flywheel_layer"] == "full_analyst_research_task_evidence_agents"
+    assert records[0]["research_task_hash"] == symbol_payload["research_task_hash"]
+    assert records[0]["evidence_packet_hash"] == symbol_payload["evidence_packet_hash"]
+    assert records[0]["agent_hashes"] == symbol_payload["agent_hashes"]
+    assert records[0]["chairman_hash"] == symbol_payload["agent_hashes"]["chairman_synthesis"]
+    assert records[0]["red_team_hash"] == symbol_payload["agent_hashes"]["red_team_audit"]
+    assert records[0]["public_payload_hash"] == symbol_payload["public_payload_hash"]
+
+
+def test_v35_agents_receive_research_task_and_evidence_packet(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    cfg = FullAnalystConfig(
+        **{
+            **cfg.__dict__,
+            "v3_independent_agents": True,
+            "v35_research_system": True,
+            "execution_model": EXECUTION_MODEL_V35,
+            "requested_execution_model": EXECUTION_MODEL_V35,
+            "agent_concurrency": 4,
+        }
+    )
+    runner = V3FixtureRunner()
+
+    exit_code = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=runner,
+        alaya_client=RecordingAlaya(),
+    )
+
+    payloads_by_agent = {
+        str(payload["agent_id"]): payload
+        for payload in runner.payloads
+        if payload.get("required_schema") != RESEARCH_TASK_SCHEMA
+    }
+    assert exit_code == 0
+    for agent_id in ("k_deep_research", "f_partner_view", "w_partner_view", "g_partner_view"):
+        payload = payloads_by_agent[agent_id]
+        assert payload["research_task"]["schema"] == RESEARCH_TASK_SCHEMA
+        assert payload["evidence_packet"]["schema"] == EVIDENCE_PACKET_SCHEMA
+        assert payload["agent_brief"]
+        assert payload["required_questions"]
+        assert payload["must_not_conclude_without"]
+
+    chairman = payloads_by_agent["chairman_synthesis"]
+    red_team = payloads_by_agent["red_team_audit"]
+    assert chairman["research_task"]["schema"] == RESEARCH_TASK_SCHEMA
+    assert chairman["evidence_packet"]["schema"] == EVIDENCE_PACKET_SCHEMA
+    assert set(chairman["dependencies"]) == {"k_deep_research", "f_partner_view", "w_partner_view", "g_partner_view"}
+    assert red_team["research_task"]["schema"] == RESEARCH_TASK_SCHEMA
+    assert red_team["evidence_packet"]["schema"] == EVIDENCE_PACKET_SCHEMA
+    assert "chairman_synthesis" in red_team["dependencies"]
+
+
+def test_v35_requested_can_explicitly_fallback_to_v2() -> None:
+    args = parse_args(["--mode", MODE, "--v35-research-system"])
+
+    cfg = config_from_args(args)
+
+    assert cfg.requested_execution_model == EXECUTION_MODEL_V35
+    assert cfg.execution_model == EXECUTION_MODEL_V35
+    assert cfg.v3_independent_agents is True
+    assert cfg.v35_research_system is True
+
+    fallback_args = parse_args(["--mode", MODE, "--v35-research-system", "--fallback-to-v2"])
+    fallback_cfg = config_from_args(fallback_args)
+
+    assert fallback_cfg.requested_execution_model == EXECUTION_MODEL_V35
+    assert fallback_cfg.execution_model == EXECUTION_MODEL
+    assert fallback_cfg.v3_independent_agents is False
+    assert fallback_cfg.v35_research_system is False
+    assert fallback_cfg.explicit_v2_fallback is True
 
 
 def test_missing_required_field_becomes_blocked_failure(tmp_path: Path) -> None:
