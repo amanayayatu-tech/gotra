@@ -672,6 +672,58 @@ def test_v35_structured_task_and_evidence_refs_are_not_python_dict_text(tmp_path
     assert all("{" not in item and "}" not in item for item in output["evidence_gaps"])
 
 
+def test_v35_research_task_neutralizes_boundary_policy_terms(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    task = sanitize_research_task(
+        {
+            "schema": RESEARCH_TASK_SCHEMA,
+            "run_id": cfg.run_id,
+            "symbol": "0700",
+            "exchange": "HKEX",
+            "provider_ticker": "0700.HK",
+            "as_of_date": cfg.as_of_date.isoformat(),
+            "selection_reason": "The symbol needs a bounded evidence task before any synthesis.",
+            "trigger_context": {"coverage_status": "data_gap"},
+            "research_mission": (
+                "Audit for target price, price targets, price objectives, buy recommendation, "
+                "sell rating, hold signal, position sizing, and return promise wording."
+            ),
+            "core_questions": [
+                "Which primary public sources are required?",
+                "Which evidence gaps must stay visible?",
+                "Which boundary categories must be audited before reader publication?",
+            ],
+            "required_sources": [{"source_type": "price_data", "purpose": "confirm coverage", "required": True}],
+            "must_not_conclude_without": [
+                "No target price or buy recommendation category may appear as a conclusion."
+            ],
+            "evidence_gap_policy": ["Keep position sizing and return promise language out of reader copy."],
+            "agent_briefs": {
+                "red_team_audit": "Check target price, sell rating, hold signal, and position sizing wording."
+            },
+            "reader_boundary": "Research content only. This does not constitute investment advice.",
+        },
+        item=universe()[0],
+        price_row=price_rows()["HKEX:0700"],
+        config=cfg,
+    )
+
+    text = json.dumps(task, ensure_ascii=False).lower()
+    assert "target price" not in text
+    assert "price target" not in text
+    assert "price objective" not in text
+    assert "buy recommendation" not in text
+    assert "sell rating" not in text
+    assert "hold signal" not in text
+    assert "position sizing" not in text
+    assert "return promise" not in text
+    assert "price-objective wording" in text
+    assert "directional-action wording" in text
+    assert "allocation-guidance wording" in text
+    assert "outcome-promise wording" in text
+    assert_public_safe(task)
+
+
 def test_v3_agent_retries_public_safety_failure_then_publishes(tmp_path: Path) -> None:
     cfg = config(tmp_path, symbols=("HKEX:0700",))
     cfg = FullAnalystConfig(

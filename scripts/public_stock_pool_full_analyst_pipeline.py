@@ -1318,6 +1318,7 @@ def sanitize_research_task(
         raise ValueError("research_task_too_generic:core_questions")
     if not task["required_sources"]:
         raise ValueError("research_task_too_generic:required_sources")
+    task = neutralize_public_boundary_terms(task)
     task["task_hash"] = stable_hash({key: value for key, value in task.items() if key != "task_hash"})
     assert_public_safe(task)
     return task
@@ -2370,8 +2371,11 @@ def write_private_attempt(config: FullAnalystConfig, item: dict[str, str], paylo
 
 
 
-RED_TEAM_PUBLIC_TERM_REPLACEMENTS = (
-    (re.compile(r"\btarget\s+prices?\b|\bprice\s+targets?\b", re.IGNORECASE), "price-objective wording"),
+PUBLIC_BOUNDARY_TERM_REPLACEMENTS = (
+    (
+        re.compile(r"\btarget\s+prices?\b|\bprice\s+targets?\b|\bprice\s+objectives?\b", re.IGNORECASE),
+        "price-objective wording",
+    ),
     (
         re.compile(
             r"\b(?:buy|sell|hold)\s+(?:recommendation|rating|signal|instruction)s?\b|"
@@ -2389,19 +2393,25 @@ RED_TEAM_PUBLIC_TERM_REPLACEMENTS = (
 )
 
 
-def neutralize_red_team_public_terms(value: Any) -> Any:
-    """Let red-team discuss boundary categories without publishing trigger words."""
+def neutralize_public_boundary_terms(value: Any) -> Any:
+    """Let boundary/audit documents name policy categories without publishing trigger words."""
 
     if isinstance(value, str):
         text = value
-        for pattern, replacement in RED_TEAM_PUBLIC_TERM_REPLACEMENTS:
+        for pattern, replacement in PUBLIC_BOUNDARY_TERM_REPLACEMENTS:
             text = pattern.sub(replacement, text)
         return text
     if isinstance(value, list):
-        return [neutralize_red_team_public_terms(item) for item in value]
+        return [neutralize_public_boundary_terms(item) for item in value]
     if isinstance(value, dict):
-        return {sanitize_text(str(key))[:120]: neutralize_red_team_public_terms(item) for key, item in value.items()}
+        return {sanitize_text(str(key))[:120]: neutralize_public_boundary_terms(item) for key, item in value.items()}
     return value
+
+
+def neutralize_red_team_public_terms(value: Any) -> Any:
+    """Backward-compatible wrapper for red-team public output neutralization."""
+
+    return neutralize_public_boundary_terms(value)
 
 def sanitize_symbol_payload(
     payload: dict[str, Any],
