@@ -31,6 +31,7 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     prompt_input_payload,
     parse_args,
     run,
+    sanitize_v3_agent_output,
     selected_universe,
     update_loop_public_status,
 )
@@ -529,6 +530,38 @@ def test_v3_kfwg_parallel_then_chairman_then_red_team(tmp_path: Path) -> None:
     assert max(kfwg_starts) - min(kfwg_starts) < 0.08
     assert runner.started["chairman_synthesis"] >= max(runner.finished[key] for key in ("k_deep_research", "f_partner_view", "w_partner_view", "g_partner_view"))
     assert runner.started["red_team_audit"] >= runner.finished["chairman_synthesis"]
+
+
+def test_v3_agent_sanitizer_fills_pipeline_owned_metadata(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    payload = {
+        "status": "ok",
+        "findings": ["Chairman synthesis keeps the research state bounded by evidence freshness."],
+        "evidence_gaps": ["Issuer filing refresh is still required."],
+        "uncertainties": ["Public context may be stale."],
+        "watch_conditions": ["Next verified public filing."],
+        "research_status": "watch",
+        "confidence_boundary": "Confidence is limited by public evidence freshness.",
+    }
+
+    output = sanitize_v3_agent_output(
+        payload,
+        agent_id="chairman_synthesis",
+        item=universe()[0],
+        config=cfg,
+        input_context_hash="input-hash",
+        started_at="2026-07-03T00:00:00Z",
+        finished_at="2026-07-03T00:00:01Z",
+        duration_seconds=1.0,
+    )
+
+    assert output["status"] == "ok"
+    assert output["agent_id"] == "chairman_synthesis"
+    assert output["schema"] == "gotra.full_analyst.agent_output.v3"
+    assert output["symbol"] == "0700"
+    assert output["run_id"] == cfg.run_id
+    assert output["boundary"] == "research content only; does not constitute investment advice"
+    assert output["output_hash"]
 
 
 def test_v3_agent_failure_blocks_symbol_and_preserves_failure_readback(tmp_path: Path) -> None:
