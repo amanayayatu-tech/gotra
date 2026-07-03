@@ -1923,13 +1923,29 @@ def normalize_negated_boundary_text(text: str) -> str:
         (
             re.compile(
                 r"\b(?:not\s+(?:a|an)\s+|no\s+)(?:buy|sell|hold)\s+"
-                r"(?:recommendation|rating|signal)\b",
+                r"(?:recommendation|rating|signal|instruction)s?\b",
                 re.IGNORECASE,
             ),
             "no_directional_action",
         ),
         (
-            re.compile(r"\b(?:not\s+(?:a|an)\s+|no\s+)target\s+price\b", re.IGNORECASE),
+            re.compile(
+                r"\b(?:not\s+(?:a|an)\s+|no\s+)(?:buy\s*/\s*sell\s*/\s*hold|buy,\s*sell,\s*(?:or\s*)?hold)\s+"
+                r"(?:recommendation|rating|signal|instruction)s?\b",
+                re.IGNORECASE,
+            ),
+            "no_directional_action",
+        ),
+        (
+            re.compile(r"\b(?:not\s+(?:a|an)\s+|no\s+)(?:target\s+prices?|price\s+targets?)\b", re.IGNORECASE),
+            "no_price_objective",
+        ),
+        (
+            re.compile(
+                r"\b(?:without|does\s+not\s+(?:include|provide|constitute)|is\s+not\s+(?:a|an)\s+)"
+                r"[^.。;；]{0,80}(?:target\s+prices?|price\s+targets?)\b",
+                re.IGNORECASE,
+            ),
             "no_price_objective",
         ),
         (
