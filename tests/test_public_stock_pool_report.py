@@ -407,6 +407,73 @@ def test_us_evening_allowed_cwan_close_gap_exits_zero() -> None:
     ]
 
 
+def test_global_summary_allows_hkex_and_us_provider_gaps() -> None:
+    dates = resolve_exchange_dates(
+        mode="morning-global",
+        as_of_date=date(2026, 7, 3),
+        trading_date=date(2026, 7, 2),
+        us_trading_date=None,
+    )
+    items = [
+        {"symbol": "0501", "exchange": "HKEX"},
+        {"symbol": "CWAN", "exchange": "NYSE"},
+        {"symbol": "NVDA", "exchange": "NASDAQ"},
+    ]
+    results = [
+        {
+            "ok": False,
+            "symbol": "0501",
+            "exchange": "HKEX",
+            "provider_ticker": "0501.HK",
+            "reason": "empty_price_frame",
+            "close_date": "2026-07-02",
+        },
+        {
+            "ok": False,
+            "symbol": "CWAN",
+            "exchange": "NYSE",
+            "provider_ticker": "CWAN",
+            "reason": "trading_date_close_missing",
+            "close_date": "2026-07-02",
+        },
+        {"ok": True, "symbol": "NVDA", "exchange": "NASDAQ", "provider_ticker": "NVDA"},
+    ]
+
+    status = build_status(
+        mode="morning-global",
+        as_of_date=date(2026, 7, 3),
+        exchange_dates=dates,
+        items=items,
+        results=results,
+        report_path=Path("public_stock_pool_morning_global_2026-07-02.md"),
+        latest_path=Path("latest_morning_global.md"),
+        status_path=Path("status_morning_global.json"),
+        allowed_missing_symbols=normalize_allowed_missing_symbols(["HKEX:0501", "NYSE:CWAN"]),
+    )
+
+    assert status["run_status"] == "completed_with_allowed_data_gaps"
+    assert status["failed_count"] == 2
+    assert status["data_gap_count"] == 2
+    assert status["allowed_missing_count"] == 2
+    assert status["unexpected_failed_count"] == 0
+    assert status["data_gap_symbols"] == [
+        {
+            "exchange": "HKEX",
+            "symbol": "0501",
+            "provider_ticker": "0501.HK",
+            "reason": "empty_price_frame",
+        },
+        {
+            "exchange": "NYSE",
+            "symbol": "CWAN",
+            "provider_ticker": "CWAN",
+            "reason": "trading_date_close_missing",
+        },
+    ]
+    assert status["unexpected_failed_symbols"] == []
+    assert status["exit_status"] == 0
+
+
 def test_allowed_data_gap_markdown_is_publicly_explicit(tmp_path: Path) -> None:
     dates = resolve_exchange_dates(
         mode="evening-us",
