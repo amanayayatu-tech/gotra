@@ -86,7 +86,8 @@ Generate the US evening report:
 cd /opt/gotra
 /root/.local/bin/uv run python scripts/public_stock_pool_report.py \
   --mode evening-us \
-  --publish-static
+  --publish-static \
+  --allowed-missing-symbol NYSE:CWAN
 ```
 
 Generate the global summary report:
@@ -96,7 +97,8 @@ cd /opt/gotra
 /root/.local/bin/uv run python scripts/public_stock_pool_report.py \
   --mode morning-global \
   --publish-static \
-  --allowed-missing-symbol HKEX:0501
+  --allowed-missing-symbol HKEX:0501 \
+  --allowed-missing-symbol NYSE:CWAN
 ```
 
 Useful dry-run flags:
@@ -108,6 +110,7 @@ Useful dry-run flags:
 --report-dir /tmp/gotra-report-smoke
 --static-dir /tmp/gotra-report-static
 --allowed-missing-symbol HKEX:0501
+--allowed-missing-symbol NYSE:CWAN
 --fetch-retries 2
 ```
 
@@ -346,10 +349,10 @@ completions, messages, or hidden model/provider I/O.
 - Holiday calendars are approximated by weekdays unless dates are overridden.
 - Yahoo Finance availability can be delayed or partial; coverage must be read
   from `status.json`.
-- `HKEX:0501` is currently allowlisted as a Yahoo provider coverage gap. Keep
-  the symbol in the research universe and read the gap from `failed_symbols`;
-  this allowlist only controls the process exit code when artifacts were written
-  successfully.
+- `HKEX:0501` and `NYSE:CWAN` are currently allowlisted as Yahoo provider
+  coverage gaps. Keep the symbols in the research universe and read the gaps
+  from `failed_symbols`; this allowlist only controls the process exit code when
+  artifacts were written successfully.
 - HTTPS, security headers, Nginx `/api/` rate limiting, `/data/` static 404
   behavior, and nftables edge blocking are owned by the public-ledger runtime
   templates in `/opt/gotra-public-ledger`.
