@@ -2340,6 +2340,41 @@ def write_private_attempt(config: FullAnalystConfig, item: dict[str, str], paylo
     write_private_json_atomic(path, payload)
 
 
+
+
+RED_TEAM_PUBLIC_TERM_REPLACEMENTS = (
+    (re.compile(r"\btarget\s+prices?\b|\bprice\s+targets?\b", re.IGNORECASE), "price-objective wording"),
+    (
+        re.compile(
+            r"\b(?:buy|sell|hold)\s+(?:recommendation|rating|signal|instruction)s?\b|"
+            r"\bbuy\s*/\s*sell\s*/\s*hold\b|\bbuy,\s*sell,\s*(?:or\s*)?hold\b",
+            re.IGNORECASE,
+        ),
+        "directional-action wording",
+    ),
+    (re.compile(r"\bposition\s+sizing\b", re.IGNORECASE), "allocation-guidance wording"),
+    (re.compile(r"\breturn\s+promise\b", re.IGNORECASE), "outcome-promise wording"),
+    (re.compile(r"目标价"), "price-objective wording"),
+    (re.compile(r"买入|卖出|持有建议|交易信号"), "directional-action wording"),
+    (re.compile(r"仓位"), "allocation-guidance wording"),
+    (re.compile(r"收益承诺"), "outcome-promise wording"),
+)
+
+
+def neutralize_red_team_public_terms(value: Any) -> Any:
+    """Let red-team discuss boundary categories without publishing trigger words."""
+
+    if isinstance(value, str):
+        text = value
+        for pattern, replacement in RED_TEAM_PUBLIC_TERM_REPLACEMENTS:
+            text = pattern.sub(replacement, text)
+        return text
+    if isinstance(value, list):
+        return [neutralize_red_team_public_terms(item) for item in value]
+    if isinstance(value, dict):
+        return {sanitize_text(str(key))[:120]: neutralize_red_team_public_terms(item) for key, item in value.items()}
+    return value
+
 def sanitize_symbol_payload(
     payload: dict[str, Any],
     *,
@@ -2465,6 +2500,16 @@ def sanitize_v3_agent_output(
         output["contradiction_list"] = sanitize_list(payload.get("contradiction_list"))
         output["possible_hallucinations"] = sanitize_list(payload.get("possible_hallucinations"))
         output["overconfidence_risks"] = sanitize_list(payload.get("overconfidence_risks"))
+        for key in (
+            "findings",
+            "evidence_gaps",
+            "uncertainties",
+            "watch_conditions",
+            "contradiction_list",
+            "possible_hallucinations",
+            "overconfidence_risks",
+        ):
+            output[key] = neutralize_red_team_public_terms(output.get(key))
     output["output_hash"] = v3_agent_output_hash(output)
     assert_public_safe(output)
     return output

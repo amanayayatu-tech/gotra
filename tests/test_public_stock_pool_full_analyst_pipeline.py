@@ -1011,6 +1011,41 @@ def test_direct_buy_recommendation_still_trips_public_scanner() -> None:
         raise AssertionError("direct buy recommendation wording should remain blocked")
 
 
+def test_red_team_output_neutralizes_audited_forbidden_terms(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    output = sanitize_v3_agent_output(
+        {
+            "status": "needs_review",
+            "findings": ["Target price language is absent; no buy recommendation is present."],
+            "evidence_refs": ["price_context"],
+            "evidence_gaps": ["Official source coverage is missing."],
+            "uncertainties": ["Potential buy/sell/hold wording is not found in the synthesis."],
+            "watch_conditions": ["Keep target price and sell rating language absent."],
+            "final_red_team_verdict": "needs_review",
+            "possible_hallucinations": ["A price target claim would be unsupported."],
+            "overconfidence_risks": ["No position sizing should appear."],
+        },
+        agent_id="red_team_audit",
+        item=universe()[0],
+        config=cfg,
+        input_context_hash="input-hash",
+        started_at="2026-07-03T00:00:00Z",
+        finished_at="2026-07-03T00:00:01Z",
+        duration_seconds=1.0,
+    )
+    text = json.dumps(output, ensure_ascii=False).lower()
+    assert "target price" not in text
+    assert "price target" not in text
+    assert "buy recommendation" not in text
+    assert "sell rating" not in text
+    assert "buy/sell/hold" not in text
+    assert "position sizing" not in text
+    assert "price-objective wording" in text
+    assert "directional-action wording" in text
+    assert "allocation-guidance wording" in text
+    assert_public_safe(output)
+
+
 def test_retry_prompt_names_forbidden_public_trigger_privately(tmp_path: Path) -> None:
     cfg = config(tmp_path, symbols=("HKEX:0700",))
 
