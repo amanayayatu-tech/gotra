@@ -2649,14 +2649,24 @@ def normalize_negated_boundary_text(text: str) -> str:
         ),
         (
             re.compile(
-                r"\b(?:no|not\s+(?:a|an)|without|do\s+not\s+(?:include|provide|constitute)|"
-                r"does\s+not\s+(?:include|provide|constitute)|is\s+not\s+(?:a|an))"
+                r"\b(?:no|not|without|do\s+not\s+(?:include|provide|constitute)|"
+                r"does\s+not\s+(?:include|provide|constitute|contain)|is\s+not)"
                 r"[^.。;；]{0,140}(?:target\s+prices?|price\s+targets?|investment\s+advice|"
                 r"trading\s+signals?|directional\s+recommendations?|allocation\s+guidance|"
-                r"outcome\s+promises?|performance\s+proof|science/public\s+proof)\b",
+                r"outcome\s+promises?|performance\s+proof|science/public\s+proof|"
+                r"(?:buy|sell|hold)\s+(?:recommendation|rating|signal|instruction)s?)\b",
                 re.IGNORECASE,
             ),
             "no_research_boundary_claim",
+        ),
+        (
+            re.compile(
+                r"\b(?:(?:target\s+prices?|price\s+targets?)|"
+                r"(?:buy|sell|hold)\s+(?:recommendation|rating|signal|instruction)s?)"
+                r"[^.。;；]{0,40}(?:absent|missing|not\s+present|not\s+included|not\s+found)\b",
+                re.IGNORECASE,
+            ),
+            "boundary_term_absent",
         ),
         (
             re.compile(r"\b(?:not\s+(?:a|an)\s+|no\s+)(?:target\s+prices?|price\s+targets?)\b", re.IGNORECASE),

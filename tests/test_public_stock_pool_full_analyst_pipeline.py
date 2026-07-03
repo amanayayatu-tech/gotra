@@ -982,6 +982,17 @@ def test_list_style_boundary_terms_do_not_trip_public_scanner() -> None:
     )
 
 
+def test_red_team_absence_audit_terms_do_not_trip_public_scanner() -> None:
+    assert_public_safe(
+        {
+            "summary": (
+                "The red-team audit does not contain any direct buy recommendation, sell rating, "
+                "hold signal, or target price. Price target language is absent and not found."
+            )
+        }
+    )
+
+
 def test_direct_target_price_claim_still_trips_public_scanner() -> None:
     try:
         assert_public_safe({"summary": "This clause contains a target price and must be retried."})
@@ -989,6 +1000,15 @@ def test_direct_target_price_claim_still_trips_public_scanner() -> None:
         assert "forbidden_public_content_detected" in str(exc)
     else:
         raise AssertionError("direct target price wording should remain blocked")
+
+
+def test_direct_buy_recommendation_still_trips_public_scanner() -> None:
+    try:
+        assert_public_safe({"summary": "This clause contains a buy recommendation."})
+    except ValueError as exc:
+        assert "forbidden_public_content_detected" in str(exc)
+    else:
+        raise AssertionError("direct buy recommendation wording should remain blocked")
 
 
 def test_retry_prompt_names_forbidden_public_trigger_privately(tmp_path: Path) -> None:
