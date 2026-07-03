@@ -675,7 +675,10 @@ def test_investment_advice_like_output_is_blocked(tmp_path: Path) -> None:
 def test_negated_advice_disclaimer_does_not_trip_public_scanner() -> None:
     assert_public_safe(
         {
-            "summary": "This is not a buy recommendation and no target price is provided.",
+            "summary": (
+                "This is not a buy recommendation, not a buy/sell/hold recommendation, "
+                "and no target prices are provided. The research note does not provide price targets."
+            ),
             "boundary": list(BOUNDARY_LINES),
         }
     )
