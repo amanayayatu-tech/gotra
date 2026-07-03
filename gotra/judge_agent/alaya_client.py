@@ -1,4 +1,4 @@
-"""HTTP client for audited Alaya API operations used by the Judge Agent."""
+"""HTTP client for GOTRA-internal Alaya-compatible audit operations."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import httpx
 from dotenv import load_dotenv
 
 
-DEFAULT_ALAYA_BASE_URL = "http://localhost:5000"
+DEFAULT_GOTRA_INTERNAL_COGNITION_BASE_URL = "http://localhost:5000"
 
 
 class AlayaClientError(RuntimeError):
@@ -19,9 +19,9 @@ class AlayaClientError(RuntimeError):
 
 @dataclass(frozen=True)
 class AlayaClient:
-    """Small typed wrapper around the Alaya REST API."""
+    """Small typed wrapper for GOTRA internal cognition flywheel audit APIs."""
 
-    base_url: str = DEFAULT_ALAYA_BASE_URL
+    base_url: str = DEFAULT_GOTRA_INTERNAL_COGNITION_BASE_URL
     api_key: str = ""
     timeout_seconds: float = 30.0
 
@@ -31,7 +31,7 @@ class AlayaClient:
 
         load_dotenv()
         return cls(
-            base_url=os.getenv("ALAYA_BASE_URL", DEFAULT_ALAYA_BASE_URL),
+            base_url=os.getenv("GOTRA_INTERNAL_COGNITION_BASE_URL", DEFAULT_GOTRA_INTERNAL_COGNITION_BASE_URL),
             api_key=os.getenv("ALAYA_AUTOMATION_API_KEY")
             or os.getenv("ALAYA_API_KEY", ""),
             timeout_seconds=float(os.getenv("ALAYA_TIMEOUT_SECONDS", "30")),
