@@ -133,6 +133,25 @@ class V3FailingAgentRunner(V3FixtureRunner):
         return RunnerResult(True, text=json.dumps(fixture_v3_agent_output(payload)), elapsed_seconds=0.01, returncode=0)
 
 
+class V3RetrySafetyRunner(V3FixtureRunner):
+    def __init__(self, retry_agent: str) -> None:
+        super().__init__()
+        self.retry_agent = retry_agent
+        self.agent_attempts: dict[str, int] = {}
+
+    def complete(self, prompt_text: str, *, timeout_seconds: int) -> RunnerResult:
+        del timeout_seconds
+        payload = prompt_input_payload(prompt_text)
+        agent_id = str(payload["agent_id"])
+        self.calls.append(agent_id)
+        self.agent_attempts[agent_id] = self.agent_attempts.get(agent_id, 0) + 1
+        if agent_id == self.retry_agent and self.agent_attempts[agent_id] == 1:
+            response = fixture_v3_agent_output(payload)
+            response["findings"] = ["This clause contains a target price and must be retried."]
+            return RunnerResult(True, text=json.dumps(response), elapsed_seconds=0.01, returncode=0)
+        return RunnerResult(True, text=json.dumps(fixture_v3_agent_output(payload)), elapsed_seconds=0.01, returncode=0)
+
+
 class V3OrderingRunner(V3FixtureRunner):
     def __init__(self) -> None:
         super().__init__()
@@ -562,6 +581,47 @@ def test_v3_agent_sanitizer_fills_pipeline_owned_metadata(tmp_path: Path) -> Non
     assert output["run_id"] == cfg.run_id
     assert output["boundary"] == "research content only; does not constitute investment advice"
     assert output["output_hash"]
+
+
+def test_v3_agent_retries_public_safety_failure_then_publishes(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    cfg = FullAnalystConfig(
+        **{
+            **cfg.__dict__,
+            "v3_independent_agents": True,
+            "execution_model": EXECUTION_MODEL_V3,
+            "requested_execution_model": EXECUTION_MODEL_V3,
+            "agent_concurrency": 1,
+            "retries": 1,
+        }
+    )
+    runner = V3RetrySafetyRunner("k_deep_research")
+
+    exit_code = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=runner,
+        alaya_client=RecordingAlaya(),
+    )
+
+    status = json.loads((cfg.output_dir / "status_full_analyst_evening_hk.json").read_text())
+    k_latest = json.loads(
+        (cfg.private_audit_root / cfg.run_id / "agents" / "HKEX_0700_k_deep_research.json").read_text()
+    )
+    k_attempt_1 = json.loads(
+        (cfg.private_audit_root / cfg.run_id / "agents" / "HKEX_0700_k_deep_research_attempt_1.json").read_text()
+    )
+    k_attempt_2 = json.loads(
+        (cfg.private_audit_root / cfg.run_id / "agents" / "HKEX_0700_k_deep_research_attempt_2.json").read_text()
+    )
+    assert exit_code == 0
+    assert status["publish_count"] == 1
+    assert runner.calls.count("k_deep_research") == 2
+    assert k_attempt_1["status"] == "failed"
+    assert k_attempt_1["failure_reason"] == "forbidden_public_content_detected"
+    assert "Retry attempt 2" in k_attempt_2["prompt_text"]
+    assert k_latest["status"] == "success"
 
 
 def test_v3_agent_failure_blocks_symbol_and_preserves_failure_readback(tmp_path: Path) -> None:
