@@ -2648,6 +2648,17 @@ def normalize_negated_boundary_text(text: str) -> str:
             "no_directional_action",
         ),
         (
+            re.compile(
+                r"\b(?:no|not\s+(?:a|an)|without|do\s+not\s+(?:include|provide|constitute)|"
+                r"does\s+not\s+(?:include|provide|constitute)|is\s+not\s+(?:a|an))"
+                r"[^.。;；]{0,140}(?:target\s+prices?|price\s+targets?|investment\s+advice|"
+                r"trading\s+signals?|directional\s+recommendations?|allocation\s+guidance|"
+                r"outcome\s+promises?|performance\s+proof|science/public\s+proof)\b",
+                re.IGNORECASE,
+            ),
+            "no_research_boundary_claim",
+        ),
+        (
             re.compile(r"\b(?:not\s+(?:a|an)\s+|no\s+)(?:target\s+prices?|price\s+targets?)\b", re.IGNORECASE),
             "no_price_objective",
         ),

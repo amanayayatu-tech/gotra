@@ -970,6 +970,27 @@ def test_negated_advice_disclaimer_does_not_trip_public_scanner() -> None:
     )
 
 
+def test_list_style_boundary_terms_do_not_trip_public_scanner() -> None:
+    assert_public_safe(
+        {
+            "summary": (
+                "Public safety: research content only; no investment advice, trading signal, "
+                "directional recommendation, target price, allocation guidance, outcome promise, "
+                "performance proof, or science/public proof."
+            )
+        }
+    )
+
+
+def test_direct_target_price_claim_still_trips_public_scanner() -> None:
+    try:
+        assert_public_safe({"summary": "This clause contains a target price and must be retried."})
+    except ValueError as exc:
+        assert "forbidden_public_content_detected" in str(exc)
+    else:
+        raise AssertionError("direct target price wording should remain blocked")
+
+
 def test_retry_prompt_names_forbidden_public_trigger_privately(tmp_path: Path) -> None:
     cfg = config(tmp_path, symbols=("HKEX:0700",))
 
