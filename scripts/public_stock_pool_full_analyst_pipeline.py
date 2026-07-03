@@ -272,6 +272,7 @@ class FixtureAnalystRunner:
 
 class MockAlayaSyncClient:
     def sync(self, payload: dict[str, Any]) -> dict[str, Any]:
+        started = time.monotonic()
         public_payload = build_alaya_public_payload(payload)
         stable = stable_hash(
             {
@@ -290,6 +291,9 @@ class MockAlayaSyncClient:
             "event_hash": stable,
             "public_payload_hash": public_payload["public_payload_hash"],
             "readback_status": "not_applicable",
+            "write_seconds": 0.0,
+            "readback_seconds": 0.0,
+            "total_seconds": round(time.monotonic() - started, 3),
         }
 
 
@@ -311,6 +315,7 @@ class GotraInternalAlayaSyncClient:
         )
 
     def sync(self, payload: dict[str, Any]) -> dict[str, Any]:
+        started = time.monotonic()
         public_payload = build_alaya_public_payload(payload)
         public_payload_hash = str(public_payload["public_payload_hash"])
         event = {
@@ -347,17 +352,26 @@ class GotraInternalAlayaSyncClient:
             "source_payload_hash": public_payload_hash,
             "public_payload": public_payload,
         }
+        write_seconds = 0.0
+        readback_seconds = 0.0
         try:
+            write_started = time.monotonic()
             written = append_audit_event(self.state_path, event)
+            write_seconds = time.monotonic() - write_started
         except OSError:
             return {
                 "status": "failed",
                 "mode": "real",
                 "reason": "gotra_internal_state_write_failed",
                 "readback_status": "skipped",
+                "write_seconds": round(write_seconds, 3),
+                "readback_seconds": 0.0,
+                "total_seconds": round(time.monotonic() - started, 3),
             }
+        readback_started = time.monotonic()
         verification = verify_audit_chain(self.state_path)
         if not verification.ok:
+            readback_seconds = time.monotonic() - readback_started
             return {
                 "status": "failed",
                 "mode": "real",
@@ -365,6 +379,9 @@ class GotraInternalAlayaSyncClient:
                 "event_id": str(written.get("event_hash") or ""),
                 "event_hash": str(written.get("event_hash") or ""),
                 "readback_status": "failed",
+                "write_seconds": round(write_seconds, 3),
+                "readback_seconds": round(readback_seconds, 3),
+                "total_seconds": round(time.monotonic() - started, 3),
             }
         event_hash = str(written.get("event_hash") or "")
         readback = [
@@ -372,6 +389,7 @@ class GotraInternalAlayaSyncClient:
             for record in read_audit_events(self.state_path)
             if str(record.get("event_hash") or "") == event_hash
         ]
+        readback_seconds = time.monotonic() - readback_started
         if not readback:
             return {
                 "status": "failed",
@@ -380,6 +398,9 @@ class GotraInternalAlayaSyncClient:
                 "event_id": event_hash,
                 "event_hash": event_hash,
                 "readback_status": "failed",
+                "write_seconds": round(write_seconds, 3),
+                "readback_seconds": round(readback_seconds, 3),
+                "total_seconds": round(time.monotonic() - started, 3),
             }
         readback_payload_hash = str(readback[0].get("source_payload_hash") or "")
         readback_knowledge_id = str(readback[0].get("knowledge_id") or "")
@@ -392,6 +413,9 @@ class GotraInternalAlayaSyncClient:
                 "event_hash": event_hash,
                 "public_payload_hash": public_payload_hash,
                 "readback_status": "mismatch",
+                "write_seconds": round(write_seconds, 3),
+                "readback_seconds": round(readback_seconds, 3),
+                "total_seconds": round(time.monotonic() - started, 3),
             }
         if readback_payload_hash != public_payload_hash:
             return {
@@ -402,6 +426,9 @@ class GotraInternalAlayaSyncClient:
                 "event_hash": event_hash,
                 "public_payload_hash": public_payload_hash,
                 "readback_status": "mismatch",
+                "write_seconds": round(write_seconds, 3),
+                "readback_seconds": round(readback_seconds, 3),
+                "total_seconds": round(time.monotonic() - started, 3),
             }
         return {
             "status": "synced",
@@ -411,6 +438,9 @@ class GotraInternalAlayaSyncClient:
             "event_hash": event_hash,
             "public_payload_hash": public_payload_hash,
             "readback_status": "verified",
+            "write_seconds": round(write_seconds, 3),
+            "readback_seconds": round(readback_seconds, 3),
+            "total_seconds": round(time.monotonic() - started, 3),
         }
 
 
@@ -852,6 +882,9 @@ def run_symbol(
             symbol_payload["public_payload_hash"] = alaya_result.get("public_payload_hash", "")
             symbol_payload["alaya_readback_status"] = alaya_result.get("readback_status", "not_applicable")
             symbol_payload["alaya_failure_reason"] = alaya_result.get("reason", "")
+            symbol_payload["alaya_write_seconds"] = float(alaya_result.get("write_seconds") or 0.0)
+            symbol_payload["alaya_readback_seconds"] = float(alaya_result.get("readback_seconds") or 0.0)
+            symbol_payload["alaya_total_seconds"] = float(alaya_result.get("total_seconds") or 0.0)
             attempt_record["status"] = "success"
             attempt_record["parsed_structured_output"] = symbol_payload
             write_private_attempt(config, item, attempt_record)
@@ -870,6 +903,9 @@ def run_symbol(
                 "public_payload_hash": alaya_result.get("public_payload_hash", ""),
                 "alaya_readback_status": alaya_result.get("readback_status", "not_applicable"),
                 "alaya_failure_reason": alaya_result.get("reason", ""),
+                "alaya_write_seconds": float(alaya_result.get("write_seconds") or 0.0),
+                "alaya_readback_seconds": float(alaya_result.get("readback_seconds") or 0.0),
+                "alaya_total_seconds": float(alaya_result.get("total_seconds") or 0.0),
                 "attempts": attempt,
                 "attempt_metrics": attempts,
                 "started_at_utc": started_at,
@@ -896,6 +932,9 @@ def run_symbol(
         "alaya_event_hash": "",
         "alaya_readback_status": "skipped",
         "alaya_failure_reason": "",
+        "alaya_write_seconds": 0.0,
+        "alaya_readback_seconds": 0.0,
+        "alaya_total_seconds": 0.0,
         "attempts": len(attempts),
         "attempt_metrics": attempts,
         "started_at_utc": started_at,
@@ -1071,9 +1110,23 @@ def judge_symbol(symbol_payload: dict[str, Any]) -> tuple[str, list[str]]:
 
 def alaya_sync(symbol_payload: dict[str, Any], alaya_client: AlayaSyncClient, config: FullAnalystConfig) -> dict[str, Any]:
     if symbol_payload["judge_status"] != "publish":
-        return {"status": "skipped", "reason": "judge_status_not_publish", "readback_status": "skipped"}
+        return {
+            "status": "skipped",
+            "reason": "judge_status_not_publish",
+            "readback_status": "skipped",
+            "write_seconds": 0.0,
+            "readback_seconds": 0.0,
+            "total_seconds": 0.0,
+        }
     if config.alaya_mode == "off":
-        return {"status": "skipped", "reason": "alaya_mode_off", "readback_status": "skipped"}
+        return {
+            "status": "skipped",
+            "reason": "alaya_mode_off",
+            "readback_status": "skipped",
+            "write_seconds": 0.0,
+            "readback_seconds": 0.0,
+            "total_seconds": 0.0,
+        }
     result = alaya_client.sync(symbol_payload)
     if result.get("status") != "synced":
         return {
@@ -1082,6 +1135,9 @@ def alaya_sync(symbol_payload: dict[str, Any], alaya_client: AlayaSyncClient, co
             "event_id": sanitize_text(str(result.get("event_id") or ""))[:160],
             "event_hash": sanitize_text(str(result.get("event_hash") or ""))[:160],
             "readback_status": sanitize_text(str(result.get("readback_status") or "failed"))[:80],
+            "write_seconds": float(result.get("write_seconds") or 0.0),
+            "readback_seconds": float(result.get("readback_seconds") or 0.0),
+            "total_seconds": float(result.get("total_seconds") or 0.0),
         }
     write_private_json_atomic(
         private_run_dir(config) / "alaya_events" / f"{symbol_payload['exchange']}_{symbol_payload['symbol']}.json",
@@ -1213,6 +1269,12 @@ def build_status(
         "alaya_failed_count": len(alaya_failed),
         "alaya_readback_verified_count": len(alaya_verified),
         "alaya_readback_failed_count": len(alaya_readback_failed),
+        "alaya_write_seconds": round(sum(float(row.get("alaya_write_seconds") or 0.0) for row in results), 3),
+        "alaya_readback_seconds": round(
+            sum(float(row.get("alaya_readback_seconds") or 0.0) for row in results),
+            3,
+        ),
+        "alaya_total_seconds": round(sum(float(row.get("alaya_total_seconds") or 0.0) for row in results), 3),
         "alaya_sync_status": alaya_sync_status,
         "alaya_readback_status": alaya_readback_status,
         "failed_symbols": failure_rows(failed),
@@ -1479,6 +1541,9 @@ def render_markdown(status: dict[str, Any], results: list[dict[str, Any]]) -> st
         f"- alaya_failed_count: {status['alaya_failed_count']}",
         f"- alaya_readback_verified_count: {status['alaya_readback_verified_count']}",
         f"- alaya_readback_failed_count: {status['alaya_readback_failed_count']}",
+        f"- alaya_write_seconds: {status['alaya_write_seconds']}",
+        f"- alaya_readback_seconds: {status['alaya_readback_seconds']}",
+        f"- alaya_total_seconds: {status['alaya_total_seconds']}",
         f"- alaya_mode: {status['alaya_mode']}",
         f"- alaya_sync_status: {status['alaya_sync_status']}",
         f"- alaya_readback_status: {status['alaya_readback_status']}",
@@ -1663,6 +1728,9 @@ def write_failure_records(config: FullAnalystConfig, results: list[dict[str, Any
             "data_gap_count": status["data_gap_count"],
             "alaya_synced_count": status["alaya_synced_count"],
             "alaya_readback_verified_count": status["alaya_readback_verified_count"],
+            "alaya_write_seconds": status["alaya_write_seconds"],
+            "alaya_readback_seconds": status["alaya_readback_seconds"],
+            "alaya_total_seconds": status["alaya_total_seconds"],
             "artifact_write_status": status["artifact_write_status"],
             "public_scan_status": status["public_scan_status"],
             "exit_status": status["exit_status"],
@@ -1700,6 +1768,9 @@ def write_blocker_status(config: FullAnalystConfig, *, started_at_utc: str, reas
         "alaya_failed_count": 0,
         "alaya_readback_verified_count": 0,
         "alaya_readback_failed_count": 0,
+        "alaya_write_seconds": 0.0,
+        "alaya_readback_seconds": 0.0,
+        "alaya_total_seconds": 0.0,
         "alaya_sync_status": "blocked" if config.alaya_mode == "real" else "skipped",
         "alaya_readback_status": "blocked" if config.alaya_mode == "real" else "skipped",
         "failed_symbols": [],
@@ -1822,6 +1893,9 @@ def build_loop_running_status(
         "alaya_failed_count": 0,
         "alaya_readback_verified_count": 0,
         "alaya_readback_failed_count": 0,
+        "alaya_write_seconds": 0.0,
+        "alaya_readback_seconds": 0.0,
+        "alaya_total_seconds": 0.0,
         "alaya_sync_status": "pending" if config.alaya_mode == "real" else "skipped",
         "alaya_readback_status": "pending" if config.alaya_mode == "real" else "not_applicable",
         "failed_symbols": [],

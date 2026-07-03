@@ -131,6 +131,9 @@ class RealSuccessAlaya(RecordingAlaya):
             "event_id": "real-event-1",
             "event_hash": "real-hash-1",
             "readback_status": "verified",
+            "write_seconds": 0.02,
+            "readback_seconds": 0.03,
+            "total_seconds": 0.05,
         }
 
 
@@ -244,6 +247,9 @@ def test_fixture_run_writes_independent_public_and_static_artifacts(tmp_path: Pa
     assert status["stage_statuses"]["judge_gate"] == "needs_review"
     assert status["stage_statuses"]["public_safety_scan"] == "ok"
     assert status["alaya_synced_count"] == 2
+    assert status["alaya_write_seconds"] >= 0
+    assert status["alaya_readback_seconds"] >= 0
+    assert status["alaya_total_seconds"] >= 0
     assert status["provider_model_io_embedded"] is False
     assert status["prompt_template_version"] == PROMPT_TEMPLATE_VERSION
     assert status["symbol_schema"] == SYMBOL_SCHEMA
@@ -306,6 +312,9 @@ def test_all_publish_exits_zero_with_real_alaya_readback_verified(tmp_path: Path
     assert status["alaya_synced_count"] == 1
     assert status["alaya_readback_verified_count"] == 1
     assert status["alaya_readback_status"] == "verified"
+    assert status["alaya_write_seconds"] == 0.02
+    assert status["alaya_readback_seconds"] == 0.03
+    assert status["alaya_total_seconds"] == 0.05
     assert alaya.calls
 
 
