@@ -17,7 +17,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
@@ -70,6 +70,7 @@ CHAIRMAN_SCHEMA_V4 = "gotra.full_analyst.chairman_synthesis.v4"
 RED_TEAM_SCHEMA_V4 = "gotra.full_analyst.red_team_audit.v4"
 RESEARCH_QUALITY_GATE_SCHEMA = "gotra.full_analyst.research_quality_gate.v1"
 KNOWLEDGE_GATE_SCHEMA = "gotra.cognition_flywheel.knowledge_gate.v1"
+RESEARCH_SIGNAL_SCHEMA = "gotra.research_signal.v1"
 METHODOLOGY_VERSION = "ksana_4_1_lite"
 METHODOLOGY_VERSION_V3 = "ksana_4_1_independent_agents"
 METHODOLOGY_VERSION_V35 = "ksana_4_1_research_task_evidence_agents"
@@ -447,6 +448,7 @@ class GotraInternalAlayaSyncClient:
             "k_dossier_hash": payload.get("k_dossier_hash", ""),
             "research_quality_gate_hash": payload.get("research_quality_gate_hash", ""),
             "knowledge_gate_hash": payload.get("knowledge_gate_hash", ""),
+            "research_signal_hash": payload.get("research_signal_hash", ""),
             "prompt_hash": payload.get("prompt_hash", ""),
             "research_packet_hash": payload.get("research_packet_hash", ""),
             "public_payload_hash": public_payload_hash,
@@ -602,7 +604,7 @@ class GotraInternalAlayaSyncClient:
             if is_v35_payload or is_v40_payload:
                 hash_keys = ["research_task_hash", "evidence_packet_hash", "market_data_snapshot_hash", "chairman_hash", "red_team_hash"]
                 if is_v40_payload:
-                    hash_keys.extend(["k_dossier_hash", "research_quality_gate_hash", "knowledge_gate_hash"])
+                    hash_keys.extend(["k_dossier_hash", "research_quality_gate_hash", "knowledge_gate_hash", "research_signal_hash"])
                 for hash_key in hash_keys:
                     expected_hash = (
                         payload["agent_hashes"].get("chairman_synthesis", "")
@@ -2231,6 +2233,7 @@ def build_alaya_public_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "agent_statuses": agent_statuses(payload),
             "research_quality_gate_hash": payload.get("research_quality_gate_hash", ""),
             "knowledge_gate_hash": payload.get("knowledge_gate_hash", ""),
+            "research_signal_hash": payload.get("research_signal_hash", ""),
             "evidence_gaps": payload["evidence_gaps"],
             "watch_conditions": payload["watch_conditions"],
         }
@@ -2262,6 +2265,7 @@ def build_alaya_public_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "red_team_verdict": red_team_verdict(payload),
             "research_quality_gate_hash": payload.get("research_quality_gate_hash", ""),
             "knowledge_gate_hash": payload.get("knowledge_gate_hash", ""),
+            "research_signal_hash": payload.get("research_signal_hash", ""),
             "knowledge_persistence": payload.get("knowledge_persistence", ""),
             "unresolved_questions": payload.get("unresolved_questions", []),
             "missing_required_sources": payload.get("missing_required_sources", []),
@@ -2278,10 +2282,13 @@ def build_alaya_public_payload(payload: dict[str, Any]) -> dict[str, Any]:
             public_payload["reader_boundary_gate_hash"] = payload.get("reader_boundary_gate_hash", "")
             public_payload["research_quality_gate"] = payload.get("research_quality_gate", {})
             public_payload["knowledge_gate"] = payload.get("knowledge_gate", {})
+            public_payload["research_signal"] = payload.get("research_signal", {})
+            public_payload["agent_research_signal_hashes"] = payload.get("agent_research_signal_hashes", {})
             public_payload["k_dossier_schema"] = K_DOSSIER_SCHEMA
             public_payload["perspective_agent_schema"] = PERSPECTIVE_AGENT_SCHEMA_V4
             public_payload["chairman_schema"] = CHAIRMAN_SCHEMA_V4
             public_payload["red_team_schema"] = RED_TEAM_SCHEMA_V4
+            public_payload["research_signal_schema"] = RESEARCH_SIGNAL_SCHEMA
         if is_v35_payload:
             public_payload["cognition_flywheel_layer"] = "full_analyst_research_task_evidence_agents"
         assert_public_safe(public_payload)
@@ -2737,6 +2744,214 @@ def build_reader_boundary_gate(*, research_quality_gate: dict[str, Any], red_tea
     return gate
 
 
+RESEARCH_SIGNAL_FORBIDDEN_FRAGMENTS = (
+    "b" + "uy recommendation",
+    "s" + "ell recommendation",
+    "h" + "old recommendation",
+    "target " + "price",
+    "price " + "target",
+    "position " + "sizing",
+    "return " + "promise",
+    "\u5efa\u8bae\u4e70\u5165",
+    "\u5efa\u8bae\u5356\u51fa",
+    "\u5fc5\u6da8",
+    "\u7a33\u8d5a",
+)
+
+
+def research_signal_review_due_at(config: FullAnalystConfig, window_days: int) -> str:
+    return (config.as_of_date + timedelta(days=window_days)).isoformat()
+
+
+def research_signal_confidence(research_quality_gate: dict[str, Any] | None, evidence_gaps: list[str]) -> str:
+    verdict = str((research_quality_gate or {}).get("quality_verdict") or "").lower()
+    status = str((research_quality_gate or {}).get("research_status") or "").lower()
+    if verdict == "pass" and not evidence_gaps:
+        return "medium"
+    if status in {"data_gap", "high_uncertainty"}:
+        return "low"
+    return "needs_review"
+
+
+def research_signal_evidence_ids(evidence_packet: dict[str, Any]) -> list[str]:
+    ids = [
+        sanitize_text(str(item.get("evidence_id") or item.get("source_id") or ""))[:160]
+        for item in evidence_packet.get("evidence_items", [])
+        if isinstance(item, dict)
+    ]
+    return dedupe_preserve_order(ids)[:12]
+
+
+def assert_research_signal_no_forbidden_terms(signal: dict[str, Any]) -> None:
+    text = normalize_negated_boundary_text(json.dumps(signal, ensure_ascii=False, sort_keys=True)).lower()
+    for fragment in RESEARCH_SIGNAL_FORBIDDEN_FRAGMENTS:
+        if fragment.lower() in text:
+            raise ValueError("[BLOCKED: 合规禁词] research_signal_forbidden_wording")
+    assert_public_safe(signal)
+
+
+def validate_research_signal_contract(signal: dict[str, Any]) -> None:
+    required = (
+        "signal_id",
+        "symbol",
+        "hypothesis",
+        "confidence",
+        "evidence_ids",
+        "counter_evidence",
+        "uncertainty",
+        "window_days",
+        "review_due_at",
+    )
+    missing = [field for field in required if field not in signal]
+    if missing:
+        raise ValueError(f"research_signal_missing_required_fields:{','.join(missing)}")
+    if not sanitize_text(str(signal.get("signal_id") or "")):
+        raise ValueError("research_signal_missing_signal_id")
+    if not sanitize_text(str(signal.get("symbol") or "")):
+        raise ValueError("research_signal_missing_symbol")
+    if not sanitize_text(str(signal.get("hypothesis") or "")):
+        raise ValueError("research_signal_missing_hypothesis")
+    if not isinstance(signal.get("evidence_ids"), list) or not signal["evidence_ids"]:
+        raise ValueError("research_signal_empty_evidence_ids")
+    if not isinstance(signal.get("counter_evidence"), list) or not signal["counter_evidence"]:
+        raise ValueError("research_signal_empty_counter_evidence")
+    if not isinstance(signal.get("uncertainty"), list) or not signal["uncertainty"]:
+        raise ValueError("research_signal_empty_uncertainty")
+    if not isinstance(signal.get("window_days"), int) or int(signal["window_days"]) <= 0:
+        raise ValueError("research_signal_invalid_window_days")
+    try:
+        date.fromisoformat(str(signal.get("review_due_at") or ""))
+    except ValueError as exc:
+        raise ValueError("research_signal_invalid_review_due_at") from exc
+    for field in ("evidence_packet_hash", "market_data_snapshot_hash", "evidence_packet_id"):
+        if not sanitize_text(str(signal.get(field) or "")):
+            raise ValueError(f"research_signal_missing_{field}")
+    assert_research_signal_no_forbidden_terms(signal)
+
+
+def build_research_signal(
+    *,
+    item: dict[str, str],
+    config: FullAnalystConfig,
+    source_id: str,
+    hypothesis: str,
+    evidence_packet: dict[str, Any],
+    market_data_snapshot: dict[str, Any],
+    counter_evidence: list[str],
+    uncertainty: list[str],
+    research_quality_gate: dict[str, Any] | None,
+    window_days: int = 30,
+) -> dict[str, Any]:
+    evidence_ids = research_signal_evidence_ids(evidence_packet)
+    signal = {
+        "schema": RESEARCH_SIGNAL_SCHEMA,
+        "signal_id": f"{config.run_id}:{item['exchange']}:{item['symbol']}:{source_id}:research_signal",
+        "run_id": config.run_id,
+        "symbol": item["symbol"],
+        "exchange": item["exchange"],
+        "provider_ticker": item["provider_ticker"],
+        "as_of_date": config.as_of_date.isoformat(),
+        "source_id": source_id,
+        "hypothesis": sanitize_public_text_value(hypothesis, max_chars=900)
+        or f"{item['exchange']}:{item['symbol']} remains a bounded public research object.",
+        "confidence": research_signal_confidence(research_quality_gate, sanitize_list(uncertainty)),
+        "evidence_ids": evidence_ids,
+        "counter_evidence": sanitize_list(counter_evidence)[:8],
+        "uncertainty": sanitize_list(uncertainty)[:8],
+        "window_days": window_days,
+        "review_due_at": research_signal_review_due_at(config, window_days),
+        "evidence_packet_id": sanitize_text(str(evidence_packet.get("packet_id") or ""))[:240],
+        "evidence_packet_hash": sanitize_text(str(evidence_packet.get("evidence_packet_hash") or ""))[:120],
+        "market_data_snapshot_hash": sanitize_text(str(market_data_snapshot.get("snapshot_hash") or ""))[:120],
+        "market_data_snapshot_schema": sanitize_text(str(market_data_snapshot.get("schema") or MARKET_DATA_SNAPSHOT_SCHEMA))[:120],
+        "research_status": sanitize_text(str((research_quality_gate or {}).get("research_status") or "needs_review"))[:80],
+        "boundary": "research-only structured signal; not a trading instruction",
+    }
+    if not signal["counter_evidence"]:
+        signal["counter_evidence"] = ["Counter-evidence remains unresolved and must stay visible before stronger synthesis."]
+    if not signal["uncertainty"]:
+        signal["uncertainty"] = ["Uncertainty remains bounded by public evidence freshness and missing sources."]
+    validate_research_signal_contract(signal)
+    signal["signal_hash"] = stable_hash({key: value for key, value in signal.items() if key != "signal_hash"})
+    return signal
+
+
+def build_symbol_research_signal(
+    *,
+    item: dict[str, str],
+    config: FullAnalystConfig,
+    evidence_packet: dict[str, Any],
+    market_data_snapshot: dict[str, Any],
+    chairman: dict[str, Any],
+    red_team: dict[str, Any],
+    research_quality_gate: dict[str, Any],
+    evidence_gaps: list[str],
+    watch_conditions: list[str],
+    public_summary: str,
+) -> dict[str, Any]:
+    hypothesis = public_summary or "; ".join(sanitize_list(chairman.get("findings"))[:3])
+    counter_evidence = (
+        sanitize_list(red_team.get("counter_evidence_needed"))
+        + sanitize_list(red_team.get("weak_assumptions"))
+        + sanitize_list(red_team.get("contradiction_list"))
+        + evidence_gaps
+    )
+    uncertainty = (
+        sanitize_list(chairman.get("unresolved_questions"))
+        + sanitize_list(chairman.get("conflicts"))
+        + sanitize_list(red_team.get("over_certainty_risks"))
+        + watch_conditions
+    )
+    return build_research_signal(
+        item=item,
+        config=config,
+        source_id="symbol",
+        hypothesis=hypothesis,
+        evidence_packet=evidence_packet,
+        market_data_snapshot=market_data_snapshot,
+        counter_evidence=counter_evidence,
+        uncertainty=uncertainty,
+        research_quality_gate=research_quality_gate,
+    )
+
+
+def build_agent_research_signals(
+    *,
+    item: dict[str, str],
+    config: FullAnalystConfig,
+    evidence_packet: dict[str, Any],
+    market_data_snapshot: dict[str, Any],
+    agent_outputs: dict[str, dict[str, Any]],
+    research_quality_gate: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    signals: dict[str, dict[str, Any]] = {}
+    for agent_id, output in agent_outputs.items():
+        signals[agent_id] = build_research_signal(
+            item=item,
+            config=config,
+            source_id=agent_id,
+            hypothesis="; ".join(sanitize_list(output.get("findings"))[:3]),
+            evidence_packet=evidence_packet,
+            market_data_snapshot=market_data_snapshot,
+            counter_evidence=sanitize_list(output.get("evidence_gaps")) + sanitize_list(output.get("counter_evidence_needed")),
+            uncertainty=sanitize_list(output.get("uncertainties")) + sanitize_list(output.get("watch_conditions")),
+            research_quality_gate=research_quality_gate,
+        )
+    return signals
+
+
+def validate_symbol_research_signal_contract(symbol_payload: dict[str, Any]) -> None:
+    validate_research_signal_contract(symbol_payload.get("research_signal") if isinstance(symbol_payload.get("research_signal"), dict) else {})
+    agent_signals = symbol_payload.get("agent_research_signals")
+    if not isinstance(agent_signals, dict):
+        raise ValueError("agent_research_signals_missing")
+    missing = [agent_id for agent_id in V3_AGENT_IDS if agent_id not in agent_signals]
+    if missing:
+        raise ValueError(f"agent_research_signals_missing_agents:{','.join(missing)}")
+    for agent_id in V3_AGENT_IDS:
+        validate_research_signal_contract(agent_signals[agent_id])
+
+
 def aggregate_v3_symbol_payload(
     *,
     item: dict[str, str],
@@ -2820,6 +3035,35 @@ def aggregate_v3_symbol_payload(
         {"summary": "; ".join(sanitize_list(chairman.get("findings"))[:3])},
         f"Independent-agent research synthesis for {item['exchange']}:{item['symbol']}.",
     )
+    research_signal: dict[str, Any] | None = None
+    agent_research_signals: dict[str, dict[str, Any]] = {}
+    agent_research_signal_hashes: dict[str, str] = {}
+    if is_v40_config(config):
+        if not evidence_packet or not research_quality_gate:
+            raise ValueError("v40_missing_evidence_packet_or_research_quality_gate_for_research_signal")
+        research_signal = build_symbol_research_signal(
+            item=item,
+            config=config,
+            evidence_packet=evidence_packet,
+            market_data_snapshot=market_data_snapshot,
+            chairman=chairman,
+            red_team=red_team,
+            research_quality_gate=research_quality_gate,
+            evidence_gaps=evidence_gaps,
+            watch_conditions=watch_conditions,
+            public_summary=public_summary,
+        )
+        agent_research_signals = build_agent_research_signals(
+            item=item,
+            config=config,
+            evidence_packet=evidence_packet,
+            market_data_snapshot=market_data_snapshot,
+            agent_outputs=agent_outputs,
+            research_quality_gate=research_quality_gate,
+        )
+        agent_research_signal_hashes = {
+            agent_id: signal["signal_hash"] for agent_id, signal in agent_research_signals.items()
+        }
     payload = {
         "schema": symbol_schema_for_config(config),
         "prompt_template_version": prompt_template_for_config(config),
@@ -2922,6 +3166,11 @@ def aggregate_v3_symbol_payload(
                 "evidence_gap_memory": knowledge_gate["evidence_gap_memory"],
                 "reader_boundary_gate": reader_boundary_gate,
                 "reader_boundary_gate_hash": reader_boundary_gate["gate_hash"],
+                "research_signal": research_signal,
+                "research_signal_hash": research_signal["signal_hash"] if research_signal else "",
+                "research_signal_schema": RESEARCH_SIGNAL_SCHEMA,
+                "agent_research_signals": agent_research_signals,
+                "agent_research_signal_hashes": agent_research_signal_hashes,
             }
         )
     payload["research_packet_hash"] = stable_hash(
@@ -2937,6 +3186,7 @@ def aggregate_v3_symbol_payload(
             "agent_hashes": agent_hashes,
             "research_quality_gate_hash": payload.get("research_quality_gate_hash", ""),
             "knowledge_gate_hash": payload.get("knowledge_gate_hash", ""),
+            "research_signal_hash": payload.get("research_signal_hash", ""),
             "research_status": research_status,
         }
     )
@@ -2974,6 +3224,13 @@ def judge_symbol_v3(symbol_payload: dict[str, Any]) -> tuple[str, list[str]]:
             return "blocked", ["evidence packet future_data_check failed"]
         if market_data_snapshot.get("future_data_risk"):
             return "blocked", ["market data snapshot reports future_data_risk"]
+        try:
+            validate_symbol_research_signal_contract(symbol_payload)
+        except ValueError as exc:
+            reason = normalize_failure_reason(exc)
+            if "[BLOCKED: 合规禁词]" in str(exc):
+                return "blocked", ["[BLOCKED: 合规禁词] research signal compliance gate failed"]
+            return "blocked", [f"research signal contract failed: {reason}"]
         gate = symbol_payload.get("research_quality_gate") if isinstance(symbol_payload.get("research_quality_gate"), dict) else {}
         if gate.get("engineering_blocker") or gate.get("quality_verdict") == "blocked":
             return "blocked", ["v4 research quality gate reported an engineering blocker"]
@@ -3997,6 +4254,7 @@ def build_status(
         "red_team_schema": RED_TEAM_SCHEMA_V4 if is_v40_config(config) else None,
         "research_quality_gate_schema": RESEARCH_QUALITY_GATE_SCHEMA if is_v40_config(config) else None,
         "knowledge_gate_schema": KNOWLEDGE_GATE_SCHEMA if is_v40_config(config) else None,
+        "research_signal_schema": RESEARCH_SIGNAL_SCHEMA if is_v40_config(config) else None,
         "daily_reader_schema": DAILY_READER_SCHEMA_V40 if is_v40_config(config) else None,
         "methodology_version": active_methodology,
         "execution_model": active_execution_model,
@@ -4273,6 +4531,7 @@ def render_markdown(status: dict[str, Any], results: list[dict[str, Any]]) -> st
         f"- red_team_schema: {status.get('red_team_schema') or 'not_applicable'}",
         f"- research_quality_gate_schema: {status.get('research_quality_gate_schema') or 'not_applicable'}",
         f"- knowledge_gate_schema: {status.get('knowledge_gate_schema') or 'not_applicable'}",
+        f"- research_signal_schema: {status.get('research_signal_schema') or 'not_applicable'}",
         f"- daily_reader_schema: {status.get('daily_reader_schema') or 'not_applicable'}",
         f"- methodology_version: {status.get('methodology_version')}",
         f"- execution_model: {status.get('execution_model')}",
@@ -4379,12 +4638,25 @@ def render_markdown(status: dict[str, Any], results: list[dict[str, Any]]) -> st
                 ]
             )
         if research.get("schema") == SYMBOL_SCHEMA_V40:
+            signal = research.get("research_signal") if isinstance(research.get("research_signal"), dict) else {}
             dossier = research.get("k_deep_research_dossier") if isinstance(research.get("k_deep_research_dossier"), dict) else {}
             quality_gate = research.get("research_quality_gate") if isinstance(research.get("research_quality_gate"), dict) else {}
             knowledge_gate = research.get("knowledge_gate") if isinstance(research.get("knowledge_gate"), dict) else {}
             boundary_gate = research.get("reader_boundary_gate") if isinstance(research.get("reader_boundary_gate"), dict) else {}
             lines.extend(
                 [
+                    "- research_signal:",
+                    f"  - research_signal_hash: {research.get('research_signal_hash', '')}",
+                    f"  - hypothesis: {signal.get('hypothesis', 'not_reported')}",
+                    f"  - confidence: {signal.get('confidence', 'not_reported')}",
+                    f"  - window_days: {signal.get('window_days', 'not_reported')}",
+                    f"  - review_due_at: {signal.get('review_due_at', 'not_reported')}",
+                    "  - evidence_ids:",
+                    *[f"    - {item}" for item in sanitize_list(signal.get("evidence_ids"))[:8]],
+                    "  - counter_evidence:",
+                    *[f"    - {item}" for item in sanitize_list(signal.get("counter_evidence"))[:8]],
+                    "  - uncertainty:",
+                    *[f"    - {item}" for item in sanitize_list(signal.get("uncertainty"))[:8]],
                     "- k_deep_research_dossier:",
                     f"  - k_dossier_hash: {research.get('k_dossier_hash', '')}",
                     f"  - dossier_summary: {dossier.get('dossier_summary', 'not_reported')}",
@@ -4474,6 +4746,7 @@ def sanitize_private_metadata(payload: dict[str, Any]) -> dict[str, Any]:
         "research_quality_gate_hash",
         "knowledge_gate_hash",
         "reader_boundary_gate_hash",
+        "research_signal_hash",
         "prompt_hash",
         "research_packet_hash",
         "public_payload_hash",

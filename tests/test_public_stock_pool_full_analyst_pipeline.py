@@ -42,6 +42,7 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     PROMPT_TEMPLATE_VERSION_V40,
     RED_TEAM_SCHEMA_V4,
     RESEARCH_QUALITY_GATE_SCHEMA,
+    RESEARCH_SIGNAL_SCHEMA,
     RESEARCH_TASK_SCHEMA,
     RESEARCH_TASK_SCHEMA_V2,
     SYMBOL_SCHEMA,
@@ -63,6 +64,7 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     update_loop_public_status,
     v3_agent_failure_record,
     validate_evidence_packet_contract,
+    validate_research_signal_contract,
 )
 
 
@@ -1125,6 +1127,7 @@ def test_v40_fixture_run_builds_k_first_gates_and_alaya_hash_readback(tmp_path: 
     assert status["red_team_schema"] == RED_TEAM_SCHEMA_V4
     assert status["research_quality_gate_schema"] == RESEARCH_QUALITY_GATE_SCHEMA
     assert status["knowledge_gate_schema"] == KNOWLEDGE_GATE_SCHEMA
+    assert status["research_signal_schema"] == RESEARCH_SIGNAL_SCHEMA
     assert status["daily_reader_schema"] == "gotra.daily_reader_brief.v4"
     assert status["methodology_version"] == METHODOLOGY_VERSION_V40
     assert status["execution_model"] == EXECUTION_MODEL_V40
@@ -1187,6 +1190,23 @@ def test_v40_fixture_run_builds_k_first_gates_and_alaya_hash_readback(tmp_path: 
     assert symbol_payload["reader_boundary_gate"]["data_gap_visible"] is True
     assert symbol_payload["reader_boundary_gate"]["needs_review_visible"] is True
     assert symbol_payload["reader_boundary_gate"]["red_team_visible"] is True
+    validate_research_signal_contract(symbol_payload["research_signal"])
+    assert symbol_payload["research_signal"]["schema"] == RESEARCH_SIGNAL_SCHEMA
+    assert symbol_payload["research_signal_hash"] == symbol_payload["research_signal"]["signal_hash"]
+    assert symbol_payload["research_signal"]["evidence_packet_hash"] == symbol_payload["evidence_packet_hash"]
+    assert symbol_payload["research_signal"]["market_data_snapshot_hash"] == symbol_payload["market_data_snapshot_hash"]
+    assert symbol_payload["research_signal"]["evidence_ids"]
+    assert symbol_payload["research_signal"]["counter_evidence"]
+    assert symbol_payload["research_signal"]["uncertainty"]
+    assert symbol_payload["research_signal"]["window_days"] == 30
+    assert symbol_payload["research_signal"]["review_due_at"] == "2026-07-29"
+    assert set(symbol_payload["agent_research_signals"]) == set(symbol_payload["agent_outputs"])
+    assert set(symbol_payload["agent_research_signal_hashes"]) == set(symbol_payload["agent_outputs"])
+    for agent_id, signal in symbol_payload["agent_research_signals"].items():
+        validate_research_signal_contract(signal)
+        assert signal["signal_hash"] == symbol_payload["agent_research_signal_hashes"][agent_id]
+        assert signal["evidence_packet_hash"] == symbol_payload["evidence_packet_hash"]
+        assert signal["market_data_snapshot_hash"] == symbol_payload["market_data_snapshot_hash"]
     assert symbol_payload["parallelism"]["k_dossier_first"] is True
     assert symbol_payload["parallelism"]["fwg_ran_in_parallel"] is True
     assert symbol_payload["parallelism"]["kfwg_ran_in_parallel"] is False
@@ -1225,6 +1245,8 @@ def test_v40_fixture_run_builds_k_first_gates_and_alaya_hash_readback(tmp_path: 
     assert records[0]["red_team_hash"] == symbol_payload["agent_hashes"]["red_team_audit"]
     assert records[0]["research_quality_gate_hash"] == symbol_payload["research_quality_gate_hash"]
     assert records[0]["knowledge_gate_hash"] == symbol_payload["knowledge_gate_hash"]
+    assert records[0]["research_signal_hash"] == symbol_payload["research_signal_hash"]
+    assert records[0]["public_payload"]["research_signal"]["signal_hash"] == symbol_payload["research_signal_hash"]
     assert records[0]["public_payload_hash"] == symbol_payload["public_payload_hash"]
     assert records[0]["knowledge_persistence"] == symbol_payload["knowledge_persistence"]
     assert records[0]["unresolved_questions"] == symbol_payload["unresolved_questions"]
@@ -1275,6 +1297,57 @@ def test_v40_market_data_snapshot_future_data_risk_blocks_publication(tmp_path: 
     assert "future_data_risk" in symbol_payload["market_data_snapshot"]["quality_flags"]
     assert symbol_payload["judge_status"] == "blocked"
     assert "future_data_check" in " ".join(symbol_payload["judge_reasons"])
+
+
+def valid_research_signal() -> dict[str, object]:
+    return {
+        "schema": RESEARCH_SIGNAL_SCHEMA,
+        "signal_id": "run:HKEX:0700:symbol:research_signal",
+        "run_id": "run",
+        "symbol": "0700",
+        "exchange": "HKEX",
+        "provider_ticker": "0700.HK",
+        "as_of_date": "2026-06-29",
+        "source_id": "symbol",
+        "hypothesis": "Research state remains bounded by verified public evidence and visible review items.",
+        "confidence": "needs_review",
+        "evidence_ids": ["market_data_snapshot"],
+        "counter_evidence": ["Official issuer evidence remains incomplete."],
+        "uncertainty": ["Source freshness limits confidence."],
+        "window_days": 30,
+        "review_due_at": "2026-07-29",
+        "evidence_packet_id": "run:HKEX:0700:evidence_packet",
+        "evidence_packet_hash": "evidence-hash",
+        "market_data_snapshot_hash": "snapshot-hash",
+        "market_data_snapshot_schema": MARKET_DATA_SNAPSHOT_SCHEMA,
+        "research_status": "needs_review",
+        "boundary": "research-only structured signal; not a trading instruction",
+        "signal_hash": "signal-hash",
+    }
+
+
+def test_research_signal_contract_blocks_missing_required_field() -> None:
+    signal = valid_research_signal()
+    signal.pop("review_due_at")
+
+    with pytest.raises(ValueError, match="research_signal_missing_required_fields"):
+        validate_research_signal_contract(signal)
+
+
+def test_research_signal_contract_blocks_empty_evidence() -> None:
+    signal = valid_research_signal()
+    signal["evidence_ids"] = []
+
+    with pytest.raises(ValueError, match="research_signal_empty_evidence_ids"):
+        validate_research_signal_contract(signal)
+
+
+def test_research_signal_contract_blocks_compliance_wording() -> None:
+    signal = valid_research_signal()
+    signal["hypothesis"] = "\u5efa\u8bae\u4e70\u5165\u4e14\u5fc5\u6da8"
+
+    with pytest.raises(ValueError, match="BLOCKED: 合规禁词"):
+        validate_research_signal_contract(signal)
 
 
 def test_v40_requested_can_explicitly_fallback_to_v2() -> None:
