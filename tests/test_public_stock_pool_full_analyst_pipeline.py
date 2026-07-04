@@ -27,6 +27,7 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     GotraInternalAlayaSyncClient,
     K_DOSSIER_SCHEMA,
     KNOWLEDGE_GATE_SCHEMA,
+    MARKET_DATA_SNAPSHOT_SCHEMA,
     METHODOLOGY_VERSION,
     METHODOLOGY_VERSION_V3,
     METHODOLOGY_VERSION_V35,
@@ -1112,6 +1113,7 @@ def test_v40_fixture_run_builds_k_first_gates_and_alaya_hash_readback(tmp_path: 
     assert status["run_status"] == "completed_with_review_items"
     assert status["prompt_template_version"] == PROMPT_TEMPLATE_VERSION_V40
     assert status["symbol_schema"] == SYMBOL_SCHEMA_V40
+    assert status["market_data_snapshot_schema"] == MARKET_DATA_SNAPSHOT_SCHEMA
     assert status["research_task_schema"] == RESEARCH_TASK_SCHEMA_V2
     assert status["evidence_packet_schema"] == EVIDENCE_PACKET_SCHEMA_V2
     assert status["k_dossier_schema"] == K_DOSSIER_SCHEMA
@@ -1137,8 +1139,17 @@ def test_v40_fixture_run_builds_k_first_gates_and_alaya_hash_readback(tmp_path: 
     assert symbol_payload["prompt_template_version"] == PROMPT_TEMPLATE_VERSION_V40
     assert symbol_payload["methodology_version"] == METHODOLOGY_VERSION_V40
     assert symbol_payload["execution_model"] == EXECUTION_MODEL_V40
+    assert symbol_payload["market_data_snapshot"]["schema"] == MARKET_DATA_SNAPSHOT_SCHEMA
+    assert symbol_payload["market_data_snapshot"]["provider"] == "yahoo_chart_api_via_gotra_price_cache"
+    assert symbol_payload["market_data_snapshot"]["market"] == "Hong Kong public equity market"
+    assert symbol_payload["market_data_snapshot"]["currency"] == "HKD"
+    assert symbol_payload["market_data_snapshot"]["quality_flags"]
+    assert symbol_payload["market_data_snapshot_hash"] == symbol_payload["market_data_snapshot"]["snapshot_hash"]
     assert symbol_payload["research_task"]["schema"] == RESEARCH_TASK_SCHEMA_V2
     assert symbol_payload["evidence_packet"]["schema"] == EVIDENCE_PACKET_SCHEMA_V2
+    assert symbol_payload["evidence_packet"]["market_data_snapshot_hash"] == symbol_payload["market_data_snapshot_hash"]
+    assert symbol_payload["evidence_packet"]["market_data_snapshot"]["snapshot_hash"] == symbol_payload["market_data_snapshot_hash"]
+    assert any(item["evidence_id"] == "market_data_snapshot" for item in symbol_payload["evidence_packet"]["evidence_items"])
     assert symbol_payload["k_deep_research_dossier"]["schema"] == K_DOSSIER_SCHEMA
     assert symbol_payload["k_dossier_hash"] == symbol_payload["k_deep_research_dossier"]["dossier_hash"]
     assert symbol_payload["agent_hashes"]["k_deep_research"] == symbol_payload["k_dossier_hash"]
@@ -1168,6 +1179,8 @@ def test_v40_fixture_run_builds_k_first_gates_and_alaya_hash_readback(tmp_path: 
         assert payload["required_schema"] == PERSPECTIVE_AGENT_SCHEMA_V4
         assert payload["research_task"]["schema"] == RESEARCH_TASK_SCHEMA_V2
         assert payload["evidence_packet"]["schema"] == EVIDENCE_PACKET_SCHEMA_V2
+        assert payload["evidence_packet"]["market_data_snapshot_hash"] == symbol_payload["market_data_snapshot_hash"]
+        assert payload["market_data_snapshot_hash"] == symbol_payload["market_data_snapshot_hash"]
         assert payload["k_deep_research_dossier"]["schema"] == K_DOSSIER_SCHEMA
         assert payload["k_dossier_hash"] == symbol_payload["k_dossier_hash"]
         assert payload["agent_brief"]
@@ -1186,6 +1199,8 @@ def test_v40_fixture_run_builds_k_first_gates_and_alaya_hash_readback(tmp_path: 
     assert records[0]["cognition_flywheel_layer"] == METHODOLOGY_VERSION_V40
     assert records[0]["research_task_hash"] == symbol_payload["research_task_hash"]
     assert records[0]["evidence_packet_hash"] == symbol_payload["evidence_packet_hash"]
+    assert records[0]["market_data_snapshot_hash"] == symbol_payload["market_data_snapshot_hash"]
+    assert records[0]["public_payload"]["market_data_snapshot_hash"] == symbol_payload["market_data_snapshot_hash"]
     assert records[0]["k_dossier_hash"] == symbol_payload["k_dossier_hash"]
     assert records[0]["agent_hashes"] == symbol_payload["agent_hashes"]
     assert records[0]["chairman_hash"] == symbol_payload["agent_hashes"]["chairman_synthesis"]
@@ -1196,6 +1211,50 @@ def test_v40_fixture_run_builds_k_first_gates_and_alaya_hash_readback(tmp_path: 
     assert records[0]["knowledge_persistence"] == symbol_payload["knowledge_persistence"]
     assert records[0]["unresolved_questions"] == symbol_payload["unresolved_questions"]
     assert "readback_status" in records[0]
+
+
+def test_v40_market_data_snapshot_future_data_risk_blocks_publication(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    cfg = FullAnalystConfig(
+        **{
+            **cfg.__dict__,
+            "v3_independent_agents": True,
+            "v40_cognition_flywheel": True,
+            "execution_model": EXECUTION_MODEL_V40,
+            "requested_execution_model": EXECUTION_MODEL_V40,
+            "agent_concurrency": 3,
+            "alaya_mode": "real",
+        }
+    )
+    future_price_rows = price_rows()
+    future_price_rows["HKEX:0700"] = {
+        **future_price_rows["HKEX:0700"],
+        "close_date": "2026-06-30",
+        "adj_close": 100.0,
+        "previous_date": "2026-06-29",
+        "previous_adj_close": 99.0,
+    }
+    state_path = cfg.private_audit_root / "cognition_flywheel" / "full_analyst_memory_events.jsonl"
+
+    exit_code = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=future_price_rows,
+        runner=V3OrderingRunner(),
+        alaya_client=GotraInternalAlayaSyncClient(state_path=state_path, actor="test/full_analyst_pipeline"),
+    )
+
+    status = json.loads((cfg.output_dir / "status_full_analyst_evening_hk.json").read_text())
+    symbol_payload = json.loads((cfg.output_dir / "symbols" / "HKEX_0700.json").read_text())
+
+    assert exit_code == 2
+    assert status["run_status"] == "completed_with_blockers"
+    assert status["blocked_count"] == 1
+    assert status["failed_count"] == 0
+    assert symbol_payload["market_data_snapshot"]["future_data_risk"] is True
+    assert "future_data_risk" in symbol_payload["market_data_snapshot"]["quality_flags"]
+    assert symbol_payload["judge_status"] == "blocked"
+    assert "future_data_risk" in " ".join(symbol_payload["judge_reasons"])
 
 
 def test_v40_requested_can_explicitly_fallback_to_v2() -> None:

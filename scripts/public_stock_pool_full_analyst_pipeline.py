@@ -62,6 +62,7 @@ RESEARCH_TASK_SCHEMA = "gotra.full_analyst.research_task.v1"
 RESEARCH_TASK_SCHEMA_V2 = "gotra.full_analyst.research_task.v2"
 EVIDENCE_PACKET_SCHEMA = "gotra.full_analyst.evidence_packet.v1"
 EVIDENCE_PACKET_SCHEMA_V2 = "gotra.full_analyst.evidence_packet.v2"
+MARKET_DATA_SNAPSHOT_SCHEMA = "gotra.market_data_snapshot.v1"
 K_DOSSIER_SCHEMA = "gotra.full_analyst.k_deep_research_dossier.v1"
 PERSPECTIVE_AGENT_SCHEMA_V4 = "gotra.full_analyst.perspective_agent.v4"
 CHAIRMAN_SCHEMA_V4 = "gotra.full_analyst.chairman_synthesis.v4"
@@ -81,6 +82,8 @@ ALAYA_EVENT_SCHEMA_V3 = "gotra.cognition_flywheel.full_analyst_memory.v3"
 ALAYA_EVENT_SCHEMA_V35 = "gotra.cognition_flywheel.full_analyst_memory.v3_5"
 ALAYA_EVENT_SCHEMA_V40 = "gotra.cognition_flywheel.full_analyst_memory.v4"
 DAILY_READER_SCHEMA_V40 = "gotra.daily_reader_brief.v4"
+MARKET_DATA_PROVIDER = "yahoo_chart_api_via_gotra_price_cache"
+MARKET_DATA_SOURCE_NAME = "Yahoo Finance chart API via GOTRA price_cache helper"
 AGENT_OUTPUT_SCHEMA_V3 = "gotra.full_analyst.agent_output.v3"
 PRIVATE_ATTEMPT_SCHEMA = "gotra.full_analyst.private_attempt.v1"
 MODE = "full-analyst-evening-hk-test"
@@ -439,6 +442,7 @@ class GotraInternalAlayaSyncClient:
             "prompt_template_version": payload["prompt_template_version"],
             "research_task_hash": payload.get("research_task_hash", ""),
             "evidence_packet_hash": payload.get("evidence_packet_hash", ""),
+            "market_data_snapshot_hash": payload.get("market_data_snapshot_hash", ""),
             "k_dossier_hash": payload.get("k_dossier_hash", ""),
             "research_quality_gate_hash": payload.get("research_quality_gate_hash", ""),
             "knowledge_gate_hash": payload.get("knowledge_gate_hash", ""),
@@ -595,7 +599,7 @@ class GotraInternalAlayaSyncClient:
                     "total_seconds": round(time.monotonic() - started, 3),
                 }
             if is_v35_payload or is_v40_payload:
-                hash_keys = ["research_task_hash", "evidence_packet_hash", "chairman_hash", "red_team_hash"]
+                hash_keys = ["research_task_hash", "evidence_packet_hash", "market_data_snapshot_hash", "chairman_hash", "red_team_hash"]
                 if is_v40_payload:
                     hash_keys.extend(["k_dossier_hash", "research_quality_gate_hash", "knowledge_gate_hash"])
                 for hash_key in hash_keys:
@@ -911,8 +915,11 @@ def build_research_task_prompt(
     last_error: str,
 ) -> str:
     task_schema = research_task_schema_for_config(config)
+    market_data_snapshot = build_market_data_snapshot(item, price_row, config)
     trigger_context = {
         "price_move": public_price_context(price_row),
+        "market_data_snapshot": market_data_snapshot,
+        "market_data_snapshot_hash": market_data_snapshot["snapshot_hash"],
         "coverage_status": "ok" if price_row.get("ok") else "data_gap",
         "freshness": f"as_of_date={config.as_of_date.isoformat()}; trading_date={trading_date_for_exchange(item['exchange'], exchange_dates_for_config(config)).isoformat()}",
         "prior_alaya_unresolved_questions": prior_alaya_unresolved_questions(item, config),
@@ -995,6 +1002,7 @@ def build_v3_agent_prompt(
 ) -> tuple[str, str]:
     if agent_id not in V3_AGENT_IDS:
         raise ValueError(f"unsupported_v3_agent:{agent_id}")
+    market_data_snapshot = build_market_data_snapshot(item, price_row, config)
     dependency_packet = (
         public_v35_dependency_packet(dependencies or {}, agent_id)
         if has_research_task_system(config)
@@ -1009,6 +1017,7 @@ def build_v3_agent_prompt(
         "trading_date": trading_date_for_exchange(item["exchange"], exchange_dates_for_config(config)).isoformat(),
         "price_coverage_status": "ok" if price_row.get("ok") else "data_gap",
         "price_context": public_price_context(price_row),
+        "market_data_snapshot_hash": market_data_snapshot["snapshot_hash"],
         "agent_id": agent_id,
         "agent_role": V3_AGENT_ROLE_LABELS[agent_id],
         "dependencies": dependency_packet.get("agent_outputs", dependency_packet) if has_research_task_system(config) else dependency_packet,
@@ -1348,6 +1357,79 @@ def public_price_context(price_row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def market_currency_for_exchange(exchange: str) -> str:
+    return {"HKEX": "HKD", "NASDAQ": "USD", "NYSE": "USD"}.get(str(exchange).upper(), "UNKNOWN")
+
+
+def market_name_for_exchange(exchange: str) -> str:
+    return {
+        "HKEX": "Hong Kong public equity market",
+        "NASDAQ": "United States public equity market",
+        "NYSE": "United States public equity market",
+    }.get(str(exchange).upper(), "unknown public equity market")
+
+
+def parse_optional_date(value: Any) -> date | None:
+    text = sanitize_text(str(value or ""))
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def build_market_data_snapshot(
+    item: dict[str, str],
+    price_row: dict[str, Any],
+    config: FullAnalystConfig,
+) -> dict[str, Any]:
+    trading_date = trading_date_for_exchange(item["exchange"], exchange_dates_for_config(config))
+    close_date = parse_optional_date(price_row.get("close_date"))
+    quality_flags = [
+        "bounded_public_pipeline_context",
+        "adjusted_close_price" if price_row.get("ok") else "price_data_missing",
+        "currency_inferred_from_exchange",
+    ]
+    if not price_row.get("ok"):
+        quality_flags.append(f"missing_reason:{sanitize_text(str(price_row.get('reason') or 'unknown'))[:120]}")
+    if price_row.get("ok") and price_row.get("adj_close") is None:
+        quality_flags.append("latest_price_not_present")
+    if price_row.get("ok") and price_row.get("previous_adj_close") is None:
+        quality_flags.append("previous_price_not_present")
+    future_data_risk = bool(close_date and (close_date > trading_date or close_date > config.as_of_date))
+    if future_data_risk:
+        quality_flags.append("future_data_risk")
+    snapshot = {
+        "schema": MARKET_DATA_SNAPSHOT_SCHEMA,
+        "run_id": config.run_id,
+        "symbol": item["symbol"],
+        "exchange": item["exchange"],
+        "provider_ticker": item["provider_ticker"],
+        "as_of_date": config.as_of_date.isoformat(),
+        "trading_date": trading_date.isoformat(),
+        "source_type": "price_data",
+        "source_name": MARKET_DATA_SOURCE_NAME,
+        "source_url_or_id": f"price:{MARKET_DATA_PROVIDER}:{item['exchange']}:{item['symbol']}:{trading_date.isoformat()}",
+        "provider": MARKET_DATA_PROVIDER,
+        "market": market_name_for_exchange(item["exchange"]),
+        "currency": market_currency_for_exchange(item["exchange"]),
+        "availability_date": sanitize_text(str(price_row.get("close_date") or trading_date.isoformat())),
+        "price_status": "ok" if price_row.get("ok") else "missing",
+        "latest_price": price_row.get("adj_close") if price_row.get("ok") else None,
+        "latest_price_date": sanitize_text(str(price_row.get("close_date") or "")),
+        "previous_price": price_row.get("previous_adj_close") if price_row.get("ok") else None,
+        "previous_price_date": sanitize_text(str(price_row.get("previous_date") or "")),
+        "one_session_change_pct": price_row.get("one_session_change_pct") if price_row.get("ok") else None,
+        "quality_flags": dedupe_preserve_order(quality_flags),
+        "future_data_risk": future_data_risk,
+        "public_safe": True,
+    }
+    snapshot["snapshot_hash"] = stable_hash({key: value for key, value in snapshot.items() if key != "snapshot_hash"})
+    assert_public_safe(snapshot)
+    return snapshot
+
+
 def prior_alaya_unresolved_questions(item: dict[str, str], config: FullAnalystConfig) -> list[str]:
     state_path = config.private_audit_root / "cognition_flywheel" / "full_analyst_memory_events.jsonl"
     if not state_path.exists():
@@ -1507,6 +1589,7 @@ def build_evidence_packet(
     research_task: dict[str, Any],
 ) -> dict[str, Any]:
     trading_date = trading_date_for_exchange(item["exchange"], exchange_dates_for_config(config)).isoformat()
+    market_data_snapshot = build_market_data_snapshot(item, price_row, config)
     price_status = "fresh" if price_row.get("ok") else "missing"
     evidence_items = [
         {
@@ -1521,6 +1604,32 @@ def build_evidence_packet(
             "summary": json.dumps(public_price_context(price_row), ensure_ascii=False, sort_keys=True),
             "supports_questions": research_task.get("core_questions", [])[:3],
             "limitations": [] if price_row.get("ok") else [sanitize_text(str(price_row.get("reason") or "price_data_missing"))],
+            "public_safe": True,
+        },
+        {
+            "evidence_id": "market_data_snapshot",
+            "source_type": "price_data",
+            "source_name": MARKET_DATA_SOURCE_NAME,
+            "source_url_or_id": market_data_snapshot["source_url_or_id"],
+            "publish_timestamp": market_data_snapshot["availability_date"],
+            "availability_date": market_data_snapshot["availability_date"],
+            "retrieval_method": "bounded_public_market_data_snapshot",
+            "freshness_status": price_status,
+            "summary": json.dumps(
+                {
+                    "market_data_snapshot_hash": market_data_snapshot["snapshot_hash"],
+                    "provider": market_data_snapshot["provider"],
+                    "market": market_data_snapshot["market"],
+                    "currency": market_data_snapshot["currency"],
+                    "price_status": market_data_snapshot["price_status"],
+                    "quality_flags": market_data_snapshot["quality_flags"],
+                    "future_data_risk": market_data_snapshot["future_data_risk"],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            "supports_questions": research_task.get("core_questions", [])[:3],
+            "limitations": market_data_snapshot["quality_flags"],
             "public_safe": True,
         },
         {
@@ -1605,6 +1714,8 @@ def build_evidence_packet(
     data_gaps = []
     if not price_row.get("ok"):
         data_gaps.append(f"price_data gap: {sanitize_text(str(price_row.get('reason') or 'unknown'))}")
+    if market_data_snapshot["future_data_risk"]:
+        data_gaps.append("market_data_snapshot future_data_risk: close_date is later than the configured trading/as-of date")
     data_gaps.extend(
         f"missing required {source['source_type']}: {source['purpose']}"
         for source in missing_required_sources
@@ -1617,6 +1728,8 @@ def build_evidence_packet(
         "provider_ticker": item["provider_ticker"],
         "as_of_date": config.as_of_date.isoformat(),
         "task_hash": research_task["task_hash"],
+        "market_data_snapshot": market_data_snapshot,
+        "market_data_snapshot_hash": market_data_snapshot["snapshot_hash"],
         "evidence_items": evidence_items,
         "missing_required_sources": missing_required_sources,
         "stale_sources": stale_sources,
@@ -2044,6 +2157,7 @@ def build_alaya_public_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "judge_status": payload["judge_status"],
             "research_task_hash": payload.get("research_task_hash", ""),
             "evidence_packet_hash": payload.get("evidence_packet_hash", ""),
+            "market_data_snapshot_hash": payload.get("market_data_snapshot_hash", ""),
             "k_dossier_hash": payload.get("k_dossier_hash", ""),
             "agent_hashes": payload["agent_hashes"],
             "agent_statuses": agent_statuses(payload),
@@ -2065,6 +2179,7 @@ def build_alaya_public_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "prompt_template_version": payload["prompt_template_version"],
             "research_task_hash": payload.get("research_task_hash", ""),
             "evidence_packet_hash": payload.get("evidence_packet_hash", ""),
+            "market_data_snapshot_hash": payload.get("market_data_snapshot_hash", ""),
             "k_dossier_hash": payload.get("k_dossier_hash", ""),
             "research_packet_hash": payload.get("research_packet_hash", ""),
             "public_payload_hash": stable_hash(public_payload_hash_basis),
@@ -2110,6 +2225,7 @@ def build_alaya_public_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "exchange": payload["exchange"],
         "as_of_date": payload["as_of_date"],
         "research_status": payload["research_status"],
+        "market_data_snapshot_hash": payload.get("market_data_snapshot_hash", ""),
         "agent_outputs": {
             "k_deep_research": payload["k_deep_research"],
             "f_partner_view": payload["f_partner_view"],
@@ -2133,6 +2249,7 @@ def build_alaya_public_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "methodology_version": payload["methodology_version"],
         "prompt_template_version": payload["prompt_template_version"],
         "prompt_hash": payload.get("prompt_hash", ""),
+        "market_data_snapshot_hash": payload.get("market_data_snapshot_hash", ""),
         "research_packet_hash": payload.get("research_packet_hash", ""),
         "public_payload_hash": stable_hash(public_payload_hash_basis),
         "judge_status": payload["judge_status"],
@@ -2195,6 +2312,8 @@ def public_v35_dependency_packet(dependencies: dict[str, Any], agent_id: str) ->
         "schema": evidence_packet.get("schema"),
         "task_hash": evidence_packet.get("task_hash"),
         "evidence_packet_hash": evidence_packet.get("evidence_packet_hash"),
+        "market_data_snapshot_hash": evidence_packet.get("market_data_snapshot_hash", ""),
+        "market_data_snapshot": evidence_packet.get("market_data_snapshot", {}),
         "evidence_items": [
             {
                 "evidence_id": item.get("evidence_id"),
@@ -2566,6 +2685,7 @@ def aggregate_v3_symbol_payload(
     k_dossier_seconds: float = 0.0,
 ) -> dict[str, Any]:
     price_coverage_status = "ok" if price_row.get("ok") else "data_gap"
+    market_data_snapshot = build_market_data_snapshot(item, price_row, config)
     agent_hashes = {agent_id: str(agent_outputs[agent_id].get("output_hash") or "") for agent_id in V3_AGENT_IDS}
     agent_timings = {
         V3_AGENT_TIMING_KEYS[agent_id]: float(agent_outputs[agent_id].get("duration_seconds") or 0.0)
@@ -2645,6 +2765,8 @@ def aggregate_v3_symbol_payload(
         "trading_date": trading_date_for_exchange(item["exchange"], exchange_dates_for_config(config)).isoformat(),
         "price_coverage_status": price_coverage_status,
         "price_context": public_price_context(price_row),
+        "market_data_snapshot": market_data_snapshot,
+        "market_data_snapshot_hash": market_data_snapshot["snapshot_hash"],
         "agent_outputs": agent_outputs,
         "agent_hashes": agent_hashes,
         "agent_timings": agent_timings,
@@ -2742,6 +2864,7 @@ def aggregate_v3_symbol_payload(
             "exchange": item["exchange"],
             "research_task_hash": payload.get("research_task_hash", ""),
             "evidence_packet_hash": payload.get("evidence_packet_hash", ""),
+            "market_data_snapshot_hash": payload.get("market_data_snapshot_hash", ""),
             "k_dossier_hash": payload.get("k_dossier_hash", ""),
             "agent_hashes": agent_hashes,
             "research_quality_gate_hash": payload.get("research_quality_gate_hash", ""),
@@ -2767,6 +2890,9 @@ def dedupe_preserve_order(values: list[str]) -> list[str]:
 
 def judge_symbol_v3(symbol_payload: dict[str, Any]) -> tuple[str, list[str]]:
     assert_public_safe(symbol_payload)
+    market_data_snapshot = symbol_payload.get("market_data_snapshot") if isinstance(symbol_payload.get("market_data_snapshot"), dict) else {}
+    if market_data_snapshot.get("future_data_risk"):
+        return "blocked", ["market data snapshot reports future_data_risk"]
     statuses = agent_statuses(symbol_payload)
     failed_agents = [agent_id for agent_id, status in statuses.items() if status == "failed"]
     if failed_agents:
@@ -3182,6 +3308,9 @@ def sanitize_symbol_payload(
     sanitized["trading_date"] = trading_date_for_exchange(item["exchange"], exchange_dates_for_config(config)).isoformat()
     sanitized["price_coverage_status"] = "ok" if price_row.get("ok") else "data_gap"
     sanitized["price_context"] = public_price_context(price_row)
+    market_data_snapshot = build_market_data_snapshot(item, price_row, config)
+    sanitized["market_data_snapshot"] = market_data_snapshot
+    sanitized["market_data_snapshot_hash"] = market_data_snapshot["snapshot_hash"]
     sanitized["prompt_template_version"] = PROMPT_TEMPLATE_VERSION
     sanitized["methodology_version"] = METHODOLOGY_VERSION
     sanitized["execution_model"] = EXECUTION_MODEL
@@ -3553,6 +3682,9 @@ def normalize_negated_boundary_text(text: str) -> str:
 
 
 def judge_symbol(symbol_payload: dict[str, Any]) -> tuple[str, list[str]]:
+    market_data_snapshot = symbol_payload.get("market_data_snapshot") if isinstance(symbol_payload.get("market_data_snapshot"), dict) else {}
+    if market_data_snapshot.get("future_data_risk"):
+        return "blocked", ["market data snapshot reports future_data_risk"]
     if symbol_payload["price_coverage_status"] == "data_gap":
         return "needs_review", ["price coverage is data_gap; do not promote to publish"]
     assert_public_safe(symbol_payload)
@@ -3780,6 +3912,7 @@ def build_status(
         "rollback_hint": rollback_hint(config),
         "prompt_template_version": active_prompt_template,
         "symbol_schema": active_schema,
+        "market_data_snapshot_schema": MARKET_DATA_SNAPSHOT_SCHEMA,
         "research_task_schema": research_task_schema_for_config(config) if has_research_task_system(config) else None,
         "evidence_packet_schema": evidence_packet_schema_for_config(config) if has_research_task_system(config) else None,
         "k_dossier_schema": K_DOSSIER_SCHEMA if is_v40_config(config) else None,
