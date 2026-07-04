@@ -1,152 +1,146 @@
 # GOTRA
 
-> **GOTRA / gotra** 记录一次投研判断的血脉：signal、prediction、evidence、outcome、
-> error attribution、feedback、provenance，以及可审计、可复盘的知识状态。
+GOTRA 是一个研究认知系统，不是荐股系统、交易信号系统或收益证明系统。
 
-GOTRA 是一个 AI 原生、可审计、可复盘的投研研究工作流与内容/研究基础设施。它的目标是让研究判断、证据、预测、结果和反馈可以被追踪和复核，而不是提供荐股、自动交易或收益承诺。
+当前主线是 **GOTRA v4.0 Ksana cognition flywheel**：先生成研究任务书和公开证据包，再由 K 深度研究底稿、F/W/G 独立视角、主席综合、红队反证、研究质量闸门、知识闸门、内部 Alaya 回读和读者边界闸门共同形成可审计的公开研究产物。
 
-当前项目状态：内部工程与研究证据阶段。当前 `main` 已包含 Stage4-8、Baseline v2/v3/v3.1/v3.2/v3.3/v3.4/v3.5A 文档与代码路径，包括本地 harness、provider/backend 实验、deterministic reference 和 forward-live capture plumbing。除非某个后续文档明确升级证据层级，否则这些内容默认不构成外部验证、公开证明或科学结论，也不构成交易或投资建议。
+生产读者页面在配套仓库 [`gotra-public-ledger`](https://github.com/amanayayatu-tech/gotra-public-ledger) 提供，线上地址是 [gotra.me](https://gotra.me/)。
 
-## 项目定位
+## 当前状态
+
+最新已落档状态：
+
+| 项目 | 当前值 |
+| --- | --- |
+| 后端仓库 | `/opt/gotra` |
+| v4 后端代码基线 | `main@acd6cfa`，clean；README refresh 提交可能在此之上 |
+| v4 结果 | `PASS_WITH_REVIEW_ITEMS_2H_V40_KSANA_COGNITION_FLYWHEEL` |
+| 证据层级 | `2h pressure` |
+| 压测时长 | `7232s` |
+| 完整通过 loop | `13` |
+| production artifact | `gotra.daily_reader_brief.v4` / `gotra.full_analyst.symbol.v4` |
+| execution model | `deep_research_dossier_then_parallel_perspectives` |
+| methodology | `ksana_cognition_flywheel_v4` |
+| public safety | `ok` |
+| Alaya readback | `verified` |
+| 前端产品化 | `PASS_V40_FRONTEND_PRODUCTIZATION_SMOKE`，`gotra-public-ledger` PR `#56`，`main@35ba6fa` |
+
+这说明 v4 后端链路和 v4 前端读者路径已经通过短压测与 production smoke。它**不等于** `10h/formal acceptance`，也不是科学公开证明、业绩证明、投资建议或交易信号。
+
+## GOTRA 是什么
 
 GOTRA 用来：
 
-- 记录带审计元数据的研究判断和预测；
-- 把研究证据、价格上下文、反馈和 provenance 绑定到判断链路；
-- 通过 Judge Agent 和可人工复核的闸门处理高风险知识决策；
-- 在明确 no-future-data 约束下回放历史实验；
-- 在结果成熟前捕获 future-live 决策；
-- 把工程/runtime 健康、内部研究结果、强证据结论和交易/投资断言分开。
+- 把研究对象、研究任务、证据、缺口、分歧、反证、质量闸门和知识沉淀过程记录下来；
+- 在公开安全边界内生成可阅读、可复核、可审计的研究产物；
+- 让 `data_gap`、`needs_review`、红队质疑和未解决问题留在明面上，而不是包装成确定答案；
+- 将研究过程和工程证据分层保存，避免把 smoke、压力测试、正式验收、科学结论或投资结论混在一起；
+- 通过 GOTRA repo 内部的 Alaya cognition flywheel / memory / readback state 做知识回读和反馈，不接入外部 Alaya 服务。
 
 GOTRA 不是：
 
-- 个性化财务建议；
-- 自动交易机器人；
-- 接券商下单的执行系统；
-- 收益保证或利润承诺系统；
-- “GOTRA、ksana、alaya 或某个 LLM 可以预测市场”的证明。
+- 投资建议；
+- 交易信号；
+- 买入、卖出、持有、加仓、减仓指令；
+- 目标价或仓位建议；
+- 收益承诺或业绩证明；
+- science/public proof；
+- 自动交易或券商下单系统；
+- 外部 Alaya 项目的客户端。
 
-## 当前架构
+## v4 研究链路
 
-当前仓库主要由以下层组成：
+v4 的核心链路是：
 
-| 层 | 职责 | 主要入口 |
-| --- | --- | --- |
-| Research / signal generation | 构造价格包、研究包和受控实验 prompt。 | `scripts/baseline_v3_four_arm.py`, `gotra/perplexity_executor/`, `integrations/alaya/` |
-| Judge gate / decision routing | 判断 gate candidate，持久化 decision provenance，支持 dry-run polling，保持 strong promotion human-only。 | `gotra/judge_agent/`, `scripts/gate_poller.py`, `gotra/judge_agent/prompts/` |
-| Alaya knowledge / feedback layer | 表达 active/strong knowledge 上下文，同步 gates，生成 outcome-derived feedback artifacts，并保持 feedback eligibility 可审计。 | `integrations/alaya/`, `gotra/judge_agent/outcome_feedback.py` |
-| Backtest / formal-lite harness | 运行 local/mock/provider/backend grid，计算诊断指标，并执行 no-future-data 与 artifact 边界。 | `gotra/backtest/`, `scripts/baseline_v3_four_arm.py`, `gotra/backtest/statistics.py` |
-| Deterministic reference | 提供不调用 LLM/backend/provider 的 cleaner price-only 历史参考。 | v3.4b/v3.4c summary 中的 `deterministic_price_only_baseline` 字段 |
-| Forward-live capture | 在 outcome 成熟前捕获 future-only 决策，记录 prompt hash、decision hash 和可选 Codex CLI transcript path。 | `scripts/baseline_v3_5_forward_live_capture.py` |
-| Outcome maturity / scoring | 计划中的下一层，只在 horizon 成熟后评分 captured decisions。 | v3.5B planned；v3.5A capture 不做 outcome scoring |
-| Evidence / provenance artifacts | 用文档和本地 runtime artifacts 保持每次实验可检查，同时不提交 raw provider output。 | `docs/`, `data/backtest/*.md`, ignored `data/backtest/runs/*` |
-
-旧的 Kimi/GLM/DeepSeek provider API formal-lite/parser 线、新的 `codex_cli_llm_backend` experiment family、deterministic references、forward-live capture path 是不同证据族，不能合并解释成同一个结果。
-
-## 证据梯度
-
-阅读本仓库时请按以下证据层级解释：
-
-| 层级 | 能说明什么 | 不能说明什么 |
-| --- | --- | --- |
-| local checks | 代码可导入、确定性测试、lint、fixture 行为、artifact hygiene。 | provider 可靠性、市场 edge、OOS 有效性。 |
-| provider/runtime health | 某个 provider/backend 在特定 grid 下能返回 schema-valid decisions。 | replay 有效、科学验收、投资有效。 |
-| mock/canary/tiny smoke | 小范围路径在扩容前可跑通。 | formal acceptance 或公开证明。 |
-| formal-lite internal research | 预注册内部 grid 完成或失败，并留下诊断记录。 | 外部验证、科学结论、公开证明或交易/投资断言。 |
-| forward-live capture | 未来结果发生前，决策已被捕获。 | outcome matured pass；必须等 horizon 成熟后评分。 |
-| Mature external proof layer | 需要单独记录的成熟、验收协议。 | 默认不由本 repo 当前状态声称。 |
-| Trading/investment assertion | 需要完全不同的合规与证据层。 | 本项目不声称。 |
-
-当前仓库证据默认是 internal engineering/research evidence。除非未来某个命名 artifact 明确升级证据层级，否则不要把局部 smoke、provider health、formal-lite internal run 或 forward-live capture 说成更强结论。
-
-## Direct LLM Caveat
-
-历史 direct-LLM shorthand 必须解释为 `direct_llm_parametric_memory_control`。
-
-它不是干净的 no-future historical baseline。即使 prompts、input packets 和 artifact filters 都限制到 `decision_date`，现代 LLM 的参数记忆也可能包含后来的市场叙事。prompt 和 artifact gate 可以降低显式 future-data 泄漏，但不能抹掉 parametric memory。
-
-因此：
-
-- `direct_llm_parametric_memory_control` metrics 只能作为诊断；
-- C1/C3/C5、return、MSE、MAE、direction-hit 等包含 `direct_llm_parametric_memory_control` 的指标，不得用来证明或反驳 GOTRA、ksana、alaya 的成功或失败；
-- 更适合历史 alaya-style 解释的比较是 `ksana_real_research` vs `full_gotra`，并且仍然受 internal-evidence 边界约束；
-- 更干净的 baseline 是 deterministic price-only 或 simple statistical reference；
-- 最可信的未来导向路径是 forward-live/future-only capture，并在 outcome 成熟后再评分。
-
-详见 [`docs/GOTRA_DIRECT_LLM_INTERPRETATION_BOUNDARY_2026-06-20.md`](docs/GOTRA_DIRECT_LLM_INTERPRETATION_BOUNDARY_2026-06-20.md)。
-
-## Baseline 演进摘要
-
-以下是当前主线的审慎时间线，不是市场优越性声明：
-
-- **Stage4-8**：reproducibility、replay gate、provider routing 和 baseline-only signal/PNL screening。它们改进了审计 harness 并明确失败边界，但没有建立公开市场有效性证明。
-- **Baseline v2 / v3**：四臂实验族，比较 `direct_llm_parametric_memory_control`、`ksana_formatting_only`、`ksana_real_research`、`full_gotra`，并区分 `price_only_packet` 与 `richer_research_packet`。Baseline v3 formal-lite 属于内部研究证据，强结论仍为 inconclusive。
-- **v3.1 / v3.2**：real-evidence 和 true-independent feedback substrate。v3.1 保持 H2 data-insufficient；v3.2 引入更严格的 feedback eligibility，并在 formal-lite attempt 中暴露 provider contract blocker。
-- **v3.3a-d**：Judge decision provenance、dry-run gate polling、outcome-derived feedback artifact production、temporal replay/calibration、prompt/spec hardening。这些是 local engineering 和 replay/calibration evidence。
-- **v3.4 / v3.4b / v3.4c**：新的 `codex_cli_llm_backend` experiment family、transcript/hash metadata、deterministic price-only reference integration 和 scaled internal run。这些是 internal backend/reference diagnostics，不是外部验证或公开科学结论。
-- **v3.5A**：forward-live/future-only decision capture path。它可以在 outcome 发生前捕获决策；outcome scoring 必须等 horizon 成熟。
-
-## 当前不声称
-
-本仓库当前不声称：
-
-- 默认已经具备外部验证、公开证明或科学结论；
-- 任何交易或投资推荐；
-- provider health、Codex CLI backend health 或 CI success 等于 market edge；
-- forward-live capture 等于 matured outcome pass；
-- `direct_llm_parametric_memory_control` 是干净的 no-future baseline；
-- product metrics 本身可以证明预测质量或投资价值。
-
-如果某个 run 写着 `PROVIDER_PILOT_PASS`、`FORMAL_LITE_MIN_INTERNAL_PASS`、`SCALED_INTERNAL_PROVIDER_PILOT_PASS` 或 `FORWARD_LIVE_CAPTURE_PASS`，请只在对应文档声明的证据层内解释。
-
-## 快速开始
-
-前置要求：
-
-- Python `>=3.11`，CI 使用 Python `3.12`；
-- [`uv`](https://docs.astral.sh/uv/)；
-- 运行触达 `engine/ksana` 的检查前，需要初始化 git submodules。
-
-```bash
-git clone https://github.com/amanayayatu-tech/gotra.git
-cd gotra
-git submodule update --init --recursive
-uv sync --frozen
+```text
+stock selection
+  -> Research Task Planner
+  -> Evidence Packet Builder
+  -> K Deep Research Dossier
+  -> F/W/G Independent Perspective Agents in parallel
+  -> Chairman Synthesis
+  -> Red Team Audit / Counter-Evidence
+  -> Research Quality Gate
+  -> Alaya / Knowledge Gate
+  -> Alaya Write
+  -> Readback Verification
+  -> Reader Boundary Gate
+  -> Public Artifact
+  -> daily_reader_brief.v4
+  -> gotra-public-ledger reader
 ```
 
-可选环境配置见 [`.env.example`](.env.example)。不要把真实 secrets 加入 git。Provider/backend runs 属于高成本且证据敏感动作，必须有明确 goal 和预注册边界后再运行。
+中文解释：
 
-## 本地检查
+- **Research Task Planner / 研究任务书**：说明为什么今天研究这只股票、今天必须回答什么、哪些证据是必需的、哪些缺口不能假装完整。
+- **Evidence Packet / 证据包**：整理公开安全证据、来源 freshness、missing required sources、stale sources 和 `data_gap`。
+- **K Deep Research Dossier / K 深度研究底稿**：先于 F/W/G 生成，形成主要研究底稿和待验证问题。
+- **F/W/G Independent Perspectives / F/W/G 独立视角**：基于研究任务书、证据包和 K 底稿独立并行研究，各自产生 hash、timing 和 private record。
+- **Chairman Synthesis / 主席综合**：综合 K 与 F/W/G，指出一致、冲突、证据强弱、不确定性和观察条件。
+- **Red Team Audit / 红队反证审计**：攻击薄弱假设、过度确定、证据缺口和公开边界风险。红队不是 Judge。
+- **Research Quality Gate / 研究质量闸门**：输出 `candidate | watch | avoid | needs_review | data_gap | high_uncertainty` 等研究状态。
+- **Knowledge Gate / 知识闸门**：决定哪些知识可沉淀，哪些只是临时观察，哪些 unresolved questions 进入下一轮。
+- **Alaya Readback / 内部 Alaya 回读**：验证 task、evidence、K dossier、agents、chairman、red team、quality gate、knowledge gate 和 public payload 的 hash。
+- **Reader Boundary Gate / 读者边界闸门**：不隐藏研究内容，只确保公开表达不会被误读为投资建议或交易信号。
 
-常规本地验证：
+## 版本与 Schema
+
+当前 v4 版本名：
+
+| 类型 | 值 |
+| --- | --- |
+| prompt template | `gotra.full_analyst.prompt.v4.ksana_cognition_flywheel` |
+| symbol schema | `gotra.full_analyst.symbol.v4` |
+| daily reader schema | `gotra.daily_reader_brief.v4` |
+| research task schema | `gotra.full_analyst.research_task.v2` |
+| evidence packet schema | `gotra.full_analyst.evidence_packet.v2` |
+| K dossier schema | `gotra.full_analyst.k_deep_research_dossier.v1` |
+| perspective schema | `gotra.full_analyst.perspective_agent.v4` |
+| chairman schema | `gotra.full_analyst.chairman_synthesis.v4` |
+| red team schema | `gotra.full_analyst.red_team_audit.v4` |
+| research quality gate | `gotra.full_analyst.research_quality_gate.v1` |
+| knowledge gate | `gotra.cognition_flywheel.knowledge_gate.v1` |
+| Alaya event schema | `gotra.cognition_flywheel.full_analyst_memory.v4` |
+
+v2、v3、v3.5 的 fallback 仍保留，用于读取旧产物和避免历史报告断裂。不要把 v3.5 的 `PASS_WITH_REVIEW_ITEMS` 升级成 v4 pass，也不要把 v4 的 2h pressure 升级成 10h/formal acceptance。
+
+## 主要入口
+
+### Full Analyst v4 pipeline
+
+核心脚本：
 
 ```bash
-uv run ruff check . --force-exclude
-uv run pytest -q
-git diff --check
+scripts/public_stock_pool_full_analyst_pipeline.py
 ```
 
-README/docs-only 变更通常只需要 `git diff --check`，除非 README 引用了被改动的命令或代码路径。当前 v3 surfaces 的有用 focused checks：
+查看参数：
 
 ```bash
-uv run python -m py_compile \
-  scripts/baseline_v3_four_arm.py \
-  scripts/baseline_v3_5_forward_live_capture.py \
-  gotra/backtest/statistics.py
-
-uv run pytest -q tests/test_baseline_v3_four_arm.py tests/test_forward_live_capture.py
+cd /opt/gotra
+/opt/gotra/.venv/bin/python scripts/public_stock_pool_full_analyst_pipeline.py --help
 ```
 
-CI 还会运行 Ruff、全量 pytest、BT repair tests、heuristic BT canaries、direct-vendor LLM import guards、repository hygiene guard 和 ksana orchestration guard。详见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
+典型 v4 本地/服务器 canary 形态：
 
-## Public Stock-Pool Report Ops
+```bash
+cd /opt/gotra
+/opt/gotra/.venv/bin/python scripts/public_stock_pool_full_analyst_pipeline.py \
+  --mode full-analyst-production-loop \
+  --v40-cognition-flywheel \
+  --execution-model deep_research_dossier_then_parallel_perspectives \
+  --llm-runner codex-cli \
+  --alaya-mode real \
+  --max-concurrency 3 \
+  --agent-concurrency 4 \
+  --retries 1
+```
 
-`main` includes the single-server public stock-pool report automation used by
-the public ledger frontend. The script writes public-safe Markdown/JSON
-artifacts only; it does not call LLM providers, read `.env`, expose private UI
-state, or generate trading instructions.
+生产发布必须按当次控制提示词决定是否加 `--publish-static`。不要把 local canary、smoke、production smoke 和正式验收混成一个结论。
 
-Manual run on the server:
+### Daily stock-pool public report
+
+传统 public stock-pool report 仍存在，和 v4 Full Analyst 不是同一层：
 
 ```bash
 cd /opt/gotra
@@ -154,89 +148,110 @@ cd /opt/gotra
 /root/.local/bin/uv run python scripts/public_stock_pool_report.py --mode evening-hk --publish-static
 ```
 
-Check timers and logs:
+`public_stock_pool_report.py` 写的是 public-safe 日报/状态产物；`public_stock_pool_full_analyst_pipeline.py` 写的是 Full Analyst / v4 cognition flywheel 研究产物。不要把两者的 `status.json` 混读。
 
-```bash
-systemctl list-timers --all | grep gotra-stock-pool
-sudo systemctl status gotra-stock-pool-morning-report.service --no-pager
-sudo systemctl status gotra-stock-pool-evening-report.service --no-pager
-sudo journalctl -u gotra-stock-pool-morning-report.service -n 120 --no-pager
-sudo journalctl -u gotra-stock-pool-evening-report.service -n 120 --no-pager
+## 生产产物
+
+常用生产路径：
+
+```text
+/var/www/gotra-public-ledger/reports/daily_reader_brief.json
+/var/www/gotra-public-ledger/reports/status_full_analyst_evening_hk.json
+/var/www/gotra-public-ledger/reports/latest/
+/var/www/gotra-public-ledger/reports/full-analyst/
 ```
 
-Check the latest status and failed-symbol list:
+重要字段：
 
-```bash
-jq '{ok, run_status, mode, as_of_date, trading_date, success_count, failed_count, artifact_write_status, artifact_write_failure_reason}' \
-  /opt/gotra/data/reports/status.json
-jq -r '.failed_symbols[]? | [.exchange, .symbol, .provider_ticker, .reason] | @tsv' \
-  /opt/gotra/data/reports/status.json
-curl -fsS http://47.251.249.147/reports/status.json \
-  | jq '{ok, run_status, mode, trading_date, success_count, failed_count, artifact_write_status, artifact_write_failure_reason}'
+```text
+schema=gotra.daily_reader_brief.v4
+symbol_schema=gotra.full_analyst.symbol.v4
+methodology_version=ksana_cognition_flywheel_v4
+execution_model=deep_research_dossier_then_parallel_perspectives
+run_status=completed_with_review_items
+public_scan_status=ok
+alaya_readback_status=verified
 ```
 
-If `status.json` cannot be written, the exact `status.json write failed` reason
-is preserved in the service journal. Full ops notes, systemd templates, Nginx
-route snippet, smoke checks, and safety scans are in
-[`docs/PUBLIC_STOCK_POOL_REPORT_AUTOMATION_RUNBOOK.md`](docs/PUBLIC_STOCK_POOL_REPORT_AUTOMATION_RUNBOOK.md).
+如果 `status.json` 显示 partial 或 data gap，要先确认它属于传统 daily stock-pool report 还是 Full Analyst v4，不要直接判定 v4 失败。
+
+## 验证命令
+
+后端 focused checks：
+
+```bash
+cd /opt/gotra
+/opt/gotra/.venv/bin/python -m pytest tests -q -k "full_analyst or research_task or evidence_packet or k_dossier or perspective_agent or chairman or red_team or knowledge_gate or alaya or public_safe"
+/opt/gotra/.venv/bin/python scripts/public_stock_pool_full_analyst_pipeline.py --help
+```
+
+通用 checks：
+
+```bash
+cd /opt/gotra
+/opt/gotra/.venv/bin/python -m pytest tests -q
+git diff --check
+```
+
+文档-only 改动通常至少跑：
+
+```bash
+git diff --check
+```
+
+## 证据层级
+
+阅读 GOTRA 结果时按以下层级解释：
+
+| 层级 | 能说明什么 | 不能说明什么 |
+| --- | --- | --- |
+| local checks | 代码、schema、fixture、lint/test/build 或脚本 help 可通过。 | 生产可用、研究质量稳定、正式验收。 |
+| smoke evidence | 某条正向路径、生产路由或 canary 可读可跑。 | 长时间稳定、10h acceptance、科学证明。 |
+| 2h pressure | v4 在指定窗口内完成多轮 production smoke/contract/HTTP/nginx 检查。 | 10h/formal acceptance、投资有效性、收益证明。 |
+| 6h/10h/formal acceptance | 需要单独明确运行、证据文件和最终结论。 | 默认不能由 2h pressure 推导。 |
+| science/public/performance claim | 需要完全不同的协议和证据。 | 本仓库当前不声称。 |
+| trading/investment claim | 需要合规和交易层证据。 | GOTRA 不提供。 |
+
+当前 v4 已完成的是 `2h pressure` + 前端 productization smoke，不是 10h/formal acceptance。
+
+## Alaya 边界
+
+本仓库里 Alaya 只表示 GOTRA repo 内部 cognition flywheel / knowledge memory / feedback / readback state。
+
+禁止把它解释为：
+
+- 外部 `/Users/peachy/Documents/alaya`；
+- 外部 alaya repo；
+- `ALAYA_BASE_URL`；
+- `ALAYA_WRITE_PATH`；
+- 外部知识库服务或商业产品。
+
+公开产物里可以说明 Alaya readback verified，但不得暴露 secrets、raw provider I/O、完整内部 prompt、API key、Authorization/Bearer token。
 
 ## Artifact Hygiene
 
 不要提交生成产物或敏感产物：
 
-- `data/backtest/runs/*`
-- `data/backtest/prices/*`
-- Codex CLI transcripts
-- raw provider/API outputs
-- `.env*`，但 `.env.example` 除外
-- API keys、tokens、auth JSON 或本地 secrets
-- SQLite/DB files
-- bundle/tar/zip archives
-- paper-trading data
-- validation logs、review bundles、patch files、generated reports
-- Stage8/Stage9 local artifacts，除非某个 docs-only artifact 被明确接受
+- raw provider/API outputs；
+- Codex CLI transcripts；
+- `.env*`，但 `.env.example` 除外；
+- API keys、tokens、auth JSON；
+- SQLite/DB files；
+- `*.tar.gz`、`*.bundle`、zip archives；
+- validation logs、review bundles、release bundles；
+- private audit records，除非有明确 public-safe contract；
+- `/tmp/gotra-*` 证据目录内容。
 
-仓库 `.gitignore` 和 CI hygiene guard 会强制执行这些规则中的稳定子集。
+## 相关文档
 
-## 文档地图
+核心契约：
 
-核心项目契约：
+- [`SPEC.md`](SPEC.md)
+- [`docs/AUTONOMY_RUNBOOK.md`](docs/AUTONOMY_RUNBOOK.md)
+- [`docs/ROADMAP.md`](docs/ROADMAP.md)
+- [`docs/PUBLIC_STOCK_POOL_REPORT_AUTOMATION_RUNBOOK.md`](docs/PUBLIC_STOCK_POOL_REPORT_AUTOMATION_RUNBOOK.md)
 
-- [`SPEC.md`](SPEC.md)：agent-facing 操作规约、边界和验证命令。
-- [`docs/AUTONOMY_RUNBOOK.md`](docs/AUTONOMY_RUNBOOK.md)：自主化/runbook 约束。
-- [`docs/ROADMAP.md`](docs/ROADMAP.md)：阶段路线图。
-- [`data/backtest/PREREGISTERED.md`](data/backtest/PREREGISTERED.md)：原始 BT protocol。
-
-证据与边界文档：
-
-- [`docs/GOTRA_DIRECT_LLM_INTERPRETATION_BOUNDARY_2026-06-20.md`](docs/GOTRA_DIRECT_LLM_INTERPRETATION_BOUNDARY_2026-06-20.md)
-- [`data/backtest/STAGE6_PREREGISTERED.md`](data/backtest/STAGE6_PREREGISTERED.md)
-- [`docs/STAGE6_EVIDENCE_MANIFEST_20260617.md`](docs/STAGE6_EVIDENCE_MANIFEST_20260617.md)
-- [`docs/STAGE6_FINAL_VERDICT_2026-06-17.md`](docs/STAGE6_FINAL_VERDICT_2026-06-17.md)
-- [`docs/GOTRA_V3_3A_CHAIN_AUDIT_AND_PROVENANCE_20260620.md`](docs/GOTRA_V3_3A_CHAIN_AUDIT_AND_PROVENANCE_20260620.md)
-- [`docs/GOTRA_V3_3B_OUTCOME_FEEDBACK_PRODUCTION_20260620.md`](docs/GOTRA_V3_3B_OUTCOME_FEEDBACK_PRODUCTION_20260620.md)
-- [`docs/GOTRA_V3_3C_JUDGE_TEMPORAL_REPLAY_20260620.md`](docs/GOTRA_V3_3C_JUDGE_TEMPORAL_REPLAY_20260620.md)
-- [`docs/GOTRA_V3_3D_JUDGE_PROMPT_HARDENING_20260620.md`](docs/GOTRA_V3_3D_JUDGE_PROMPT_HARDENING_20260620.md)
-- [`docs/GOTRA_V3_4_CODEX_CLI_FORMAL_LITE_RESULT_20260620.md`](docs/GOTRA_V3_4_CODEX_CLI_FORMAL_LITE_RESULT_20260620.md)
-- [`docs/GOTRA_V3_4B_DETERMINISTIC_REFERENCE_RESULT_20260620.md`](docs/GOTRA_V3_4B_DETERMINISTIC_REFERENCE_RESULT_20260620.md)
-- [`docs/GOTRA_V3_4C_CODEX_CLI_SCALED_REFERENCE_RESULT_20260620.md`](docs/GOTRA_V3_4C_CODEX_CLI_SCALED_REFERENCE_RESULT_20260620.md)
-- [`docs/GOTRA_V3_5A_FORWARD_LIVE_CAPTURE_RESULT_20260620.md`](docs/GOTRA_V3_5A_FORWARD_LIVE_CAPTURE_RESULT_20260620.md)
-
-相关代码和测试入口：
-
-- [`scripts/baseline_v3_four_arm.py`](scripts/baseline_v3_four_arm.py)
-- [`scripts/baseline_v3_5_forward_live_capture.py`](scripts/baseline_v3_5_forward_live_capture.py)
-- [`gotra/judge_agent/outcome_feedback.py`](gotra/judge_agent/outcome_feedback.py)
-- [`gotra/judge_agent/temporal_replay.py`](gotra/judge_agent/temporal_replay.py)
-- [`tests/test_baseline_v3_four_arm.py`](tests/test_baseline_v3_four_arm.py)
-- [`tests/test_forward_live_capture.py`](tests/test_forward_live_capture.py)
-- [`tests/test_judge_agent.py`](tests/test_judge_agent.py)
-- [`tests/test_outcome_feedback.py`](tests/test_outcome_feedback.py)
-- [`tests/test_judge_temporal_replay.py`](tests/test_judge_temporal_replay.py)
-
-## 合规与使用警示
-
-GOTRA 仅用于研究和信息整理。它不提供投资建议、组合管理、交易执行，也不构成对任何证券的买入、卖出或持有建议。用户对自己的决策负责。任何结果都可能错误、不完整、结论不足、过时，或受数据、provider、模型和实验设计限制影响。
+历史 baseline 和边界文档仍保留，但它们代表旧证据族。阅读时要用对应版本和证据层级解释，不要把旧 baseline 叙事当成当前 v4 产品说明。
 
 ## License
 
