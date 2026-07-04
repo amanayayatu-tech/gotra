@@ -6,6 +6,8 @@ from datetime import date, datetime, timedelta, timezone
 from itertools import count
 from pathlib import Path
 
+import pytest
+
 from scripts.public_stock_pool_full_research import RunnerResult
 from scripts.public_stock_pool_full_analyst_pipeline import (
     BOUNDARY_LINES,
@@ -60,6 +62,7 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     selected_universe,
     update_loop_public_status,
     v3_agent_failure_record,
+    validate_evidence_packet_contract,
 )
 
 
@@ -1147,6 +1150,21 @@ def test_v40_fixture_run_builds_k_first_gates_and_alaya_hash_readback(tmp_path: 
     assert symbol_payload["market_data_snapshot_hash"] == symbol_payload["market_data_snapshot"]["snapshot_hash"]
     assert symbol_payload["research_task"]["schema"] == RESEARCH_TASK_SCHEMA_V2
     assert symbol_payload["evidence_packet"]["schema"] == EVIDENCE_PACKET_SCHEMA_V2
+    validate_evidence_packet_contract(symbol_payload["evidence_packet"])
+    assert symbol_payload["evidence_packet"]["packet_id"].endswith(":HKEX:0700:evidence_packet")
+    assert symbol_payload["evidence_packet"]["as_of"] == cfg.as_of_date.isoformat()
+    assert symbol_payload["evidence_packet"]["future_data_check"] is True
+    assert isinstance(symbol_payload["evidence_packet"]["missing_items"], list)
+    assert symbol_payload["evidence_packet"]["sources"]
+    for source in symbol_payload["evidence_packet"]["sources"]:
+        assert source["retrieved_at"]
+        assert source["source_id"]
+        assert source["source_type"]
+        assert source["source_name"]
+    invalid_packet = json.loads(json.dumps(symbol_payload["evidence_packet"]))
+    del invalid_packet["sources"][0]["retrieved_at"]
+    with pytest.raises(ValueError, match="evidence_packet_source_missing_retrieved_at"):
+        validate_evidence_packet_contract(invalid_packet)
     assert symbol_payload["evidence_packet"]["market_data_snapshot_hash"] == symbol_payload["market_data_snapshot_hash"]
     assert symbol_payload["evidence_packet"]["market_data_snapshot"]["snapshot_hash"] == symbol_payload["market_data_snapshot_hash"]
     assert any(item["evidence_id"] == "market_data_snapshot" for item in symbol_payload["evidence_packet"]["evidence_items"])
@@ -1252,9 +1270,11 @@ def test_v40_market_data_snapshot_future_data_risk_blocks_publication(tmp_path: 
     assert status["blocked_count"] == 1
     assert status["failed_count"] == 0
     assert symbol_payload["market_data_snapshot"]["future_data_risk"] is True
+    assert symbol_payload["evidence_packet"]["future_data_check"] is False
+    assert symbol_payload["evidence_packet"]["future_data_check_details"]["passed"] is False
     assert "future_data_risk" in symbol_payload["market_data_snapshot"]["quality_flags"]
     assert symbol_payload["judge_status"] == "blocked"
-    assert "future_data_risk" in " ".join(symbol_payload["judge_reasons"])
+    assert "future_data_check" in " ".join(symbol_payload["judge_reasons"])
 
 
 def test_v40_requested_can_explicitly_fallback_to_v2() -> None:
