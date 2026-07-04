@@ -1,6 +1,6 @@
 # GOTRA
 
-GOTRA 是一个研究认知系统，不是荐股系统、交易信号系统或收益证明系统。
+GOTRA 是一个**可审计 AI 金融研究发布账本**：它记录研究任务、证据、分歧、反证、复盘与审计状态，不是荐股系统、交易信号系统或收益证明系统。
 
 当前主线是 **GOTRA v4.0 Ksana cognition flywheel**：先生成研究任务书和公开证据包，再由 K 深度研究底稿、F/W/G 独立视角、主席综合、红队反证、研究质量闸门、知识闸门、内部 Alaya 回读和读者边界闸门共同形成可审计的公开研究产物。
 
@@ -44,9 +44,11 @@ GOTRA 不是：
 - 买入、卖出、持有、加仓、减仓指令；
 - 目标价或仓位建议；
 - 收益承诺或业绩证明；
-- science/public proof；
+- 科学或公共有效性证明；
 - 自动交易或券商下单系统；
 - 外部 Alaya 项目的客户端。
+
+公开定位和禁用表述的机器可读合同在 [`config/public_claims.yml`](config/public_claims.yml)。任何官网、README、公开 payload 或 release note 的定位文案都应保持在 allowlist 语义内；命中 blocklist 语义时必须改写、阻断或进入人工复核。
 
 ## v4 研究链路
 
@@ -209,8 +211,8 @@ git diff --check
 | smoke evidence | 某条正向路径、生产路由或 canary 可读可跑。 | 长时间稳定、10h acceptance、科学证明。 |
 | 2h pressure | v4 在指定窗口内完成多轮 production smoke/contract/HTTP/nginx 检查。 | 10h/formal acceptance、投资有效性、收益证明。 |
 | 6h/10h/formal acceptance | 需要单独明确运行、证据文件和最终结论。 | 默认不能由 2h pressure 推导。 |
-| science/public/performance claim | 需要完全不同的协议和证据。 | 本仓库当前不声称。 |
-| trading/investment claim | 需要合规和交易层证据。 | GOTRA 不提供。 |
+| 科学、公开有效性或业绩类声明 | 需要完全不同的协议和证据。 | 本仓库当前不声称。 |
+| 交易或投资类声明 | 需要合规和交易层证据。 | GOTRA 不提供。 |
 
 当前 v4 已完成的是 `2h pressure` + 前端 productization smoke，不是 10h/formal acceptance。
 
