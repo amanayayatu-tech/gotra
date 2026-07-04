@@ -71,6 +71,7 @@ RED_TEAM_SCHEMA_V4 = "gotra.full_analyst.red_team_audit.v4"
 RESEARCH_QUALITY_GATE_SCHEMA = "gotra.full_analyst.research_quality_gate.v1"
 KNOWLEDGE_GATE_SCHEMA = "gotra.cognition_flywheel.knowledge_gate.v1"
 RESEARCH_SIGNAL_SCHEMA = "gotra.research_signal.v1"
+PUBLICATION_DECISION_SCHEMA = "gotra.publication_decision.v1"
 METHODOLOGY_VERSION = "ksana_4_1_lite"
 METHODOLOGY_VERSION_V3 = "ksana_4_1_independent_agents"
 METHODOLOGY_VERSION_V35 = "ksana_4_1_research_task_evidence_agents"
@@ -449,6 +450,7 @@ class GotraInternalAlayaSyncClient:
             "research_quality_gate_hash": payload.get("research_quality_gate_hash", ""),
             "knowledge_gate_hash": payload.get("knowledge_gate_hash", ""),
             "research_signal_hash": payload.get("research_signal_hash", ""),
+            "publication_decision_hash": payload.get("publication_decision_hash", ""),
             "prompt_hash": payload.get("prompt_hash", ""),
             "research_packet_hash": payload.get("research_packet_hash", ""),
             "public_payload_hash": public_payload_hash,
@@ -604,7 +606,15 @@ class GotraInternalAlayaSyncClient:
             if is_v35_payload or is_v40_payload:
                 hash_keys = ["research_task_hash", "evidence_packet_hash", "market_data_snapshot_hash", "chairman_hash", "red_team_hash"]
                 if is_v40_payload:
-                    hash_keys.extend(["k_dossier_hash", "research_quality_gate_hash", "knowledge_gate_hash", "research_signal_hash"])
+                    hash_keys.extend(
+                        [
+                            "k_dossier_hash",
+                            "research_quality_gate_hash",
+                            "knowledge_gate_hash",
+                            "research_signal_hash",
+                            "publication_decision_hash",
+                        ]
+                    )
                 for hash_key in hash_keys:
                     expected_hash = (
                         payload["agent_hashes"].get("chairman_synthesis", "")
@@ -2234,6 +2244,7 @@ def build_alaya_public_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "research_quality_gate_hash": payload.get("research_quality_gate_hash", ""),
             "knowledge_gate_hash": payload.get("knowledge_gate_hash", ""),
             "research_signal_hash": payload.get("research_signal_hash", ""),
+            "publication_decision_hash": payload.get("publication_decision_hash", ""),
             "evidence_gaps": payload["evidence_gaps"],
             "watch_conditions": payload["watch_conditions"],
         }
@@ -2266,6 +2277,7 @@ def build_alaya_public_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "research_quality_gate_hash": payload.get("research_quality_gate_hash", ""),
             "knowledge_gate_hash": payload.get("knowledge_gate_hash", ""),
             "research_signal_hash": payload.get("research_signal_hash", ""),
+            "publication_decision_hash": payload.get("publication_decision_hash", ""),
             "knowledge_persistence": payload.get("knowledge_persistence", ""),
             "unresolved_questions": payload.get("unresolved_questions", []),
             "missing_required_sources": payload.get("missing_required_sources", []),
@@ -2283,12 +2295,14 @@ def build_alaya_public_payload(payload: dict[str, Any]) -> dict[str, Any]:
             public_payload["research_quality_gate"] = payload.get("research_quality_gate", {})
             public_payload["knowledge_gate"] = payload.get("knowledge_gate", {})
             public_payload["research_signal"] = payload.get("research_signal", {})
+            public_payload["publication_decision"] = payload.get("publication_decision", {})
             public_payload["agent_research_signal_hashes"] = payload.get("agent_research_signal_hashes", {})
             public_payload["k_dossier_schema"] = K_DOSSIER_SCHEMA
             public_payload["perspective_agent_schema"] = PERSPECTIVE_AGENT_SCHEMA_V4
             public_payload["chairman_schema"] = CHAIRMAN_SCHEMA_V4
             public_payload["red_team_schema"] = RED_TEAM_SCHEMA_V4
             public_payload["research_signal_schema"] = RESEARCH_SIGNAL_SCHEMA
+            public_payload["publication_decision_schema"] = PUBLICATION_DECISION_SCHEMA
         if is_v35_payload:
             public_payload["cognition_flywheel_layer"] = "full_analyst_research_task_evidence_agents"
         assert_public_safe(public_payload)
@@ -2952,6 +2966,200 @@ def validate_symbol_research_signal_contract(symbol_payload: dict[str, Any]) -> 
         validate_research_signal_contract(agent_signals[agent_id])
 
 
+def publication_gate(name: str, status: str, reason: str) -> dict[str, str]:
+    return {
+        "gate": name,
+        "status": status,
+        "reader_safe_reason": sanitize_public_text_value(reason, max_chars=500) or "gate result not reported",
+    }
+
+
+def publication_public_safety_gate(symbol_payload: dict[str, Any]) -> dict[str, str]:
+    try:
+        assert_public_safe(symbol_payload)
+    except Exception as exc:  # noqa: BLE001 - gate must collapse scanner details to public-safe category.
+        return publication_gate("public_safety_scan", "blocked", public_safe_failure_category(str(exc)))
+    return publication_gate("public_safety_scan", "pass", "public safety scan reported no public expression blocker")
+
+
+def publication_secret_gate(symbol_payload: dict[str, Any]) -> dict[str, str]:
+    text = json.dumps(symbol_payload, ensure_ascii=False, sort_keys=True)
+    if re.search(
+        r"OPENAI_API_KEY|sk-[A-Za-z0-9_-]+|Bearer\s+|Authorization|PRIVATE KEY|"
+        r"prompt_text|\"(?:messages|completion)\"\s*:|raw_provider_response|stdout|stderr",
+        text,
+        re.IGNORECASE,
+    ):
+        return publication_gate("secret_scan", "blocked", "secret_or_raw_io_public_payload_risk")
+    return publication_gate("secret_scan", "pass", "no secret or raw provider I/O marker detected in public payload")
+
+
+def publication_forbidden_wording_gate(symbol_payload: dict[str, Any]) -> dict[str, str]:
+    signal = symbol_payload.get("research_signal") if isinstance(symbol_payload.get("research_signal"), dict) else {}
+    text = normalize_negated_boundary_text(json.dumps(signal, ensure_ascii=False, sort_keys=True)).lower()
+    for fragment in RESEARCH_SIGNAL_FORBIDDEN_FRAGMENTS:
+        if fragment.lower() in text:
+            return publication_gate("forbidden_wording_scan", "blocked", "[BLOCKED: 合规禁词] research signal wording gate failed")
+    return publication_gate("forbidden_wording_scan", "pass", "no restricted research-signal wording detected")
+
+
+def publication_evidence_packet_gate(symbol_payload: dict[str, Any]) -> dict[str, str]:
+    packet = symbol_payload.get("evidence_packet") if isinstance(symbol_payload.get("evidence_packet"), dict) else {}
+    if not packet:
+        return publication_gate("evidence_packet_contract", "blocked", "missing EvidencePacket; no public judgment may be generated")
+    try:
+        validate_evidence_packet_contract(packet)
+    except Exception as exc:  # noqa: BLE001 - validation detail is reduced to a reader-safe category.
+        return publication_gate("evidence_packet_contract", "blocked", public_safe_failure_category(str(exc)))
+    if packet.get("missing_required_sources") or packet.get("data_gaps") or packet.get("stale_sources"):
+        return publication_gate("evidence_packet_contract", "needs_review", "EvidencePacket reports missing, stale, or gap sources that must stay visible")
+    return publication_gate("evidence_packet_contract", "pass", "EvidencePacket contract is complete for publication review")
+
+
+def publication_future_data_gate(symbol_payload: dict[str, Any]) -> dict[str, str]:
+    packet = symbol_payload.get("evidence_packet") if isinstance(symbol_payload.get("evidence_packet"), dict) else {}
+    snapshot = symbol_payload.get("market_data_snapshot") if isinstance(symbol_payload.get("market_data_snapshot"), dict) else {}
+    if packet.get("future_data_check") is False or snapshot.get("future_data_risk"):
+        return publication_gate("future_data_check", "blocked", "future-data guard failed")
+    return publication_gate("future_data_check", "pass", "future-data guard passed")
+
+
+def publication_research_signal_gate(symbol_payload: dict[str, Any]) -> dict[str, str]:
+    try:
+        validate_symbol_research_signal_contract(symbol_payload)
+    except ValueError as exc:
+        if "[BLOCKED: 合规禁词]" in str(exc):
+            return publication_gate("research_signal_contract", "blocked", "[BLOCKED: 合规禁词] research signal compliance gate failed")
+        return publication_gate("research_signal_contract", "blocked", f"research_signal_contract_failed:{normalize_failure_reason(exc)}")
+    return publication_gate("research_signal_contract", "pass", "every ResearchSignal is present and bound to evidence")
+
+
+def publication_data_completeness_gate(symbol_payload: dict[str, Any]) -> dict[str, str]:
+    if symbol_payload.get("price_coverage_status") == "data_gap":
+        return publication_gate("data_completeness_gate", "needs_review", "price coverage is data_gap")
+    if symbol_payload.get("missing_required_sources"):
+        return publication_gate("data_completeness_gate", "needs_review", "required public sources are missing")
+    evidence_gaps = sanitize_list(symbol_payload.get("evidence_gaps"))
+    if evidence_gaps and evidence_gaps != ["No specific evidence gap was reported."]:
+        return publication_gate("data_completeness_gate", "needs_review", "evidence gaps remain visible")
+    return publication_gate("data_completeness_gate", "pass", "data completeness gate passed for public research status")
+
+
+def publication_blocker_type(gates: dict[str, dict[str, str]], judge_status: str, judge_reasons: list[str]) -> str:
+    blocked = [name for name, gate in gates.items() if gate.get("status") == "blocked"]
+    if "secret_scan" in blocked:
+        return "secret_or_raw_io"
+    if "forbidden_wording_scan" in blocked or any("[BLOCKED: 合规禁词]" in reason for reason in judge_reasons):
+        return "forbidden_wording"
+    if "public_safety_scan" in blocked:
+        return "public_safety"
+    if "future_data_check" in blocked:
+        return "future_data"
+    if "evidence_packet_contract" in blocked:
+        return "evidence_packet_contract"
+    if "research_signal_contract" in blocked:
+        return "research_signal_contract"
+    if judge_status == "blocked":
+        return "judge_gate"
+    return ""
+
+
+def validate_publication_decision_contract(decision: dict[str, Any]) -> None:
+    required = (
+        "schema",
+        "decision_id",
+        "run_id",
+        "symbol",
+        "signal_id",
+        "research_signal_hash",
+        "decision",
+        "reader_safe_reasons",
+        "gates",
+        "publish_with_boundary",
+    )
+    missing = [field for field in required if field not in decision]
+    if missing:
+        raise ValueError(f"publication_decision_missing_required_fields:{','.join(missing)}")
+    if decision.get("schema") != PUBLICATION_DECISION_SCHEMA:
+        raise ValueError("publication_decision_invalid_schema")
+    if decision.get("decision") not in {"publish", "needs_review", "blocked"}:
+        raise ValueError("publication_decision_invalid_decision")
+    if not sanitize_text(str(decision.get("signal_id") or "")):
+        raise ValueError("publication_decision_missing_signal_id")
+    if not sanitize_text(str(decision.get("research_signal_hash") or "")):
+        raise ValueError("publication_decision_missing_research_signal_hash")
+    if decision["decision"] != "publish" and not sanitize_list(decision.get("reader_safe_reasons")):
+        raise ValueError("publication_decision_missing_reader_safe_reasons")
+    if decision["decision"] == "blocked" and not sanitize_text(str(decision.get("blocker_type") or "")):
+        raise ValueError("publication_decision_missing_blocker_type")
+    gates = decision.get("gates")
+    if not isinstance(gates, dict):
+        raise ValueError("publication_decision_missing_gates")
+    if decision["decision"] == "publish":
+        failed = [name for name, gate in gates.items() if not isinstance(gate, dict) or gate.get("status") != "pass"]
+        if failed:
+            raise ValueError(f"publication_decision_publish_with_failed_gates:{','.join(failed)}")
+    for gate_name in ("public_safety_scan", "secret_scan", "forbidden_wording_scan"):
+        gate = gates.get(gate_name)
+        if isinstance(gate, dict) and gate.get("status") == "blocked" and decision["decision"] == "publish":
+            raise ValueError(f"publication_decision_publish_with_blocked_{gate_name}")
+    assert_public_safe(decision)
+
+
+def build_publication_decision(
+    symbol_payload: dict[str, Any],
+    *,
+    judge_status: str,
+    judge_reasons: list[str],
+) -> dict[str, Any]:
+    signal = symbol_payload.get("research_signal") if isinstance(symbol_payload.get("research_signal"), dict) else {}
+    gates = {
+        "public_safety_scan": publication_public_safety_gate(symbol_payload),
+        "secret_scan": publication_secret_gate(symbol_payload),
+        "forbidden_wording_scan": publication_forbidden_wording_gate(symbol_payload),
+        "evidence_packet_contract": publication_evidence_packet_gate(symbol_payload),
+        "future_data_check": publication_future_data_gate(symbol_payload),
+        "research_signal_contract": publication_research_signal_gate(symbol_payload),
+        "data_completeness_gate": publication_data_completeness_gate(symbol_payload),
+    }
+    gate_statuses = {name: gate["status"] for name, gate in gates.items()}
+    blocked = any(status == "blocked" for status in gate_statuses.values()) or judge_status == "blocked"
+    needs_review = any(status == "needs_review" for status in gate_statuses.values()) or judge_status == "needs_review"
+    decision_value = "blocked" if blocked else "needs_review" if needs_review else "publish"
+    reader_safe_reasons = dedupe_preserve_order(
+        sanitize_list(judge_reasons)
+        + [
+            gate["reader_safe_reason"]
+            for gate in gates.values()
+            if gate["status"] != "pass"
+        ]
+    )[:10]
+    if decision_value == "publish":
+        reader_safe_reasons = ["All publication gates passed with research-only boundary."]
+    elif not reader_safe_reasons:
+        reader_safe_reasons = ["Publication gate requires visible reader review."]
+    decision = {
+        "schema": PUBLICATION_DECISION_SCHEMA,
+        "decision_id": f"{symbol_payload['run_id']}:{symbol_payload['exchange']}:{symbol_payload['symbol']}:publication_decision",
+        "run_id": symbol_payload["run_id"],
+        "symbol": symbol_payload["symbol"],
+        "exchange": symbol_payload["exchange"],
+        "as_of_date": symbol_payload["as_of_date"],
+        "signal_id": sanitize_text(str(signal.get("signal_id") or ""))[:260],
+        "research_signal_hash": sanitize_text(str(signal.get("signal_hash") or symbol_payload.get("research_signal_hash") or ""))[:120],
+        "decision": decision_value,
+        "reader_safe_reasons": reader_safe_reasons,
+        "blocker_type": publication_blocker_type(gates, judge_status, reader_safe_reasons) if decision_value == "blocked" else "",
+        "gates": gates,
+        "publish_with_boundary": decision_value in {"publish", "needs_review"},
+        "evidence_layer": "local checks + smoke evidence",
+        "boundary": "research-only publication decision; not an action instruction",
+    }
+    validate_publication_decision_contract(decision)
+    decision["decision_hash"] = stable_hash({key: value for key, value in decision.items() if key != "decision_hash"})
+    return decision
+
+
 def aggregate_v3_symbol_payload(
     *,
     item: dict[str, str],
@@ -3360,6 +3568,34 @@ def run_symbol_v3(
     judge_status, judge_reasons = judge_symbol_v3(symbol_payload)
     symbol_payload["judge_status"] = judge_status
     symbol_payload["judge_reasons"] = judge_reasons
+    if is_v40_config(config):
+        publication_decision = build_publication_decision(
+            symbol_payload,
+            judge_status=judge_status,
+            judge_reasons=judge_reasons,
+        )
+        symbol_payload["publication_decision"] = publication_decision
+        symbol_payload["publication_decision_hash"] = publication_decision["decision_hash"]
+        symbol_payload["publication_decision_schema"] = PUBLICATION_DECISION_SCHEMA
+        symbol_payload["research_packet_hash"] = stable_hash(
+            {
+                "schema": symbol_payload["schema"],
+                "run_id": config.run_id,
+                "symbol": item["symbol"],
+                "exchange": item["exchange"],
+                "research_task_hash": symbol_payload.get("research_task_hash", ""),
+                "evidence_packet_hash": symbol_payload.get("evidence_packet_hash", ""),
+                "market_data_snapshot_hash": symbol_payload.get("market_data_snapshot_hash", ""),
+                "k_dossier_hash": symbol_payload.get("k_dossier_hash", ""),
+                "agent_hashes": symbol_payload["agent_hashes"],
+                "research_quality_gate_hash": symbol_payload.get("research_quality_gate_hash", ""),
+                "knowledge_gate_hash": symbol_payload.get("knowledge_gate_hash", ""),
+                "research_signal_hash": symbol_payload.get("research_signal_hash", ""),
+                "publication_decision_hash": symbol_payload.get("publication_decision_hash", ""),
+                "research_status": symbol_payload["research_status"],
+                "judge_status": judge_status,
+            }
+        )
     alaya_result = alaya_sync(symbol_payload, alaya_client, config)
     symbol_payload["alaya_sync_status"] = alaya_result["status"]
     symbol_payload["alaya_sync_ref"] = alaya_result.get("event_id", "")
@@ -4255,6 +4491,7 @@ def build_status(
         "research_quality_gate_schema": RESEARCH_QUALITY_GATE_SCHEMA if is_v40_config(config) else None,
         "knowledge_gate_schema": KNOWLEDGE_GATE_SCHEMA if is_v40_config(config) else None,
         "research_signal_schema": RESEARCH_SIGNAL_SCHEMA if is_v40_config(config) else None,
+        "publication_decision_schema": PUBLICATION_DECISION_SCHEMA if is_v40_config(config) else None,
         "daily_reader_schema": DAILY_READER_SCHEMA_V40 if is_v40_config(config) else None,
         "methodology_version": active_methodology,
         "execution_model": active_execution_model,
@@ -4532,6 +4769,7 @@ def render_markdown(status: dict[str, Any], results: list[dict[str, Any]]) -> st
         f"- research_quality_gate_schema: {status.get('research_quality_gate_schema') or 'not_applicable'}",
         f"- knowledge_gate_schema: {status.get('knowledge_gate_schema') or 'not_applicable'}",
         f"- research_signal_schema: {status.get('research_signal_schema') or 'not_applicable'}",
+        f"- publication_decision_schema: {status.get('publication_decision_schema') or 'not_applicable'}",
         f"- daily_reader_schema: {status.get('daily_reader_schema') or 'not_applicable'}",
         f"- methodology_version: {status.get('methodology_version')}",
         f"- execution_model: {status.get('execution_model')}",
@@ -4639,6 +4877,7 @@ def render_markdown(status: dict[str, Any], results: list[dict[str, Any]]) -> st
             )
         if research.get("schema") == SYMBOL_SCHEMA_V40:
             signal = research.get("research_signal") if isinstance(research.get("research_signal"), dict) else {}
+            decision = research.get("publication_decision") if isinstance(research.get("publication_decision"), dict) else {}
             dossier = research.get("k_deep_research_dossier") if isinstance(research.get("k_deep_research_dossier"), dict) else {}
             quality_gate = research.get("research_quality_gate") if isinstance(research.get("research_quality_gate"), dict) else {}
             knowledge_gate = research.get("knowledge_gate") if isinstance(research.get("knowledge_gate"), dict) else {}
@@ -4657,6 +4896,12 @@ def render_markdown(status: dict[str, Any], results: list[dict[str, Any]]) -> st
                     *[f"    - {item}" for item in sanitize_list(signal.get("counter_evidence"))[:8]],
                     "  - uncertainty:",
                     *[f"    - {item}" for item in sanitize_list(signal.get("uncertainty"))[:8]],
+                    "- publication_decision:",
+                    f"  - publication_decision_hash: {research.get('publication_decision_hash', '')}",
+                    f"  - decision: {decision.get('decision', 'not_reported')}",
+                    f"  - blocker_type: {decision.get('blocker_type', '')}",
+                    "  - reader_safe_reasons:",
+                    *[f"    - {item}" for item in sanitize_list(decision.get("reader_safe_reasons"))[:8]],
                     "- k_deep_research_dossier:",
                     f"  - k_dossier_hash: {research.get('k_dossier_hash', '')}",
                     f"  - dossier_summary: {dossier.get('dossier_summary', 'not_reported')}",
@@ -4747,6 +4992,7 @@ def sanitize_private_metadata(payload: dict[str, Any]) -> dict[str, Any]:
         "knowledge_gate_hash",
         "reader_boundary_gate_hash",
         "research_signal_hash",
+        "publication_decision_hash",
         "prompt_hash",
         "research_packet_hash",
         "public_payload_hash",
