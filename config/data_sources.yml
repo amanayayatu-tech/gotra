@@ -57,7 +57,7 @@ providers:
   alpha_vantage:
     display_name: Alpha Vantage free tier
     provider_family: alpha_vantage
-    purpose: Low-frequency fallback for public price or indicator evidence when explicitly configured.
+    purpose: Low-frequency fallback for documented price or indicator observations when explicitly configured.
     source_types:
       - price_data
       - technical_indicator
@@ -89,7 +89,7 @@ providers:
     license_note: Official SEC public access source; requests must identify the application via a compliant User-Agent and observe SEC fair-access guidance.
     rate_limit_note: Maximum 10 requests per second; use local cache and backoff for batch work.
     freshness_note: Filing availability follows SEC publication timestamps and may not align with market close.
-    commercial_use_note: Official filing facts may be cited as public evidence, subject to SEC terms and rate limits.
+    commercial_use_note: Official filing facts may be referenced in research packets, subject to SEC terms and rate limits.
     production_realtime_authorized: false
     allow_as_sole_paid_market_data_source: false
     max_requests_per_second: 10
@@ -124,7 +124,7 @@ providers:
     license_note: Public issuer disclosure source; cite announcement identifiers and publication dates.
     rate_limit_note: Low-frequency disclosure lookup and cache; not a realtime quote service.
     freshness_note: Announcement availability follows HKEX publication timing and may lag trading sessions.
-    commercial_use_note: Disclosure facts may support public evidence packets, but this is not market-data authorization.
+    commercial_use_note: Disclosure facts may support research packets, but this is not market-data authorization.
     production_realtime_authorized: false
     allow_as_sole_paid_market_data_source: false
     public_summary: Official HKEX disclosure facts, not realtime market data.
