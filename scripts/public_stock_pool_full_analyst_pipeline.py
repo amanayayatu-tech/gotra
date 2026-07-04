@@ -43,6 +43,7 @@ from scripts.public_stock_pool_report import (  # noqa: E402
     trading_date_for_exchange,
     yahoo_ticker,
 )
+from gotra.data_sources import provider_public_policy  # noqa: E402
 from gotra.judge_agent.audit_chain import (  # noqa: E402
     append_audit_event,
     read_audit_events,
@@ -1400,6 +1401,7 @@ def build_market_data_snapshot(
     future_data_risk = bool(close_date and (close_date > trading_date or close_date > config.as_of_date))
     if future_data_risk:
         quality_flags.append("future_data_risk")
+    provider_policy = provider_public_policy(MARKET_DATA_PROVIDER)
     snapshot = {
         "schema": MARKET_DATA_SNAPSHOT_SCHEMA,
         "run_id": config.run_id,
@@ -1422,6 +1424,7 @@ def build_market_data_snapshot(
         "previous_price_date": sanitize_text(str(price_row.get("previous_date") or "")),
         "one_session_change_pct": price_row.get("one_session_change_pct") if price_row.get("ok") else None,
         "quality_flags": dedupe_preserve_order(quality_flags),
+        "provider_policy": provider_policy,
         "future_data_risk": future_data_risk,
         "public_safe": True,
     }
