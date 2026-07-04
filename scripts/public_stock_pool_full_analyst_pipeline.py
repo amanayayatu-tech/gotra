@@ -1592,6 +1592,7 @@ def build_evidence_packet(
     research_task: dict[str, Any],
 ) -> dict[str, Any]:
     trading_date = trading_date_for_exchange(item["exchange"], exchange_dates_for_config(config)).isoformat()
+    retrieved_at = utc_now_iso()
     market_data_snapshot = build_market_data_snapshot(item, price_row, config)
     price_status = "fresh" if price_row.get("ok") else "missing"
     evidence_items = [
@@ -1602,6 +1603,7 @@ def build_evidence_packet(
             "source_url_or_id": f"price:{item['exchange']}:{item['symbol']}:{trading_date}",
             "publish_timestamp": str(price_row.get("close_date") or trading_date),
             "availability_date": str(price_row.get("close_date") or trading_date),
+            "retrieved_at": retrieved_at,
             "retrieval_method": "bounded_public_pipeline_context",
             "freshness_status": price_status,
             "summary": json.dumps(public_price_context(price_row), ensure_ascii=False, sort_keys=True),
@@ -1616,6 +1618,7 @@ def build_evidence_packet(
             "source_url_or_id": market_data_snapshot["source_url_or_id"],
             "publish_timestamp": market_data_snapshot["availability_date"],
             "availability_date": market_data_snapshot["availability_date"],
+            "retrieved_at": retrieved_at,
             "retrieval_method": "bounded_public_market_data_snapshot",
             "freshness_status": price_status,
             "summary": json.dumps(
@@ -1642,6 +1645,7 @@ def build_evidence_packet(
             "source_url_or_id": "gotra_public_api.research_universe_items",
             "publish_timestamp": sanitize_text(str(item.get("source_date") or config.as_of_date.isoformat())),
             "availability_date": sanitize_text(str(item.get("source_date") or config.as_of_date.isoformat())),
+            "retrieved_at": retrieved_at,
             "retrieval_method": "local_public_universe_read",
             "freshness_status": "fresh" if item.get("source_date") else "unknown",
             "summary": sanitize_text(str(item.get("purpose") or f"{item['exchange']}:{item['symbol']} public stock-pool candidate."))[:500],
@@ -1662,6 +1666,7 @@ def build_evidence_packet(
                     "source_url_or_id": "/reports/status_full_analyst_evening_hk.json",
                     "publish_timestamp": sanitize_text(str(status.get("finished_at_utc") or status.get("last_heartbeat_utc") or "")),
                     "availability_date": config.as_of_date.isoformat(),
+                    "retrieved_at": retrieved_at,
                     "retrieval_method": "public_static_status_read",
                     "freshness_status": "fresh" if status.get("as_of_date") == config.as_of_date.isoformat() else "stale",
                     "summary": json.dumps(
@@ -1690,6 +1695,7 @@ def build_evidence_packet(
             "source_url_or_id": "gotra_internal_cognition_flywheel_readback",
             "publish_timestamp": config.as_of_date.isoformat(),
             "availability_date": config.as_of_date.isoformat(),
+            "retrieved_at": retrieved_at,
             "retrieval_method": "internal_public_safe_summary",
             "freshness_status": "unknown",
             "summary": "; ".join(prior_questions[:4]),
@@ -1723,14 +1729,53 @@ def build_evidence_packet(
         f"missing required {source['source_type']}: {source['purpose']}"
         for source in missing_required_sources
     )
+    sources = [
+        {
+            "source_id": str(source["evidence_id"]),
+            "source_type": str(source["source_type"]),
+            "source_name": str(source["source_name"]),
+            "source_url_or_id": str(source["source_url_or_id"]),
+            "retrieved_at": str(source["retrieved_at"]),
+            "publish_timestamp": str(source["publish_timestamp"]),
+            "availability_date": str(source["availability_date"]),
+            "market": item["exchange"],
+            "freshness_status": str(source["freshness_status"]),
+            "usage_limitations": sanitize_list(source.get("limitations")),
+            "public_safe": bool(source.get("public_safe")),
+        }
+        for source in evidence_items
+    ]
+    missing_items = [
+        {
+            "item_type": str(source["source_type"]),
+            "purpose": str(source["purpose"]),
+            "reason": str(source["reason"]),
+        }
+        for source in missing_required_sources
+    ]
+    missing_items.extend(
+        {"item_type": "data_gap", "purpose": str(gap), "reason": "recorded_data_gap"}
+        for gap in dedupe_preserve_order(data_gaps)[:12]
+    )
+    future_data_check = not bool(market_data_snapshot["future_data_risk"])
     packet = {
         "schema": evidence_packet_schema_for_config(config),
+        "packet_id": f"{config.run_id}:{item['exchange']}:{item['symbol']}:evidence_packet",
         "run_id": config.run_id,
         "symbol": item["symbol"],
         "exchange": item["exchange"],
         "provider_ticker": item["provider_ticker"],
+        "as_of": config.as_of_date.isoformat(),
         "as_of_date": config.as_of_date.isoformat(),
         "task_hash": research_task["task_hash"],
+        "sources": sources,
+        "missing_items": missing_items,
+        "future_data_check": future_data_check,
+        "future_data_check_details": {
+            "passed": future_data_check,
+            "market_data_snapshot_hash": market_data_snapshot["snapshot_hash"],
+            "quality_flags": market_data_snapshot["quality_flags"],
+        },
         "market_data_snapshot": market_data_snapshot,
         "market_data_snapshot_hash": market_data_snapshot["snapshot_hash"],
         "evidence_items": evidence_items,
@@ -1739,9 +1784,29 @@ def build_evidence_packet(
         "data_gaps": dedupe_preserve_order(data_gaps)[:12],
         "prior_alaya_readback": {"unresolved_questions": prior_questions[:6], "source": "gotra_internal_cognition_flywheel"},
     }
+    validate_evidence_packet_contract(packet)
     packet["evidence_packet_hash"] = stable_hash({key: value for key, value in packet.items() if key != "evidence_packet_hash"})
     assert_public_safe(packet)
     return packet
+
+
+def validate_evidence_packet_contract(packet: dict[str, Any]) -> None:
+    required = ("packet_id", "symbol", "as_of", "sources", "missing_items", "future_data_check")
+    missing = [field for field in required if field not in packet]
+    if missing:
+        raise ValueError(f"evidence_packet_missing_required_fields:{','.join(missing)}")
+    if not isinstance(packet["sources"], list) or not packet["sources"]:
+        raise ValueError("evidence_packet_sources_empty")
+    for index, source in enumerate(packet["sources"]):
+        if not isinstance(source, dict):
+            raise ValueError(f"evidence_packet_source_not_object:{index}")
+        for field in ("source_id", "source_type", "source_name", "source_url_or_id", "retrieved_at"):
+            if not source.get(field):
+                raise ValueError(f"evidence_packet_source_missing_{field}:{index}")
+    if not isinstance(packet["missing_items"], list):
+        raise ValueError("evidence_packet_missing_items_not_list")
+    if not isinstance(packet["future_data_check"], bool):
+        raise ValueError("evidence_packet_future_data_check_not_bool")
 
 
 def build_k_dossier_prompt(
@@ -2894,13 +2959,21 @@ def dedupe_preserve_order(values: list[str]) -> list[str]:
 def judge_symbol_v3(symbol_payload: dict[str, Any]) -> tuple[str, list[str]]:
     assert_public_safe(symbol_payload)
     market_data_snapshot = symbol_payload.get("market_data_snapshot") if isinstance(symbol_payload.get("market_data_snapshot"), dict) else {}
-    if market_data_snapshot.get("future_data_risk"):
+    if symbol_payload.get("schema") != SYMBOL_SCHEMA_V40 and market_data_snapshot.get("future_data_risk"):
         return "blocked", ["market data snapshot reports future_data_risk"]
     statuses = agent_statuses(symbol_payload)
     failed_agents = [agent_id for agent_id, status in statuses.items() if status == "failed"]
     if failed_agents:
         return "blocked", [f"independent agent failure: {','.join(failed_agents)}"]
     if symbol_payload.get("schema") == SYMBOL_SCHEMA_V40:
+        evidence_packet = symbol_payload.get("evidence_packet") if isinstance(symbol_payload.get("evidence_packet"), dict) else {}
+        if not evidence_packet:
+            return "blocked", ["missing EvidencePacket; no public judgment may be generated"]
+        validate_evidence_packet_contract(evidence_packet)
+        if evidence_packet.get("future_data_check") is False:
+            return "blocked", ["evidence packet future_data_check failed"]
+        if market_data_snapshot.get("future_data_risk"):
+            return "blocked", ["market data snapshot reports future_data_risk"]
         gate = symbol_payload.get("research_quality_gate") if isinstance(symbol_payload.get("research_quality_gate"), dict) else {}
         if gate.get("engineering_blocker") or gate.get("quality_verdict") == "blocked":
             return "blocked", ["v4 research quality gate reported an engineering blocker"]
