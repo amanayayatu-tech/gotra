@@ -36,6 +36,7 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     METHODOLOGY_VERSION_V40,
     MockAlayaSyncClient,
     PERSPECTIVE_AGENT_SCHEMA_V4,
+    PUBLICATION_DECISION_SCHEMA,
     PROMPT_TEMPLATE_VERSION,
     PROMPT_TEMPLATE_VERSION_V3,
     PROMPT_TEMPLATE_VERSION_V35,
@@ -64,6 +65,7 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     update_loop_public_status,
     v3_agent_failure_record,
     validate_evidence_packet_contract,
+    validate_publication_decision_contract,
     validate_research_signal_contract,
 )
 
@@ -1200,6 +1202,14 @@ def test_v40_fixture_run_builds_k_first_gates_and_alaya_hash_readback(tmp_path: 
     assert symbol_payload["research_signal"]["uncertainty"]
     assert symbol_payload["research_signal"]["window_days"] == 30
     assert symbol_payload["research_signal"]["review_due_at"] == "2026-07-29"
+    validate_publication_decision_contract(symbol_payload["publication_decision"])
+    assert symbol_payload["publication_decision"]["schema"] == PUBLICATION_DECISION_SCHEMA
+    assert symbol_payload["publication_decision"]["signal_id"] == symbol_payload["research_signal"]["signal_id"]
+    assert symbol_payload["publication_decision"]["research_signal_hash"] == symbol_payload["research_signal_hash"]
+    assert symbol_payload["publication_decision"]["decision"] == "needs_review"
+    assert symbol_payload["publication_decision"]["reader_safe_reasons"]
+    assert symbol_payload["publication_decision_hash"] == symbol_payload["publication_decision"]["decision_hash"]
+    assert symbol_payload["publication_decision_schema"] == PUBLICATION_DECISION_SCHEMA
     assert set(symbol_payload["agent_research_signals"]) == set(symbol_payload["agent_outputs"])
     assert set(symbol_payload["agent_research_signal_hashes"]) == set(symbol_payload["agent_outputs"])
     for agent_id, signal in symbol_payload["agent_research_signals"].items():
@@ -1247,6 +1257,8 @@ def test_v40_fixture_run_builds_k_first_gates_and_alaya_hash_readback(tmp_path: 
     assert records[0]["knowledge_gate_hash"] == symbol_payload["knowledge_gate_hash"]
     assert records[0]["research_signal_hash"] == symbol_payload["research_signal_hash"]
     assert records[0]["public_payload"]["research_signal"]["signal_hash"] == symbol_payload["research_signal_hash"]
+    assert records[0]["publication_decision_hash"] == symbol_payload["publication_decision_hash"]
+    assert records[0]["public_payload"]["publication_decision"]["decision_hash"] == symbol_payload["publication_decision_hash"]
     assert records[0]["public_payload_hash"] == symbol_payload["public_payload_hash"]
     assert records[0]["knowledge_persistence"] == symbol_payload["knowledge_persistence"]
     assert records[0]["unresolved_questions"] == symbol_payload["unresolved_questions"]
@@ -1297,6 +1309,11 @@ def test_v40_market_data_snapshot_future_data_risk_blocks_publication(tmp_path: 
     assert "future_data_risk" in symbol_payload["market_data_snapshot"]["quality_flags"]
     assert symbol_payload["judge_status"] == "blocked"
     assert "future_data_check" in " ".join(symbol_payload["judge_reasons"])
+    validate_publication_decision_contract(symbol_payload["publication_decision"])
+    assert symbol_payload["publication_decision"]["decision"] == "blocked"
+    assert symbol_payload["publication_decision"]["blocker_type"] == "future_data"
+    assert symbol_payload["publication_decision"]["gates"]["future_data_check"]["status"] == "blocked"
+    assert symbol_payload["publication_decision_hash"] == symbol_payload["publication_decision"]["decision_hash"]
 
 
 def valid_research_signal() -> dict[str, object]:
@@ -1326,6 +1343,47 @@ def valid_research_signal() -> dict[str, object]:
     }
 
 
+def valid_publication_decision() -> dict[str, object]:
+    return {
+        "schema": PUBLICATION_DECISION_SCHEMA,
+        "decision_id": "run:HKEX:0700:publication_decision",
+        "run_id": "run",
+        "symbol": "0700",
+        "exchange": "HKEX",
+        "as_of_date": "2026-06-29",
+        "signal_id": "run:HKEX:0700:symbol:research_signal",
+        "research_signal_hash": "signal-hash",
+        "decision": "needs_review",
+        "reader_safe_reasons": ["Research quality gate requires visible review items."],
+        "blocker_type": "",
+        "gates": {
+            "public_safety_scan": {
+                "gate": "public_safety_scan",
+                "status": "pass",
+                "reader_safe_reason": "public safety scan passed",
+            },
+            "secret_scan": {
+                "gate": "secret_scan",
+                "status": "pass",
+                "reader_safe_reason": "no secret marker detected",
+            },
+            "forbidden_wording_scan": {
+                "gate": "forbidden_wording_scan",
+                "status": "pass",
+                "reader_safe_reason": "no restricted wording detected",
+            },
+            "research_signal_contract": {
+                "gate": "research_signal_contract",
+                "status": "pass",
+                "reader_safe_reason": "ResearchSignal contract passed",
+            },
+        },
+        "publish_with_boundary": True,
+        "evidence_layer": "local checks + smoke evidence",
+        "boundary": "research-only publication decision; not an action instruction",
+    }
+
+
 def test_research_signal_contract_blocks_missing_required_field() -> None:
     signal = valid_research_signal()
     signal.pop("review_due_at")
@@ -1348,6 +1406,35 @@ def test_research_signal_contract_blocks_compliance_wording() -> None:
 
     with pytest.raises(ValueError, match="BLOCKED: 合规禁词"):
         validate_research_signal_contract(signal)
+
+
+def test_publication_decision_contract_blocks_needs_review_without_reason() -> None:
+    decision = valid_publication_decision()
+    decision["reader_safe_reasons"] = []
+
+    with pytest.raises(ValueError, match="publication_decision_missing_reader_safe_reasons"):
+        validate_publication_decision_contract(decision)
+
+
+def test_publication_decision_contract_blocks_blocked_without_type() -> None:
+    decision = valid_publication_decision()
+    decision["decision"] = "blocked"
+    decision["reader_safe_reasons"] = ["A publication gate blocked the item."]
+    decision["blocker_type"] = ""
+
+    with pytest.raises(ValueError, match="publication_decision_missing_blocker_type"):
+        validate_publication_decision_contract(decision)
+
+
+def test_publication_decision_contract_blocks_publish_with_failed_gate() -> None:
+    decision = valid_publication_decision()
+    decision["decision"] = "publish"
+    decision["reader_safe_reasons"] = ["All publication gates passed with research-only boundary."]
+    decision["gates"]["forbidden_wording_scan"]["status"] = "blocked"  # type: ignore[index]
+    decision["gates"]["forbidden_wording_scan"]["reader_safe_reason"] = "[BLOCKED: 合规禁词] wording gate failed"  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="publication_decision_publish_with_failed_gates"):
+        validate_publication_decision_contract(decision)
 
 
 def test_v40_requested_can_explicitly_fallback_to_v2() -> None:
