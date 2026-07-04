@@ -72,6 +72,8 @@ RESEARCH_QUALITY_GATE_SCHEMA = "gotra.full_analyst.research_quality_gate.v1"
 KNOWLEDGE_GATE_SCHEMA = "gotra.cognition_flywheel.knowledge_gate.v1"
 RESEARCH_SIGNAL_SCHEMA = "gotra.research_signal.v1"
 PUBLICATION_DECISION_SCHEMA = "gotra.publication_decision.v1"
+LEDGER_ENTRY_SCHEMA = "gotra.ledger_entry.v1"
+LEDGER_MANIFEST_SCHEMA = "gotra.public_research_ledger.v1"
 METHODOLOGY_VERSION = "ksana_4_1_lite"
 METHODOLOGY_VERSION_V3 = "ksana_4_1_independent_agents"
 METHODOLOGY_VERSION_V35 = "ksana_4_1_research_task_evidence_agents"
@@ -3160,6 +3162,259 @@ def build_publication_decision(
     return decision
 
 
+def ledger_base_entry_id(symbol_payload: dict[str, Any]) -> str:
+    signal = symbol_payload.get("research_signal") if isinstance(symbol_payload.get("research_signal"), dict) else {}
+    window_days = int(signal.get("window_days") or 0)
+    return ":".join(
+        [
+            "gotra",
+            "ledger",
+            sanitize_text(str(symbol_payload.get("exchange") or "")),
+            sanitize_text(str(symbol_payload.get("symbol") or "")),
+            sanitize_text(str(symbol_payload.get("as_of_date") or "")),
+            str(window_days),
+        ]
+    )
+
+
+def ledger_entry_hash_basis(entry: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in entry.items() if key != "hash"}
+
+
+def validate_ledger_entry_contract(entry: dict[str, Any]) -> None:
+    required = (
+        "schema",
+        "entry_id",
+        "base_entry_id",
+        "version",
+        "signal_id",
+        "published_at",
+        "window_days",
+        "review_due_at",
+        "hash",
+        "previous_hash",
+        "status",
+        "symbol",
+        "exchange",
+        "research_signal_hash",
+        "publication_decision_hash",
+        "evidence_packet_hash",
+    )
+    missing = [field for field in required if field not in entry]
+    if missing:
+        raise ValueError(f"ledger_entry_missing_required_fields:{','.join(missing)}")
+    if entry.get("schema") != LEDGER_ENTRY_SCHEMA:
+        raise ValueError("ledger_entry_invalid_schema")
+    if not sanitize_text(str(entry.get("entry_id") or "")):
+        raise ValueError("ledger_entry_missing_entry_id")
+    if not sanitize_text(str(entry.get("signal_id") or "")):
+        raise ValueError("ledger_entry_missing_signal_id")
+    if entry.get("status") not in {"publish", "needs_review", "blocked"}:
+        raise ValueError("ledger_entry_invalid_status")
+    if not isinstance(entry.get("version"), int) or int(entry["version"]) <= 0:
+        raise ValueError("ledger_entry_invalid_version")
+    if not isinstance(entry.get("window_days"), int) or int(entry["window_days"]) <= 0:
+        raise ValueError("ledger_entry_invalid_window_days")
+    try:
+        datetime.fromisoformat(str(entry.get("published_at") or "").replace("Z", "+00:00"))
+        date.fromisoformat(str(entry.get("review_due_at") or ""))
+    except ValueError as exc:
+        raise ValueError("ledger_entry_invalid_dates") from exc
+    if not re.fullmatch(r"[0-9a-f]{64}", str(entry.get("previous_hash") or "")):
+        raise ValueError("ledger_entry_invalid_previous_hash")
+    expected_hash = stable_hash(ledger_entry_hash_basis(entry))
+    if entry.get("hash") != expected_hash:
+        raise ValueError("ledger_entry_hash_mismatch")
+    assert_public_safe(entry)
+
+
+def build_ledger_entry(
+    symbol_payload: dict[str, Any],
+    *,
+    previous_hash: str,
+    version: int,
+    published_at: str,
+    previous_version_hash: str = "",
+) -> dict[str, Any]:
+    signal = symbol_payload.get("research_signal") if isinstance(symbol_payload.get("research_signal"), dict) else {}
+    decision = symbol_payload.get("publication_decision") if isinstance(symbol_payload.get("publication_decision"), dict) else {}
+    packet = symbol_payload.get("evidence_packet") if isinstance(symbol_payload.get("evidence_packet"), dict) else {}
+    base_entry_id = ledger_base_entry_id(symbol_payload)
+    entry = {
+        "schema": LEDGER_ENTRY_SCHEMA,
+        "entry_id": f"{base_entry_id}:v{version}",
+        "base_entry_id": base_entry_id,
+        "version": version,
+        "previous_version_hash": sanitize_text(previous_version_hash)[:120],
+        "signal_id": sanitize_text(str(signal.get("signal_id") or decision.get("signal_id") or ""))[:260],
+        "published_at": sanitize_text(published_at)[:80],
+        "as_of_date": sanitize_text(str(symbol_payload.get("as_of_date") or signal.get("as_of_date") or ""))[:40],
+        "window_days": int(signal.get("window_days") or 0),
+        "review_due_at": sanitize_text(str(signal.get("review_due_at") or ""))[:40],
+        "status": sanitize_text(str(decision.get("decision") or "needs_review"))[:40],
+        "symbol": sanitize_text(str(symbol_payload.get("symbol") or signal.get("symbol") or ""))[:80],
+        "exchange": sanitize_text(str(symbol_payload.get("exchange") or signal.get("exchange") or ""))[:40],
+        "provider_ticker": sanitize_text(str(symbol_payload.get("provider_ticker") or signal.get("provider_ticker") or ""))[:80],
+        "research_status": sanitize_text(str(symbol_payload.get("research_status") or signal.get("research_status") or ""))[:80],
+        "methodology_version": sanitize_text(str(symbol_payload.get("methodology_version") or METHODOLOGY_VERSION_V40))[:120],
+        "execution_model": sanitize_text(str(symbol_payload.get("execution_model") or EXECUTION_MODEL_V40))[:120],
+        "research_signal_hash": sanitize_text(str(symbol_payload.get("research_signal_hash") or signal.get("signal_hash") or ""))[:120],
+        "publication_decision_hash": sanitize_text(str(symbol_payload.get("publication_decision_hash") or decision.get("decision_hash") or ""))[:120],
+        "evidence_packet_hash": sanitize_text(str(symbol_payload.get("evidence_packet_hash") or packet.get("evidence_packet_hash") or ""))[:120],
+        "evidence_packet_link": f"/reports/symbols/{symbol_payload.get('exchange')}_{symbol_payload.get('symbol')}.json#audit-evidence-packet",
+        "publication_decision": {
+            "decision": decision.get("decision"),
+            "reader_safe_reasons": sanitize_list(decision.get("reader_safe_reasons")),
+            "publish_with_boundary": bool(decision.get("publish_with_boundary")),
+            "gates": decision.get("gates") if isinstance(decision.get("gates"), dict) else {},
+        },
+        "research_signal": {
+            "hypothesis": signal.get("hypothesis"),
+            "confidence": signal.get("confidence"),
+            "evidence_ids": sanitize_list(signal.get("evidence_ids")),
+            "counter_evidence": sanitize_list(signal.get("counter_evidence")),
+            "uncertainty": sanitize_list(signal.get("uncertainty")),
+            "boundary": signal.get("boundary"),
+        },
+        "boundary": "research ledger entry only; not investment advice, not a trading signal, not performance proof",
+        "previous_hash": previous_hash,
+    }
+    entry["hash"] = stable_hash(ledger_entry_hash_basis(entry))
+    validate_ledger_entry_contract(entry)
+    return entry
+
+
+def verify_ledger_chain(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    previous_hash = "0" * 64
+    for index, entry in enumerate(entries):
+        try:
+            validate_ledger_entry_contract(entry)
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "reason": str(exc),
+                "entry_index": index,
+                "entry_id": entry.get("entry_id"),
+            }
+        if entry.get("previous_hash") != previous_hash:
+            return {
+                "ok": False,
+                "reason": "ledger_previous_hash_mismatch",
+                "entry_index": index,
+                "entry_id": entry.get("entry_id"),
+                "expected_previous_hash": previous_hash,
+                "actual_previous_hash": entry.get("previous_hash"),
+            }
+        previous_hash = str(entry.get("hash") or "")
+    return {
+        "ok": True,
+        "entry_count": len(entries),
+        "latest_hash": previous_hash,
+    }
+
+
+def load_existing_research_ledger(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    entries = payload.get("entries") if isinstance(payload, dict) else []
+    if not isinstance(entries, list):
+        return []
+    chain = verify_ledger_chain([entry for entry in entries if isinstance(entry, dict)])
+    return [entry for entry in entries if isinstance(entry, dict)] if chain.get("ok") else []
+
+
+def merge_research_ledger(
+    existing_entries: list[dict[str, Any]],
+    symbol_payloads: list[dict[str, Any]],
+    *,
+    generated_at: str,
+) -> dict[str, Any]:
+    entries = list(existing_entries)
+    previous_hash = entries[-1]["hash"] if entries else "0" * 64
+    by_base: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        by_base.setdefault(str(entry.get("base_entry_id") or ""), []).append(entry)
+
+    appended = 0
+    for payload in sorted(symbol_payloads, key=lambda item: (str(item.get("exchange")), str(item.get("symbol")))):
+        decision = payload.get("publication_decision") if isinstance(payload.get("publication_decision"), dict) else {}
+        signal = payload.get("research_signal") if isinstance(payload.get("research_signal"), dict) else {}
+        if decision.get("decision") != "publish" or not signal:
+            continue
+        base_entry_id = ledger_base_entry_id(payload)
+        versions = sorted(by_base.get(base_entry_id, []), key=lambda entry: int(entry.get("version") or 0))
+        previous_version_hash = str(versions[-1].get("hash") or "") if versions else ""
+        version = int(versions[-1].get("version") or 0) + 1 if versions else 1
+        candidate = build_ledger_entry(
+            payload,
+            previous_hash=previous_hash,
+            version=version,
+            published_at=generated_at,
+            previous_version_hash=previous_version_hash,
+        )
+        candidate_identity = {
+            key: value
+            for key, value in ledger_entry_hash_basis(candidate).items()
+            if key not in {"previous_hash", "previous_version_hash", "version", "entry_id", "published_at"}
+        }
+        duplicate = any(
+            {
+                key: value
+                for key, value in ledger_entry_hash_basis(entry).items()
+                if key not in {"previous_hash", "previous_version_hash", "version", "entry_id", "published_at"}
+            }
+            == candidate_identity
+            for entry in versions
+        )
+        if duplicate:
+            continue
+        entries.append(candidate)
+        by_base.setdefault(base_entry_id, []).append(candidate)
+        previous_hash = candidate["hash"]
+        appended += 1
+
+    integrity = verify_ledger_chain(entries)
+    manifest = {
+        "schema": LEDGER_MANIFEST_SCHEMA,
+        "generated_at": generated_at,
+        "entry_count": len(entries),
+        "appended_count": appended,
+        "integrity": integrity,
+        "query_fields": ["symbol", "as_of_date", "window_days", "status"],
+        "boundary": "append-only public research ledger; research information only; not investment advice or trading signal",
+        "entries": entries,
+    }
+    assert_public_safe(manifest)
+    return manifest
+
+
+def write_research_ledger(
+    config: FullAnalystConfig,
+    *,
+    symbol_payloads: list[dict[str, Any]],
+    status: dict[str, Any],
+) -> dict[str, Any]:
+    ledger_name = "research_ledger.json"
+    output_path = config.output_dir / ledger_name
+    existing_path = config.static_dir / ledger_name if config.publish_static and (config.static_dir / ledger_name).exists() else output_path
+    generated_at = sanitize_text(str(status.get("finished_at_utc") or utc_now_iso()))
+    existing_entries = load_existing_research_ledger(existing_path)
+    manifest = merge_research_ledger(existing_entries, symbol_payloads, generated_at=generated_at)
+    write_public_json(output_path, manifest)
+    return {
+        "path": output_path,
+        "file": ledger_name,
+        "schema": manifest["schema"],
+        "entry_count": manifest["entry_count"],
+        "appended_count": manifest["appended_count"],
+        "integrity": manifest["integrity"],
+    }
+
+
 def aggregate_v3_symbol_payload(
     *,
     item: dict[str, str],
@@ -4675,6 +4930,15 @@ def write_outputs(config: FullAnalystConfig, results: list[dict[str, Any]], stat
     (config.output_dir / "symbols").mkdir(parents=True, exist_ok=True)
     report_path, status_path = report_paths(config)
     symbol_payloads = [row["research"] for row in results if row.get("research")]
+    ledger_result: dict[str, Any] | None = None
+    if is_v40_config(config):
+        ledger_result = write_research_ledger(config, symbol_payloads=symbol_payloads, status=status)
+        status["ledger_schema"] = ledger_result["schema"]
+        status["ledger_file"] = ledger_result["file"]
+        status["ledger_entry_count"] = ledger_result["entry_count"]
+        status["ledger_appended_count"] = ledger_result["appended_count"]
+        status["ledger_integrity_status"] = "ok" if ledger_result["integrity"].get("ok") else "failed"
+        status["ledger_latest_hash"] = ledger_result["integrity"].get("latest_hash", "")
     scan_public_artifacts(status=status, results=results, symbol_payloads=symbol_payloads)
     for row in results:
         if row.get("research"):
@@ -4684,8 +4948,11 @@ def write_outputs(config: FullAnalystConfig, results: list[dict[str, Any]], stat
     write_public_text(report_path, markdown)
     write_public_json(status_path, status)
     if config.publish_static:
-        publish_static(report_path, status_path, config.static_dir)
-    return {"report_path": str(report_path.resolve()), "status_path": str(status_path.resolve())}
+        publish_static(report_path, status_path, config.static_dir, ledger_path=ledger_result["path"] if ledger_result else None)
+    paths = {"report_path": str(report_path.resolve()), "status_path": str(status_path.resolve())}
+    if ledger_result:
+        paths["ledger_path"] = str(ledger_result["path"].resolve())
+    return paths
 
 
 def write_public_text(path: Path, text: str) -> None:
@@ -4715,9 +4982,12 @@ def scan_public_text(text: str) -> None:
         raise PublicScanError(public_safe_failure_category(str(exc))) from exc
 
 
-def publish_static(report_path: Path, status_path: Path, static_dir: Path) -> None:
+def publish_static(report_path: Path, status_path: Path, static_dir: Path, *, ledger_path: Path | None = None) -> None:
     static_dir.mkdir(parents=True, exist_ok=True)
-    for path in (report_path, status_path):
+    paths = [report_path, status_path]
+    if ledger_path is not None:
+        paths.append(ledger_path)
+    for path in paths:
         target = static_dir / path.name
         shutil.copy2(path, target)
         target.chmod(0o644)

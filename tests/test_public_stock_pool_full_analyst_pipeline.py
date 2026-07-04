@@ -29,6 +29,8 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     GotraInternalAlayaSyncClient,
     K_DOSSIER_SCHEMA,
     KNOWLEDGE_GATE_SCHEMA,
+    LEDGER_ENTRY_SCHEMA,
+    LEDGER_MANIFEST_SCHEMA,
     MARKET_DATA_SNAPSHOT_SCHEMA,
     METHODOLOGY_VERSION,
     METHODOLOGY_VERSION_V3,
@@ -52,6 +54,7 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     SYMBOL_SCHEMA_V40,
     assert_public_safe,
     build_prompt,
+    build_ledger_entry,
     config_from_args,
     fixture_k_dossier_output,
     fixture_research_task_output,
@@ -65,8 +68,11 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     update_loop_public_status,
     v3_agent_failure_record,
     validate_evidence_packet_contract,
+    merge_research_ledger,
     validate_publication_decision_contract,
+    validate_ledger_entry_contract,
     validate_research_signal_contract,
+    verify_ledger_chain,
 )
 
 
@@ -1382,6 +1388,103 @@ def valid_publication_decision() -> dict[str, object]:
         "evidence_layer": "local checks + smoke evidence",
         "boundary": "research-only publication decision; not an action instruction",
     }
+
+
+def valid_published_symbol_payload() -> dict[str, object]:
+    signal = valid_research_signal()
+    decision = valid_publication_decision()
+    decision["decision"] = "publish"
+    decision["reader_safe_reasons"] = ["All publication gates passed with research-only boundary."]
+    decision["publish_with_boundary"] = True
+    decision["decision_hash"] = "decision-hash"
+    return {
+        "schema": SYMBOL_SCHEMA_V40,
+        "run_id": "run",
+        "symbol": "0700",
+        "exchange": "HKEX",
+        "provider_ticker": "0700.HK",
+        "as_of_date": "2026-06-29",
+        "methodology_version": METHODOLOGY_VERSION_V40,
+        "execution_model": EXECUTION_MODEL_V40,
+        "research_status": "candidate",
+        "evidence_packet_hash": "evidence-hash",
+        "research_signal": signal,
+        "research_signal_hash": signal["signal_hash"],
+        "publication_decision": decision,
+        "publication_decision_hash": decision["decision_hash"],
+        "evidence_packet": {
+            "schema": EVIDENCE_PACKET_SCHEMA_V2,
+            "packet_id": "run:HKEX:0700:evidence_packet",
+            "evidence_packet_hash": "evidence-hash",
+            "evidence_items": [
+                {
+                    "evidence_id": "market_data_snapshot",
+                    "source_type": "price_data",
+                    "public_safe": True,
+                }
+            ],
+        },
+    }
+
+
+def test_ledger_entry_contract_and_hash_chain() -> None:
+    entry = build_ledger_entry(
+        valid_published_symbol_payload(),
+        previous_hash="0" * 64,
+        version=1,
+        published_at="2026-06-29T10:00:00+00:00",
+    )
+
+    assert entry["schema"] == LEDGER_ENTRY_SCHEMA
+    assert entry["entry_id"].endswith(":v1")
+    assert entry["signal_id"] == "run:HKEX:0700:symbol:research_signal"
+    assert entry["status"] == "publish"
+    assert entry["previous_hash"] == "0" * 64
+    validate_ledger_entry_contract(entry)
+    assert verify_ledger_chain([entry])["ok"] is True
+
+
+def test_research_ledger_update_appends_version_without_overwrite() -> None:
+    payload = valid_published_symbol_payload()
+    first = merge_research_ledger([], [payload], generated_at="2026-06-29T10:00:00+00:00")
+    assert first["schema"] == LEDGER_MANIFEST_SCHEMA
+    assert first["entry_count"] == 1
+    assert first["appended_count"] == 1
+
+    updated = valid_published_symbol_payload()
+    updated["research_signal"] = {
+        **updated["research_signal"],  # type: ignore[arg-type]
+        "hypothesis": "Updated public research state remains bounded by the same evidence chain.",
+        "signal_hash": "signal-hash-v2",
+    }
+    updated["research_signal_hash"] = "signal-hash-v2"
+    updated["publication_decision"] = {
+        **updated["publication_decision"],  # type: ignore[arg-type]
+        "research_signal_hash": "signal-hash-v2",
+        "decision_hash": "decision-hash-v2",
+    }
+    updated["publication_decision_hash"] = "decision-hash-v2"
+    second = merge_research_ledger(first["entries"], [updated], generated_at="2026-06-29T11:00:00+00:00")
+
+    assert second["entry_count"] == 2
+    assert second["appended_count"] == 1
+    assert second["entries"][0]["version"] == 1
+    assert second["entries"][1]["version"] == 2
+    assert second["entries"][1]["previous_hash"] == second["entries"][0]["hash"]
+    assert second["entries"][1]["previous_version_hash"] == second["entries"][0]["hash"]
+    assert second["integrity"]["ok"] is True
+
+
+def test_research_ledger_integrity_detects_tampering() -> None:
+    payload = valid_published_symbol_payload()
+    manifest = merge_research_ledger([], [payload], generated_at="2026-06-29T10:00:00+00:00")
+    tampered = [dict(manifest["entries"][0])]
+    tampered[0]["previous_hash"] = "1" * 64
+
+    integrity = verify_ledger_chain(tampered)
+
+    assert integrity["ok"] is False
+    assert integrity["reason"] in {"ledger_entry_hash_mismatch", "ledger_previous_hash_mismatch"}
 
 
 def test_research_signal_contract_blocks_missing_required_field() -> None:
