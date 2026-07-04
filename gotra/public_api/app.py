@@ -29,6 +29,8 @@ DEFAULT_REPORTS_DIR = Path("/var/www/gotra-public-ledger/reports")
 LEDGER_FILE_NAME = "research_ledger.json"
 LEDGER_MANIFEST_SCHEMA = "gotra.public_research_ledger.v1"
 LEDGER_ENTRY_SCHEMA = "gotra.ledger_entry.v1"
+REVIEW_RESULT_SCHEMA = "gotra.review_result.v1"
+REVIEW_UNAVAILABLE_REASON_SCHEMA = "gotra.review_unavailable_reason.v1"
 
 HKEX_SYMBOLS = (
     "0068",
@@ -274,6 +276,45 @@ def public_ledger_entries(payload: dict[str, object]) -> list[dict[str, object]]
     return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
 
 
+def public_ledger_review_results(payload: dict[str, object]) -> list[dict[str, object]]:
+    results = payload.get("review_results")
+    return [result for result in results if isinstance(result, dict)] if isinstance(results, list) else []
+
+
+def public_ledger_review_unavailable(payload: dict[str, object]) -> list[dict[str, object]]:
+    reasons = payload.get("review_unavailable")
+    return [reason for reason in reasons if isinstance(reason, dict)] if isinstance(reasons, list) else []
+
+
+def public_ledger_review_coverage(payload: dict[str, object]) -> dict[str, object]:
+    coverage = payload.get("review_coverage")
+    if isinstance(coverage, dict):
+        return coverage
+    entries = public_ledger_entries(payload)
+    return {
+        "supported_windows_days": [1, 7, 30, 90],
+        "total_count": len(entries),
+        "due_count": 0,
+        "reviewed_count": 0,
+        "not_due_count": len(entries),
+        "unavailable_count": 0,
+        "missing_due_entry_ids": [],
+        "by_window_days": [],
+        "boundary": "review coverage is unavailable in this legacy manifest; not performance proof",
+    }
+
+
+def review_status_for_entry(entry: dict[str, object], payload: dict[str, object]) -> dict[str, object]:
+    entry_id = str(entry.get("entry_id") or "")
+    for result in public_ledger_review_results(payload):
+        if result.get("entry_id") == entry_id:
+            return {"review_status": "reviewed", "review_result": result, "review_unavailable_reason": None}
+    for reason in public_ledger_review_unavailable(payload):
+        if reason.get("entry_id") == entry_id:
+            return {"review_status": "review_unavailable", "review_result": None, "review_unavailable_reason": reason}
+    return {"review_status": "not_due", "review_result": None, "review_unavailable_reason": None}
+
+
 app = FastAPI(
     title="GOTRA Public API",
     description="Public-safe read-only API adapter for GOTRA public surfaces.",
@@ -375,6 +416,30 @@ def track_record(
     }
 
 
+@app.get("/api/track-record/review-coverage", response_model=None)
+def track_record_review_coverage():
+    payload = load_public_research_ledger()
+    integrity = verify_public_research_ledger(payload)
+    if not integrity.get("ok"):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": "integrity_error",
+                "integrity": integrity,
+                "boundary": BOUNDARY,
+            },
+        )
+    return {
+        "ok": True,
+        "schema": payload.get("schema"),
+        "generated_at": payload.get("generated_at"),
+        "integrity": integrity,
+        "review_coverage": public_ledger_review_coverage(payload),
+        "boundary": BOUNDARY,
+    }
+
+
 @app.get("/api/track-record/{entry_id}", response_model=None)
 def track_record_entry(entry_id: str):
     payload = load_public_research_ledger()
@@ -400,6 +465,7 @@ def track_record_entry(entry_id: str):
                 "ok": True,
                 "entry": entry,
                 "version_chain": versions,
+                **review_status_for_entry(entry, payload),
                 "integrity": integrity,
                 "boundary": BOUNDARY,
             }

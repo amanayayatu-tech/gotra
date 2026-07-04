@@ -74,6 +74,9 @@ RESEARCH_SIGNAL_SCHEMA = "gotra.research_signal.v1"
 PUBLICATION_DECISION_SCHEMA = "gotra.publication_decision.v1"
 LEDGER_ENTRY_SCHEMA = "gotra.ledger_entry.v1"
 LEDGER_MANIFEST_SCHEMA = "gotra.public_research_ledger.v1"
+REVIEW_RESULT_SCHEMA = "gotra.review_result.v1"
+REVIEW_UNAVAILABLE_REASON_SCHEMA = "gotra.review_unavailable_reason.v1"
+REVIEW_WINDOWS_DAYS = (1, 7, 30, 90)
 METHODOLOGY_VERSION = "ksana_4_1_lite"
 METHODOLOGY_VERSION_V3 = "ksana_4_1_independent_agents"
 METHODOLOGY_VERSION_V35 = "ksana_4_1_research_task_evidence_agents"
@@ -3284,6 +3287,194 @@ def build_ledger_entry(
     return entry
 
 
+def review_date_from_iso(value: str) -> date:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+    except ValueError:
+        return date.fromisoformat(value[:10])
+
+
+def review_generated_date(generated_at: str) -> date:
+    return review_date_from_iso(generated_at)
+
+
+def review_entry_due(entry: dict[str, Any], *, generated_at: str) -> bool:
+    try:
+        due_at = date.fromisoformat(str(entry.get("review_due_at") or ""))
+        return due_at <= review_generated_date(generated_at)
+    except ValueError:
+        return True
+
+
+def safe_percent_return(start_price: Any, end_price: Any) -> float | None:
+    try:
+        start = float(start_price)
+        end = float(end_price)
+    except (TypeError, ValueError):
+        return None
+    if start <= 0:
+        return None
+    return round(((end - start) / start) * 100.0, 4)
+
+
+def review_price_observation(entry: dict[str, Any]) -> dict[str, Any]:
+    observation = entry.get("review_price_observation")
+    return observation if isinstance(observation, dict) else {}
+
+
+def review_attribution(raw_return: float, benchmark_return: float, quality_flags: list[str]) -> dict[str, Any]:
+    relative = round(raw_return - benchmark_return, 4)
+    if abs(relative) < 1.0:
+        classification = "near_benchmark"
+    elif relative > 0:
+        classification = "above_benchmark"
+    else:
+        classification = "below_benchmark"
+    return {
+        "classification": classification,
+        "relative_return_pp": relative,
+        "quality_flags": quality_flags[:8] or ["no_material_quality_flag_reported"],
+        "explanation": "Arithmetic review against declared benchmark; research audit only, not performance proof.",
+    }
+
+
+def validate_review_result_contract(result: dict[str, Any]) -> None:
+    required = ("schema", "entry_id", "window_days", "reviewed_at", "raw_return", "benchmark_return", "attribution")
+    missing = [field for field in required if field not in result]
+    if missing:
+        raise ValueError(f"review_result_missing_required_fields:{','.join(missing)}")
+    if result.get("schema") != REVIEW_RESULT_SCHEMA:
+        raise ValueError("review_result_invalid_schema")
+    if not sanitize_text(str(result.get("entry_id") or "")):
+        raise ValueError("review_result_missing_entry_id")
+    if not isinstance(result.get("window_days"), int) or int(result["window_days"]) <= 0:
+        raise ValueError("review_result_invalid_window_days")
+    try:
+        datetime.fromisoformat(str(result.get("reviewed_at") or "").replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("review_result_invalid_reviewed_at") from exc
+    if not isinstance(result.get("raw_return"), (int, float)):
+        raise ValueError("review_result_invalid_raw_return")
+    if not isinstance(result.get("benchmark_return"), (int, float)):
+        raise ValueError("review_result_invalid_benchmark_return")
+    if not isinstance(result.get("attribution"), dict):
+        raise ValueError("review_result_missing_attribution")
+    assert_public_safe(result)
+
+
+def build_review_result(entry: dict[str, Any], *, generated_at: str) -> dict[str, Any] | None:
+    observation = review_price_observation(entry)
+    raw_return = safe_percent_return(observation.get("start_price"), observation.get("end_price"))
+    benchmark_return = safe_percent_return(observation.get("benchmark_start_price"), observation.get("benchmark_end_price"))
+    if raw_return is None or benchmark_return is None:
+        return None
+    result = {
+        "schema": REVIEW_RESULT_SCHEMA,
+        "entry_id": sanitize_text(str(entry.get("entry_id") or ""))[:260],
+        "base_entry_id": sanitize_text(str(entry.get("base_entry_id") or ""))[:260],
+        "symbol": sanitize_text(str(entry.get("symbol") or ""))[:80],
+        "exchange": sanitize_text(str(entry.get("exchange") or ""))[:40],
+        "window_days": int(entry.get("window_days") or 0),
+        "review_due_at": sanitize_text(str(entry.get("review_due_at") or ""))[:40],
+        "reviewed_at": generated_at,
+        "raw_return": raw_return,
+        "benchmark_return": benchmark_return,
+        "attribution": review_attribution(raw_return, benchmark_return, sanitize_list(observation.get("quality_flags"))),
+        "price_source_id": sanitize_text(str(observation.get("price_source_id") or "declared_public_review_price_observation"))[:160],
+        "benchmark_source_id": sanitize_text(str(observation.get("benchmark_source_id") or "declared_public_benchmark_observation"))[:160],
+        "currency": sanitize_text(str(observation.get("currency") or ""))[:20],
+        "boundary": "historical arithmetic review only; not investment advice, not a trading signal, not performance proof",
+    }
+    validate_review_result_contract(result)
+    result["review_result_hash"] = stable_hash({key: value for key, value in result.items() if key != "review_result_hash"})
+    return result
+
+
+def build_review_unavailable_reason(entry: dict[str, Any], *, generated_at: str) -> dict[str, Any]:
+    observation = review_price_observation(entry)
+    missing_fields = [
+        field
+        for field in ("start_price", "end_price", "benchmark_start_price", "benchmark_end_price")
+        if field not in observation
+    ]
+    if not missing_fields:
+        missing_fields = ["valid_positive_price_inputs"]
+    reason = {
+        "schema": REVIEW_UNAVAILABLE_REASON_SCHEMA,
+        "entry_id": sanitize_text(str(entry.get("entry_id") or ""))[:260],
+        "base_entry_id": sanitize_text(str(entry.get("base_entry_id") or ""))[:260],
+        "symbol": sanitize_text(str(entry.get("symbol") or ""))[:80],
+        "exchange": sanitize_text(str(entry.get("exchange") or ""))[:40],
+        "window_days": int(entry.get("window_days") or 0),
+        "review_due_at": sanitize_text(str(entry.get("review_due_at") or ""))[:40],
+        "reviewed_at": generated_at,
+        "review_unavailable_reason": "public_review_price_or_benchmark_data_unavailable",
+        "missing_fields": missing_fields,
+        "boundary": "due review is explicit; missing public review data is not silently skipped or backfilled",
+    }
+    assert_public_safe(reason)
+    reason["review_unavailable_hash"] = stable_hash({key: value for key, value in reason.items() if key != "review_unavailable_hash"})
+    return reason
+
+
+def build_research_ledger_review_records(entries: list[dict[str, Any]], *, generated_at: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    review_results: list[dict[str, Any]] = []
+    review_unavailable: list[dict[str, Any]] = []
+    for entry in entries:
+        if not review_entry_due(entry, generated_at=generated_at):
+            continue
+        result = build_review_result(entry, generated_at=generated_at)
+        if result is not None:
+            review_results.append(result)
+        else:
+            review_unavailable.append(build_review_unavailable_reason(entry, generated_at=generated_at))
+    return review_results, review_unavailable
+
+
+def build_review_coverage(
+    entries: list[dict[str, Any]],
+    review_results: list[dict[str, Any]],
+    review_unavailable: list[dict[str, Any]],
+    *,
+    generated_at: str,
+) -> dict[str, Any]:
+    result_ids = {str(result.get("entry_id") or "") for result in review_results}
+    unavailable_ids = {str(reason.get("entry_id") or "") for reason in review_unavailable}
+    due_ids = {str(entry.get("entry_id") or "") for entry in entries if review_entry_due(entry, generated_at=generated_at)}
+    reviewed_count = len(result_ids)
+    unavailable_count = len(unavailable_ids)
+    not_due_count = max(0, len(entries) - len(due_ids))
+    missing_due_ids = sorted(due_ids - result_ids - unavailable_ids)
+    by_window_days = []
+    for window_days in REVIEW_WINDOWS_DAYS:
+        window_entries = [entry for entry in entries if int(entry.get("window_days") or 0) == window_days]
+        window_due_ids = {str(entry.get("entry_id") or "") for entry in window_entries if review_entry_due(entry, generated_at=generated_at)}
+        by_window_days.append(
+            {
+                "window_days": window_days,
+                "total_count": len(window_entries),
+                "reviewed_count": len(window_due_ids & result_ids),
+                "unavailable_count": len(window_due_ids & unavailable_ids),
+                "not_due_count": max(0, len(window_entries) - len(window_due_ids)),
+            }
+        )
+    coverage = {
+        "supported_windows_days": list(REVIEW_WINDOWS_DAYS),
+        "total_count": len(entries),
+        "due_count": len(due_ids),
+        "reviewed_count": reviewed_count,
+        "not_due_count": not_due_count,
+        "unavailable_count": unavailable_count,
+        "missing_due_entry_ids": missing_due_ids,
+        "by_window_days": by_window_days,
+        "boundary": "review coverage is audit completeness, not performance proof or investment advice",
+    }
+    if missing_due_ids:
+        raise ValueError(f"review_coverage_missing_due_entries:{','.join(missing_due_ids[:5])}")
+    assert_public_safe(coverage)
+    return coverage
+
+
 def verify_ledger_chain(entries: list[dict[str, Any]]) -> dict[str, Any]:
     previous_hash = "0" * 64
     for index, entry in enumerate(entries):
@@ -3382,13 +3573,23 @@ def merge_research_ledger(
         appended += 1
 
     integrity = verify_ledger_chain(entries)
+    review_results, review_unavailable = build_research_ledger_review_records(entries, generated_at=generated_at)
+    review_coverage = build_review_coverage(
+        entries,
+        review_results,
+        review_unavailable,
+        generated_at=generated_at,
+    )
     manifest = {
         "schema": LEDGER_MANIFEST_SCHEMA,
         "generated_at": generated_at,
         "entry_count": len(entries),
         "appended_count": appended,
         "integrity": integrity,
-        "query_fields": ["symbol", "as_of_date", "window_days", "status"],
+        "review_results": review_results,
+        "review_unavailable": review_unavailable,
+        "review_coverage": review_coverage,
+        "query_fields": ["symbol", "as_of_date", "window_days", "status", "review_status"],
         "boundary": "append-only public research ledger; research information only; not investment advice or trading signal",
         "entries": entries,
     }

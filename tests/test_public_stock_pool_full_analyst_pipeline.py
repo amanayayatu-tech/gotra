@@ -46,6 +46,7 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     RED_TEAM_SCHEMA_V4,
     RESEARCH_QUALITY_GATE_SCHEMA,
     RESEARCH_SIGNAL_SCHEMA,
+    REVIEW_RESULT_SCHEMA,
     RESEARCH_TASK_SCHEMA,
     RESEARCH_TASK_SCHEMA_V2,
     SYMBOL_SCHEMA,
@@ -65,6 +66,7 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     sanitize_research_task,
     sanitize_v3_agent_output,
     selected_universe,
+    stable_hash,
     update_loop_public_status,
     v3_agent_failure_record,
     validate_evidence_packet_contract,
@@ -72,6 +74,7 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     merge_research_ledger,
     validate_publication_decision_contract,
     validate_ledger_entry_contract,
+    validate_review_result_contract,
     validate_research_signal_contract,
     verify_ledger_chain,
 )
@@ -1474,6 +1477,61 @@ def test_research_ledger_update_appends_version_without_overwrite() -> None:
     assert second["entries"][1]["previous_hash"] == second["entries"][0]["hash"]
     assert second["entries"][1]["previous_version_hash"] == second["entries"][0]["hash"]
     assert second["integrity"]["ok"] is True
+
+
+def test_research_ledger_adds_review_result_for_due_entry_with_public_prices() -> None:
+    entry = build_ledger_entry(
+        valid_published_symbol_payload(),
+        previous_hash="0" * 64,
+        version=1,
+        published_at="2026-06-29T10:00:00+00:00",
+    )
+    entry["review_price_observation"] = {
+        "start_price": 100,
+        "end_price": 104,
+        "benchmark_start_price": 200,
+        "benchmark_end_price": 206,
+        "price_source_id": "fixture_public_adjusted_close",
+        "benchmark_source_id": "fixture_public_benchmark",
+        "currency": "HKD",
+        "quality_flags": ["fixture_public_price_observation"],
+    }
+    entry["hash"] = stable_hash({key: value for key, value in entry.items() if key != "hash"})
+
+    manifest = merge_research_ledger([entry], [], generated_at="2026-07-30T10:00:00+00:00")
+
+    assert manifest["review_coverage"]["total_count"] == 1
+    assert manifest["review_coverage"]["reviewed_count"] == 1
+    assert manifest["review_coverage"]["unavailable_count"] == 0
+    result = manifest["review_results"][0]
+    assert result["schema"] == REVIEW_RESULT_SCHEMA
+    assert result["entry_id"] == entry["entry_id"]
+    assert result["window_days"] == 30
+    assert result["raw_return"] == 4.0
+    assert result["benchmark_return"] == 3.0
+    assert result["attribution"]["classification"] == "above_benchmark"
+    validate_review_result_contract(result)
+
+
+def test_research_ledger_due_entry_gets_unavailable_reason_without_public_prices() -> None:
+    manifest = merge_research_ledger([], [valid_published_symbol_payload()], generated_at="2026-07-30T10:00:00+00:00")
+
+    assert manifest["review_results"] == []
+    assert manifest["review_coverage"]["due_count"] == 1
+    assert manifest["review_coverage"]["unavailable_count"] == 1
+    assert manifest["review_coverage"]["missing_due_entry_ids"] == []
+    reason = manifest["review_unavailable"][0]
+    assert reason["review_unavailable_reason"] == "public_review_price_or_benchmark_data_unavailable"
+    assert reason["entry_id"] == manifest["entries"][0]["entry_id"]
+
+
+def test_research_ledger_not_due_entry_is_not_silently_marked_failed() -> None:
+    manifest = merge_research_ledger([], [valid_published_symbol_payload()], generated_at="2026-07-01T10:00:00+00:00")
+
+    assert manifest["review_results"] == []
+    assert manifest["review_unavailable"] == []
+    assert manifest["review_coverage"]["not_due_count"] == 1
+    assert manifest["review_coverage"]["reviewed_count"] == 0
 
 
 def test_research_ledger_integrity_detects_tampering() -> None:
