@@ -76,6 +76,8 @@ LEDGER_ENTRY_SCHEMA = "gotra.ledger_entry.v1"
 LEDGER_MANIFEST_SCHEMA = "gotra.public_research_ledger.v1"
 REVIEW_RESULT_SCHEMA = "gotra.review_result.v1"
 REVIEW_UNAVAILABLE_REASON_SCHEMA = "gotra.review_unavailable_reason.v1"
+MONTHLY_TRANSPARENCY_REPORT_SCHEMA = "gotra.monthly_transparency_report.v1"
+MONTHLY_TRANSPARENCY_REPORT_INDEX_SCHEMA = "gotra.monthly_transparency_report_index.v1"
 REVIEW_WINDOWS_DAYS = (1, 7, 30, 90)
 METHODOLOGY_VERSION = "ksana_4_1_lite"
 METHODOLOGY_VERSION_V3 = "ksana_4_1_independent_agents"
@@ -3475,6 +3477,198 @@ def build_review_coverage(
     return coverage
 
 
+def ledger_entry_month(entry: dict[str, Any]) -> str:
+    published_at = str(entry.get("published_at") or "")
+    if re.match(r"^\d{4}-\d{2}", published_at):
+        return published_at[:7]
+    as_of_date = str(entry.get("as_of_date") or "")
+    if re.match(r"^\d{4}-\d{2}", as_of_date):
+        return as_of_date[:7]
+    return ""
+
+
+def monthly_error_cases(review_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    cases: list[dict[str, Any]] = []
+    for result in review_results:
+        attribution = result.get("attribution") if isinstance(result.get("attribution"), dict) else {}
+        if attribution.get("classification") != "below_benchmark":
+            continue
+        cases.append(
+            {
+                "entry_id": sanitize_text(str(result.get("entry_id") or ""))[:260],
+                "symbol": sanitize_text(str(result.get("symbol") or ""))[:80],
+                "exchange": sanitize_text(str(result.get("exchange") or ""))[:40],
+                "window_days": int(result.get("window_days") or 0),
+                "raw_return": float(result.get("raw_return") or 0.0),
+                "benchmark_return": float(result.get("benchmark_return") or 0.0),
+                "attribution": sanitize_text(str(attribution.get("classification") or "below_benchmark"))[:80],
+                "reader_safe_summary": "historical review below benchmark; recorded for transparency, not performance proof",
+            }
+        )
+    return cases
+
+
+def monthly_data_gaps(review_unavailable: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    gaps: list[dict[str, Any]] = []
+    for reason in review_unavailable:
+        gaps.append(
+            {
+                "entry_id": sanitize_text(str(reason.get("entry_id") or ""))[:260],
+                "symbol": sanitize_text(str(reason.get("symbol") or ""))[:80],
+                "exchange": sanitize_text(str(reason.get("exchange") or ""))[:40],
+                "window_days": int(reason.get("window_days") or 0),
+                "reason": sanitize_text(str(reason.get("review_unavailable_reason") or ""))[:180],
+                "missing_fields": sanitize_list(reason.get("missing_fields"))[:8],
+                "reader_safe_summary": "due review was not skipped; public price or benchmark evidence is missing",
+            }
+        )
+    return gaps
+
+
+def monthly_improvement_items(entries: list[dict[str, Any]], error_cases: list[dict[str, Any]], data_gaps: list[dict[str, Any]]) -> list[str]:
+    items: list[str] = []
+    if not entries:
+        items.append("Publish at least one PublicationDecision=publish LedgerEntry before interpreting monthly coverage.")
+    if data_gaps:
+        items.append("Add public review price and benchmark observations before due review windows whenever available.")
+    if error_cases:
+        items.append("Review below-benchmark cases for evidence quality, uncertainty language, and counter-evidence coverage.")
+    if not items:
+        items.append("Continue append-only ledger publication, review coverage checks, and explicit data-gap reporting.")
+    return items
+
+
+def validate_monthly_transparency_report_contract(report: dict[str, Any]) -> None:
+    required = {
+        "schema",
+        "month",
+        "generated_at",
+        "published_count",
+        "needs_review_count",
+        "blocked_count",
+        "review_coverage",
+        "error_cases",
+        "data_gaps",
+        "improvement_items",
+        "boundary",
+    }
+    missing = sorted(required - set(report))
+    if missing:
+        raise ValueError(f"monthly_transparency_report_missing_required_fields:{','.join(missing)}")
+    if report.get("schema") != MONTHLY_TRANSPARENCY_REPORT_SCHEMA:
+        raise ValueError("monthly_transparency_report_invalid_schema")
+    if not re.match(r"^\d{4}-\d{2}$", str(report.get("month") or "")):
+        raise ValueError("monthly_transparency_report_invalid_month")
+    for field in ("published_count", "needs_review_count", "blocked_count"):
+        if not isinstance(report.get(field), int) or int(report[field]) < 0:
+            raise ValueError(f"monthly_transparency_report_invalid_{field}")
+    if not isinstance(report.get("review_coverage"), dict):
+        raise ValueError("monthly_transparency_report_missing_review_coverage")
+    for field in ("error_cases", "data_gaps", "improvement_items"):
+        if not isinstance(report.get(field), list):
+            raise ValueError(f"monthly_transparency_report_invalid_{field}")
+    assert_public_safe(report)
+
+
+def build_monthly_transparency_report(
+    ledger_manifest: dict[str, Any],
+    *,
+    month: str,
+    generated_at: str,
+) -> dict[str, Any]:
+    entries = [entry for entry in ledger_manifest.get("entries", []) if isinstance(entry, dict) and ledger_entry_month(entry) == month]
+    entry_ids = {str(entry.get("entry_id") or "") for entry in entries}
+    all_review_results = [result for result in ledger_manifest.get("review_results", []) if isinstance(result, dict)]
+    all_review_unavailable = [reason for reason in ledger_manifest.get("review_unavailable", []) if isinstance(reason, dict)]
+    review_results = [result for result in all_review_results if str(result.get("entry_id") or "") in entry_ids]
+    review_unavailable = [reason for reason in all_review_unavailable if str(reason.get("entry_id") or "") in entry_ids]
+    review_coverage = build_review_coverage(
+        entries,
+        review_results,
+        review_unavailable,
+        generated_at=generated_at,
+    )
+    error_cases = monthly_error_cases(review_results)
+    data_gaps = monthly_data_gaps(review_unavailable)
+    report = {
+        "schema": MONTHLY_TRANSPARENCY_REPORT_SCHEMA,
+        "month": month,
+        "generated_at": generated_at,
+        "source_ledger_schema": ledger_manifest.get("schema") or "",
+        "source_ledger_generated_at": ledger_manifest.get("generated_at") or "",
+        "published_count": sum(1 for entry in entries if entry.get("status") == "publish"),
+        "needs_review_count": sum(1 for entry in entries if entry.get("status") == "needs_review"),
+        "blocked_count": sum(1 for entry in entries if entry.get("status") == "blocked"),
+        "review_coverage": review_coverage,
+        "error_cases": error_cases,
+        "error_case_note": "error_cases is reported even when empty; monthly report must not show only positive cases",
+        "data_gaps": data_gaps,
+        "data_gap_note": "data_gaps is reported even when empty; due review gaps remain visible when present",
+        "improvement_items": monthly_improvement_items(entries, error_cases, data_gaps),
+        "reader_safe_summary": "monthly transparency report for public research ledger coverage, review status, errors, gaps, and improvements",
+        "boundary": "transparency report only; not investment advice, not a trading signal, not performance proof, not a return promise",
+    }
+    validate_monthly_transparency_report_contract(report)
+    report["report_hash"] = stable_hash({key: value for key, value in report.items() if key != "report_hash"})
+    return report
+
+
+def build_monthly_transparency_reports(ledger_manifest: dict[str, Any], *, generated_at: str) -> list[dict[str, Any]]:
+    entries = [entry for entry in ledger_manifest.get("entries", []) if isinstance(entry, dict)]
+    months = sorted({ledger_entry_month(entry) for entry in entries if ledger_entry_month(entry)})
+    if not months:
+        months = [generated_at[:7]]
+    return [build_monthly_transparency_report(ledger_manifest, month=month, generated_at=generated_at) for month in months]
+
+
+def write_monthly_transparency_reports(output_dir: Path, ledger_manifest: dict[str, Any], *, generated_at: str) -> dict[str, Any]:
+    reports = build_monthly_transparency_reports(ledger_manifest, generated_at=generated_at)
+    report_files: list[str] = []
+    report_paths: list[Path] = []
+    summaries: list[dict[str, Any]] = []
+    for report in reports:
+        file_name = f"monthly_transparency_report_{report['month']}.json"
+        path = output_dir / file_name
+        write_public_json(path, report)
+        report_files.append(file_name)
+        report_paths.append(path)
+        summaries.append(
+            {
+                "month": report["month"],
+                "file": file_name,
+                "published_count": report["published_count"],
+                "needs_review_count": report["needs_review_count"],
+                "blocked_count": report["blocked_count"],
+                "review_coverage": report["review_coverage"],
+                "error_case_count": len(report["error_cases"]),
+                "data_gap_count": len(report["data_gaps"]),
+                "improvement_item_count": len(report["improvement_items"]),
+                "report_hash": report["report_hash"],
+            }
+        )
+    index = {
+        "schema": MONTHLY_TRANSPARENCY_REPORT_INDEX_SCHEMA,
+        "generated_at": generated_at,
+        "report_count": len(reports),
+        "latest_month": reports[-1]["month"] if reports else generated_at[:7],
+        "reports": summaries,
+        "boundary": "monthly transparency index only; not performance proof, not investment advice, not a trading signal",
+    }
+    assert_public_safe(index)
+    index_path = output_dir / "monthly_transparency_reports.json"
+    write_public_json(index_path, index)
+    return {
+        "schema": MONTHLY_TRANSPARENCY_REPORT_INDEX_SCHEMA,
+        "index_path": index_path,
+        "index_file": index_path.name,
+        "report_paths": report_paths,
+        "report_files": report_files,
+        "report_count": len(reports),
+        "latest_file": report_files[-1] if report_files else "",
+        "latest_month": reports[-1]["month"] if reports else generated_at[:7],
+    }
+
+
 def verify_ledger_chain(entries: list[dict[str, Any]]) -> dict[str, Any]:
     previous_hash = "0" * 64
     for index, entry in enumerate(entries):
@@ -3610,6 +3804,7 @@ def write_research_ledger(
     existing_entries = load_existing_research_ledger(existing_path)
     manifest = merge_research_ledger(existing_entries, symbol_payloads, generated_at=generated_at)
     write_public_json(output_path, manifest)
+    monthly_result = write_monthly_transparency_reports(config.output_dir, manifest, generated_at=generated_at)
     return {
         "path": output_path,
         "file": ledger_name,
@@ -3617,6 +3812,7 @@ def write_research_ledger(
         "entry_count": manifest["entry_count"],
         "appended_count": manifest["appended_count"],
         "integrity": manifest["integrity"],
+        "monthly_result": monthly_result,
     }
 
 
@@ -5138,12 +5334,18 @@ def write_outputs(config: FullAnalystConfig, results: list[dict[str, Any]], stat
     ledger_result: dict[str, Any] | None = None
     if is_v40_config(config):
         ledger_result = write_research_ledger(config, symbol_payloads=symbol_payloads, status=status)
+        monthly_result = ledger_result["monthly_result"]
         status["ledger_schema"] = ledger_result["schema"]
         status["ledger_file"] = ledger_result["file"]
         status["ledger_entry_count"] = ledger_result["entry_count"]
         status["ledger_appended_count"] = ledger_result["appended_count"]
         status["ledger_integrity_status"] = "ok" if ledger_result["integrity"].get("ok") else "failed"
         status["ledger_latest_hash"] = ledger_result["integrity"].get("latest_hash", "")
+        status["monthly_transparency_report_schema"] = monthly_result["schema"]
+        status["monthly_transparency_report_index_file"] = monthly_result["index_file"]
+        status["monthly_transparency_report_count"] = monthly_result["report_count"]
+        status["monthly_transparency_report_latest_file"] = monthly_result["latest_file"]
+        status["monthly_transparency_report_latest_month"] = monthly_result["latest_month"]
     scan_public_artifacts(status=status, results=results, symbol_payloads=symbol_payloads)
     for row in results:
         if row.get("research"):
@@ -5153,10 +5355,18 @@ def write_outputs(config: FullAnalystConfig, results: list[dict[str, Any]], stat
     write_public_text(report_path, markdown)
     write_public_json(status_path, status)
     if config.publish_static:
-        publish_static(report_path, status_path, config.static_dir, ledger_path=ledger_result["path"] if ledger_result else None)
+        extra_paths = []
+        if ledger_result:
+            monthly_result = ledger_result["monthly_result"]
+            extra_paths = [monthly_result["index_path"], *monthly_result["report_paths"]]
+        publish_static(report_path, status_path, config.static_dir, ledger_path=ledger_result["path"] if ledger_result else None, extra_paths=extra_paths)
     paths = {"report_path": str(report_path.resolve()), "status_path": str(status_path.resolve())}
     if ledger_result:
         paths["ledger_path"] = str(ledger_result["path"].resolve())
+        monthly_result = ledger_result["monthly_result"]
+        paths["monthly_report_index_path"] = str(monthly_result["index_path"].resolve())
+        if monthly_result["report_paths"]:
+            paths["monthly_report_latest_path"] = str(monthly_result["report_paths"][-1].resolve())
     return paths
 
 
@@ -5187,11 +5397,20 @@ def scan_public_text(text: str) -> None:
         raise PublicScanError(public_safe_failure_category(str(exc))) from exc
 
 
-def publish_static(report_path: Path, status_path: Path, static_dir: Path, *, ledger_path: Path | None = None) -> None:
+def publish_static(
+    report_path: Path,
+    status_path: Path,
+    static_dir: Path,
+    *,
+    ledger_path: Path | None = None,
+    extra_paths: list[Path] | None = None,
+) -> None:
     static_dir.mkdir(parents=True, exist_ok=True)
     paths = [report_path, status_path]
     if ledger_path is not None:
         paths.append(ledger_path)
+    if extra_paths:
+        paths.extend(extra_paths)
     for path in paths:
         target = static_dir / path.name
         shutil.copy2(path, target)
