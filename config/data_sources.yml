@@ -1,0 +1,130 @@
+schema: gotra.data_sources.v1
+last_reviewed: "2026-07-04"
+default_public_boundary:
+  research_only: true
+  not_trading_signal: true
+  not_investment_advice: true
+  no_realtime_market_data_claim: true
+  no_performance_proof: true
+price_source_priority:
+  HKEX:
+    - yahoo_chart_api_via_gotra_price_cache
+    - stooq
+    - alpha_vantage
+  NASDAQ:
+    - yahoo_chart_api_via_gotra_price_cache
+    - stooq
+    - alpha_vantage
+  NYSE:
+    - yahoo_chart_api_via_gotra_price_cache
+    - stooq
+    - alpha_vantage
+providers:
+  yahoo_chart_api_via_gotra_price_cache:
+    display_name: Yahoo Finance chart API via GOTRA price_cache helper
+    provider_family: yahoo_chart
+    purpose: End-of-day adjusted-close research and prototype price evidence.
+    source_types:
+      - price_data
+    markets:
+      - HKEX
+      - NASDAQ
+      - NYSE
+    license_note: Public web chart endpoint used for bounded research/prototype evidence only; it is not a licensed production realtime market-data feed.
+    rate_limit_note: Low-frequency batch fetches with local cache and bounded retries; not used for realtime or paid-product sole-market-data authorization.
+    freshness_note: Uses completed daily bars only; future-date rows are blocked by MarketDataSnapshot quality flags.
+    commercial_use_note: Not authorized as the sole market-data source for a paid realtime product.
+    production_realtime_authorized: false
+    allow_as_sole_paid_market_data_source: false
+    public_summary: Research/prototype adjusted-close source with explicit license and realtime limitations.
+  stooq:
+    display_name: Stooq public daily prices
+    provider_family: stooq
+    purpose: Low-frequency backup public price research source where coverage is available.
+    source_types:
+      - price_data
+    markets:
+      - NASDAQ
+      - NYSE
+      - selected_global
+    license_note: Public historical price source for research fallback only; coverage, symbols, and terms must be checked before broader use.
+    rate_limit_note: Low-frequency fallback requests only; cache before reuse.
+    freshness_note: Daily historical data may lag or have symbol coverage gaps.
+    commercial_use_note: Not treated as production realtime authorization.
+    production_realtime_authorized: false
+    allow_as_sole_paid_market_data_source: false
+    public_summary: Backup daily price research source; not a realtime or paid-product feed.
+  alpha_vantage:
+    display_name: Alpha Vantage free tier
+    provider_family: alpha_vantage
+    purpose: Low-frequency fallback for documented price or indicator observations when explicitly configured.
+    source_types:
+      - price_data
+      - technical_indicator
+    markets:
+      - NASDAQ
+      - NYSE
+      - selected_global
+    license_note: Free tier has usage and redistribution limits; paid or commercial use requires separate authorization review.
+    rate_limit_note: Free tier fallback only; configure no more than 5 requests per minute and no more than 500 requests per day.
+    freshness_note: Do not use as a realtime feed; record stale or missing responses as data_gap.
+    commercial_use_note: Requires separate commercial authorization before paid release use.
+    production_realtime_authorized: false
+    allow_as_sole_paid_market_data_source: false
+    max_requests_per_minute: 5
+    max_requests_per_day: 500
+    public_summary: Low-frequency fallback only; rate limits must be visible.
+  sec_edgar:
+    display_name: SEC EDGAR filings and CompanyFacts
+    provider_family: sec_edgar
+    purpose: Official US issuer filings, company facts, and filing metadata evidence.
+    source_types:
+      - exchange_filing
+      - company_report
+      - regulator
+    markets:
+      - NASDAQ
+      - NYSE
+      - US_issuers
+    license_note: Official SEC public access source; requests must identify the application via a compliant User-Agent and observe SEC fair-access guidance.
+    rate_limit_note: Maximum 10 requests per second; use local cache and backoff for batch work.
+    freshness_note: Filing availability follows SEC publication timestamps and may not align with market close.
+    commercial_use_note: Official filing facts may be referenced in research packets, subject to SEC terms and rate limits.
+    production_realtime_authorized: false
+    allow_as_sole_paid_market_data_source: false
+    max_requests_per_second: 10
+    required_headers:
+      - User-Agent
+    public_summary: Official filing/facts evidence, not price data.
+  fred:
+    display_name: FRED macroeconomic data
+    provider_family: fred
+    purpose: Macroeconomic context evidence only.
+    source_types:
+      - macro
+    markets:
+      - US
+      - global_macro
+    license_note: Public macro series source; cite series identifiers and observation dates.
+    rate_limit_note: Low-frequency macro lookups only; cache series observations used in research packets.
+    freshness_note: Macro series have release calendars and revision risk.
+    commercial_use_note: Not used for individual-stock price conclusions or realtime market data.
+    production_realtime_authorized: false
+    allow_as_sole_paid_market_data_source: false
+    public_summary: Macro context only; cannot support stock-specific price conclusions by itself.
+  hkexnews:
+    display_name: HKEXnews issuer announcements
+    provider_family: hkexnews
+    purpose: HKEX issuer announcements, filings, and disclosure facts.
+    source_types:
+      - exchange_filing
+      - company_report
+    markets:
+      - HKEX
+    license_note: Public issuer disclosure source; cite announcement identifiers and publication dates.
+    rate_limit_note: Low-frequency disclosure lookup and cache; not a realtime quote service.
+    freshness_note: Announcement availability follows HKEX publication timing and may lag trading sessions.
+    commercial_use_note: Disclosure facts may support research packets, but this is not market-data authorization.
+    production_realtime_authorized: false
+    allow_as_sole_paid_market_data_source: false
+    public_summary: Official HKEX disclosure facts, not realtime market data.
