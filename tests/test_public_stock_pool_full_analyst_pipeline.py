@@ -724,6 +724,80 @@ def test_v35_research_task_neutralizes_boundary_policy_terms(tmp_path: Path) -> 
     assert_public_safe(task)
 
 
+def test_v35_research_task_fills_default_required_sources_when_missing(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    task = sanitize_research_task(
+        {
+            "schema": RESEARCH_TASK_SCHEMA,
+            "run_id": cfg.run_id,
+            "symbol": "0700",
+            "exchange": "HKEX",
+            "provider_ticker": "0700.HK",
+            "as_of_date": cfg.as_of_date.isoformat(),
+            "selection_reason": "The symbol needs a bounded evidence task before synthesis.",
+            "trigger_context": {"coverage_status": "data_gap"},
+            "research_mission": "Resolve public evidence coverage and preserve unresolved gaps.",
+            "core_questions": [
+                "Which public sources are required today?",
+                "Which source gaps must remain visible?",
+                "Which claims should wait for official evidence?",
+            ],
+            "required_sources": [],
+            "must_not_conclude_without": ["official issuer evidence", "fresh price coverage"],
+            "evidence_gap_policy": ["Keep missing required sources visible."],
+            "agent_briefs": {"k_deep_research": "Use the evidence packet only."},
+            "reader_boundary": "Research content only. This does not constitute investment advice.",
+        },
+        item=universe()[0],
+        price_row=price_rows()["HKEX:0700"],
+        config=cfg,
+    )
+
+    source_types = {source["source_type"] for source in task["required_sources"]}
+    assert {"exchange_filing", "company_report", "price_data", "current_public_status"} <= source_types
+    assert all(source["purpose"] for source in task["required_sources"])
+    assert_public_safe(task)
+
+
+def test_v35_research_task_fills_blank_required_source_purposes(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    task = sanitize_research_task(
+        {
+            "schema": RESEARCH_TASK_SCHEMA,
+            "run_id": cfg.run_id,
+            "symbol": "0700",
+            "exchange": "HKEX",
+            "provider_ticker": "0700.HK",
+            "as_of_date": cfg.as_of_date.isoformat(),
+            "selection_reason": "The symbol needs a bounded evidence task before synthesis.",
+            "trigger_context": {"coverage_status": "data_gap"},
+            "research_mission": "Resolve public evidence coverage and preserve unresolved gaps.",
+            "core_questions": [
+                "Which public sources are required today?",
+                "Which source gaps must remain visible?",
+                "Which claims should wait for official evidence?",
+            ],
+            "required_sources": [{"source_type": "exchange filing", "purpose": "", "required": True}],
+            "must_not_conclude_without": ["official issuer evidence", "fresh price coverage"],
+            "evidence_gap_policy": ["Keep missing required sources visible."],
+            "agent_briefs": {"k_deep_research": "Use the evidence packet only."},
+            "reader_boundary": "Research content only. This does not constitute investment advice.",
+        },
+        item=universe()[0],
+        price_row=price_rows()["HKEX:0700"],
+        config=cfg,
+    )
+
+    assert task["required_sources"] == [
+        {
+            "source_type": "exchange_filing",
+            "purpose": "Review exchange-hosted issuer filings, announcements, circulars, financial reports, disclosure records, and other official documents needed to establish issuer-specific public facts.",
+            "required": True,
+        }
+    ]
+    assert_public_safe(task)
+
+
 def test_v3_agent_retries_public_safety_failure_then_publishes(tmp_path: Path) -> None:
     cfg = config(tmp_path, symbols=("HKEX:0700",))
     cfg = FullAnalystConfig(

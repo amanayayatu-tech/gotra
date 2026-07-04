@@ -199,6 +199,23 @@ V3_AGENT_ROLE_LABELS = {
     "red_team_audit": "Independent red-team audit agent; attacks assumptions and reports reliability risks",
 }
 
+V35_REQUIRED_SOURCE_PURPOSES = {
+    "exchange_filing": "Review exchange-hosted issuer filings, announcements, circulars, financial reports, disclosure records, and other official documents needed to establish issuer-specific public facts.",
+    "company_report": "Review official issuer annual reports, interim reports, results materials, presentations, sustainability reports, and investor-relations releases when publicly available.",
+    "price_data": "Confirm trading-date price coverage, close availability, daily movement, volume if available, and any missing market-data fields from allowed public market-data sources.",
+    "regulator": "Review public regulator notices, enforcement actions, consultation papers, policy documents, and disclosure records relevant to the issuer or sector.",
+    "macro": "Review public central-bank, statistics-agency, government, or reputable macro sources for operating regions, demand conditions, rates, inflation, FX, and sector-level macro context.",
+    "industry": "Review public industry reports, trade-body publications, regulator sector reports, and reputable market-research summaries while separating sector context from issuer-specific evidence.",
+    "news": "Review reputable public news sources to corroborate events, announcement interpretation, and market-context claims without converting commentary into advice.",
+    "prior_alaya_memory": "Review GOTRA internal Alaya unresolved questions only as continuity and gap context; do not treat memory as public proof unless independently corroborated.",
+    "public_stock_pool_metadata": "Review public stock-pool metadata to confirm why the symbol entered the bounded research candidate set and preserve its research-only boundary.",
+    "current_public_status": "Review current GOTRA public coverage, freshness status, missing fields, unresolved constraints, and needs_review flags for this symbol.",
+}
+
+
+def default_v35_required_sources() -> list[dict[str, Any]]:
+    return [{"source_type": source_type, "purpose": purpose, "required": True} for source_type, purpose in V35_REQUIRED_SOURCE_PURPOSES.items()]
+
 
 @dataclass(frozen=True)
 class FullAnalystConfig:
@@ -1274,13 +1291,26 @@ def sanitize_research_task(
     for source in payload.get("required_sources") if isinstance(payload.get("required_sources"), list) else []:
         if not isinstance(source, dict):
             continue
+        source_type = sanitize_text(str(source.get("source_type") or "unknown")).lower().replace(" ", "_").replace("-", "_")[:80]
+        purpose = sanitize_public_text_value(
+            source.get("purpose") or "",
+            preferred_keys=("purpose", "summary", "reason", "source_type"),
+            max_chars=300,
+        )
+        if not purpose:
+            purpose = V35_REQUIRED_SOURCE_PURPOSES.get(
+                source_type,
+                f"Review public {source_type} sources needed to resolve the bounded research task or preserve the related evidence gap.",
+            )
         required_sources.append(
             {
-                "source_type": sanitize_text(str(source.get("source_type") or "unknown"))[:80],
-                "purpose": sanitize_text(str(source.get("purpose") or ""))[:300],
+                "source_type": source_type,
+                "purpose": purpose,
                 "required": bool(source.get("required", True)),
             }
         )
+    if not required_sources:
+        required_sources = default_v35_required_sources()
     agent_briefs_raw = payload.get("agent_briefs") if isinstance(payload.get("agent_briefs"), dict) else {}
     agent_briefs = {
         agent_id: sanitize_public_text_value(agent_briefs_raw.get(agent_id) or V3_AGENT_ROLE_LABELS[agent_id], max_chars=500)
