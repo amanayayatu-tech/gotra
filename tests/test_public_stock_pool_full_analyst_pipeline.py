@@ -15,26 +15,40 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     ALAYA_EVENT_SCHEMA,
     ALAYA_EVENT_SCHEMA_V3,
     ALAYA_EVENT_SCHEMA_V35,
+    ALAYA_EVENT_SCHEMA_V40,
+    CHAIRMAN_SCHEMA_V4,
     EVIDENCE_PACKET_SCHEMA,
+    EVIDENCE_PACKET_SCHEMA_V2,
     EXECUTION_MODEL,
     EXECUTION_MODEL_V3,
     EXECUTION_MODEL_V35,
+    EXECUTION_MODEL_V40,
     FullAnalystConfig,
     GotraInternalAlayaSyncClient,
+    K_DOSSIER_SCHEMA,
+    KNOWLEDGE_GATE_SCHEMA,
     METHODOLOGY_VERSION,
     METHODOLOGY_VERSION_V3,
     METHODOLOGY_VERSION_V35,
+    METHODOLOGY_VERSION_V40,
     MockAlayaSyncClient,
+    PERSPECTIVE_AGENT_SCHEMA_V4,
     PROMPT_TEMPLATE_VERSION,
     PROMPT_TEMPLATE_VERSION_V3,
     PROMPT_TEMPLATE_VERSION_V35,
+    PROMPT_TEMPLATE_VERSION_V40,
+    RED_TEAM_SCHEMA_V4,
+    RESEARCH_QUALITY_GATE_SCHEMA,
     RESEARCH_TASK_SCHEMA,
+    RESEARCH_TASK_SCHEMA_V2,
     SYMBOL_SCHEMA,
     SYMBOL_SCHEMA_V3,
     SYMBOL_SCHEMA_V35,
+    SYMBOL_SCHEMA_V40,
     assert_public_safe,
     build_prompt,
     config_from_args,
+    fixture_k_dossier_output,
     fixture_research_task_output,
     fixture_v3_agent_output,
     prompt_input_payload,
@@ -129,9 +143,12 @@ class V3FixtureRunner:
         del timeout_seconds
         payload = prompt_input_payload(prompt_text)
         self.payloads.append(payload)
-        if payload.get("required_schema") == RESEARCH_TASK_SCHEMA:
+        if payload.get("required_schema") in {RESEARCH_TASK_SCHEMA, RESEARCH_TASK_SCHEMA_V2}:
             self.calls.append("research_task_planner")
             return RunnerResult(True, text=json.dumps(fixture_research_task_output(payload)), elapsed_seconds=0.01, returncode=0)
+        if payload.get("required_schema") == K_DOSSIER_SCHEMA:
+            self.calls.append("k_deep_research_dossier")
+            return RunnerResult(True, text=json.dumps(fixture_k_dossier_output(payload)), elapsed_seconds=0.01, returncode=0)
         self.calls.append(str(payload["agent_id"]))
         return RunnerResult(True, text=json.dumps(fixture_v3_agent_output(payload)), elapsed_seconds=0.01, returncode=0)
 
@@ -144,9 +161,12 @@ class V3FailingAgentRunner(V3FixtureRunner):
     def complete(self, prompt_text: str, *, timeout_seconds: int) -> RunnerResult:
         payload = prompt_input_payload(prompt_text)
         self.payloads.append(payload)
-        if payload.get("required_schema") == RESEARCH_TASK_SCHEMA:
+        if payload.get("required_schema") in {RESEARCH_TASK_SCHEMA, RESEARCH_TASK_SCHEMA_V2}:
             self.calls.append("research_task_planner")
             return RunnerResult(True, text=json.dumps(fixture_research_task_output(payload)), elapsed_seconds=0.01, returncode=0)
+        if payload.get("required_schema") == K_DOSSIER_SCHEMA:
+            self.calls.append("k_deep_research_dossier")
+            return RunnerResult(True, text=json.dumps(fixture_k_dossier_output(payload)), elapsed_seconds=0.01, returncode=0)
         self.calls.append(str(payload["agent_id"]))
         if payload["agent_id"] == self.failed_agent:
             return RunnerResult(False, reason="simulated independent agent failure", elapsed_seconds=0.01, returncode=1)
@@ -163,9 +183,12 @@ class V3RetrySafetyRunner(V3FixtureRunner):
         del timeout_seconds
         payload = prompt_input_payload(prompt_text)
         self.payloads.append(payload)
-        if payload.get("required_schema") == RESEARCH_TASK_SCHEMA:
+        if payload.get("required_schema") in {RESEARCH_TASK_SCHEMA, RESEARCH_TASK_SCHEMA_V2}:
             self.calls.append("research_task_planner")
             return RunnerResult(True, text=json.dumps(fixture_research_task_output(payload)), elapsed_seconds=0.01, returncode=0)
+        if payload.get("required_schema") == K_DOSSIER_SCHEMA:
+            self.calls.append("k_deep_research_dossier")
+            return RunnerResult(True, text=json.dumps(fixture_k_dossier_output(payload)), elapsed_seconds=0.01, returncode=0)
         agent_id = str(payload["agent_id"])
         self.calls.append(agent_id)
         self.agent_attempts[agent_id] = self.agent_attempts.get(agent_id, 0) + 1
@@ -188,13 +211,25 @@ class V3OrderingRunner(V3FixtureRunner):
         del timeout_seconds
         payload = prompt_input_payload(prompt_text)
         self.payloads.append(payload)
-        if payload.get("required_schema") == RESEARCH_TASK_SCHEMA:
+        if payload.get("required_schema") in {RESEARCH_TASK_SCHEMA, RESEARCH_TASK_SCHEMA_V2}:
             self.calls.append("research_task_planner")
             return RunnerResult(True, text=json.dumps(fixture_research_task_output(payload)), elapsed_seconds=0.01, returncode=0)
+        if payload.get("required_schema") == K_DOSSIER_SCHEMA:
+            with self.lock:
+                self.calls.append("k_deep_research_dossier")
+                self.started["k_deep_research_dossier"] = time.monotonic()
+            time.sleep(0.05)
+            response = fixture_k_dossier_output(payload)
+            with self.lock:
+                self.finished["k_deep_research_dossier"] = time.monotonic()
+                self.finished["k_deep_research"] = self.finished["k_deep_research_dossier"]
+            return RunnerResult(True, text=json.dumps(response), elapsed_seconds=0.01, returncode=0)
         agent_id = str(payload["agent_id"])
         with self.lock:
             self.calls.append(agent_id)
             self.started[agent_id] = time.monotonic()
+            if agent_id in {"f_partner_view", "w_partner_view", "g_partner_view"} and "k_deep_research_dossier" in self.started and "k_deep_research_dossier" not in self.finished:
+                self.order_errors.append(f"{agent_id}_started_before_k_dossier_finished")
             if agent_id == "chairman_synthesis":
                 missing = [key for key in ("k_deep_research", "f_partner_view", "w_partner_view", "g_partner_view") if key not in self.finished]
                 if missing:
@@ -1028,6 +1063,158 @@ def test_v35_requested_can_explicitly_fallback_to_v2() -> None:
     assert fallback_cfg.execution_model == EXECUTION_MODEL
     assert fallback_cfg.v3_independent_agents is False
     assert fallback_cfg.v35_research_system is False
+    assert fallback_cfg.explicit_v2_fallback is True
+
+
+def test_v40_fixture_run_builds_k_first_gates_and_alaya_hash_readback(tmp_path: Path) -> None:
+    cfg = config(tmp_path, symbols=("HKEX:0700",))
+    cfg = FullAnalystConfig(
+        **{
+            **cfg.__dict__,
+            "v3_independent_agents": True,
+            "v40_cognition_flywheel": True,
+            "execution_model": EXECUTION_MODEL_V40,
+            "requested_execution_model": EXECUTION_MODEL_V40,
+            "agent_concurrency": 3,
+            "alaya_mode": "real",
+        }
+    )
+    state_path = cfg.private_audit_root / "cognition_flywheel" / "full_analyst_memory_events.jsonl"
+    runner = V3OrderingRunner()
+
+    exit_code = run(
+        cfg,
+        universe_items=universe(),
+        price_rows=price_rows(),
+        runner=runner,
+        alaya_client=GotraInternalAlayaSyncClient(state_path=state_path, actor="test/full_analyst_pipeline"),
+    )
+
+    status = json.loads((cfg.output_dir / "status_full_analyst_evening_hk.json").read_text())
+    symbol_payload = json.loads((cfg.output_dir / "symbols" / "HKEX_0700.json").read_text())
+    records = [json.loads(line) for line in state_path.read_text().splitlines() if line.strip()]
+    payloads_by_agent = {
+        str(payload["agent_id"]): payload
+        for payload in runner.payloads
+        if payload.get("required_schema") not in {RESEARCH_TASK_SCHEMA, RESEARCH_TASK_SCHEMA_V2, K_DOSSIER_SCHEMA}
+    }
+
+    assert exit_code == 0
+    assert runner.order_errors == []
+    assert runner.calls[0] == "research_task_planner"
+    assert runner.calls.index("k_deep_research_dossier") < runner.calls.index("f_partner_view")
+    assert runner.calls.index("k_deep_research_dossier") < runner.calls.index("w_partner_view")
+    assert runner.calls.index("k_deep_research_dossier") < runner.calls.index("g_partner_view")
+    assert runner.calls.index("chairman_synthesis") > runner.calls.index("f_partner_view")
+    assert runner.calls.index("red_team_audit") > runner.calls.index("chairman_synthesis")
+    assert "k_deep_research" not in runner.calls
+
+    assert status["run_status"] == "completed_with_review_items"
+    assert status["prompt_template_version"] == PROMPT_TEMPLATE_VERSION_V40
+    assert status["symbol_schema"] == SYMBOL_SCHEMA_V40
+    assert status["research_task_schema"] == RESEARCH_TASK_SCHEMA_V2
+    assert status["evidence_packet_schema"] == EVIDENCE_PACKET_SCHEMA_V2
+    assert status["k_dossier_schema"] == K_DOSSIER_SCHEMA
+    assert status["perspective_agent_schema"] == PERSPECTIVE_AGENT_SCHEMA_V4
+    assert status["chairman_schema"] == CHAIRMAN_SCHEMA_V4
+    assert status["red_team_schema"] == RED_TEAM_SCHEMA_V4
+    assert status["research_quality_gate_schema"] == RESEARCH_QUALITY_GATE_SCHEMA
+    assert status["knowledge_gate_schema"] == KNOWLEDGE_GATE_SCHEMA
+    assert status["daily_reader_schema"] == "gotra.daily_reader_brief.v4"
+    assert status["methodology_version"] == METHODOLOGY_VERSION_V40
+    assert status["execution_model"] == EXECUTION_MODEL_V40
+    assert status["agent_parallelism"] == 3
+    assert status["agent_calls_total"] == 7
+    assert status["publish_count"] == 0
+    assert status["needs_review_count"] == 1
+    assert status["blocked_count"] == 0
+    assert status["failed_count"] == 0
+    assert status["alaya_event_schema"] == ALAYA_EVENT_SCHEMA_V40
+    assert status["alaya_sync_status"] == "ok"
+    assert status["alaya_readback_status"] == "verified"
+
+    assert symbol_payload["schema"] == SYMBOL_SCHEMA_V40
+    assert symbol_payload["prompt_template_version"] == PROMPT_TEMPLATE_VERSION_V40
+    assert symbol_payload["methodology_version"] == METHODOLOGY_VERSION_V40
+    assert symbol_payload["execution_model"] == EXECUTION_MODEL_V40
+    assert symbol_payload["research_task"]["schema"] == RESEARCH_TASK_SCHEMA_V2
+    assert symbol_payload["evidence_packet"]["schema"] == EVIDENCE_PACKET_SCHEMA_V2
+    assert symbol_payload["k_deep_research_dossier"]["schema"] == K_DOSSIER_SCHEMA
+    assert symbol_payload["k_dossier_hash"] == symbol_payload["k_deep_research_dossier"]["dossier_hash"]
+    assert symbol_payload["agent_hashes"]["k_deep_research"] == symbol_payload["k_dossier_hash"]
+    assert symbol_payload["agent_outputs"]["f_partner_view"]["schema"] == PERSPECTIVE_AGENT_SCHEMA_V4
+    assert symbol_payload["agent_outputs"]["w_partner_view"]["schema"] == PERSPECTIVE_AGENT_SCHEMA_V4
+    assert symbol_payload["agent_outputs"]["g_partner_view"]["schema"] == PERSPECTIVE_AGENT_SCHEMA_V4
+    assert symbol_payload["agent_outputs"]["chairman_synthesis"]["schema"] == CHAIRMAN_SCHEMA_V4
+    assert symbol_payload["agent_outputs"]["red_team_audit"]["schema"] == RED_TEAM_SCHEMA_V4
+    assert symbol_payload["agent_outputs"]["red_team_audit"]["red_team_role"] == "audit_not_judge"
+    assert symbol_payload["research_quality_gate"]["schema"] == RESEARCH_QUALITY_GATE_SCHEMA
+    assert symbol_payload["research_quality_gate"]["red_team_is_judge"] is False
+    assert symbol_payload["research_quality_gate_hash"] == symbol_payload["research_quality_gate"]["gate_hash"]
+    assert symbol_payload["knowledge_gate"]["schema"] == KNOWLEDGE_GATE_SCHEMA
+    assert symbol_payload["knowledge_gate_hash"] == symbol_payload["knowledge_gate"]["gate_hash"]
+    assert symbol_payload["knowledge_persistence"] == "persist_with_limitations"
+    assert symbol_payload["reader_boundary_gate"]["does_not_hide_research_content"] is True
+    assert symbol_payload["reader_boundary_gate"]["data_gap_visible"] is True
+    assert symbol_payload["reader_boundary_gate"]["needs_review_visible"] is True
+    assert symbol_payload["reader_boundary_gate"]["red_team_visible"] is True
+    assert symbol_payload["parallelism"]["k_dossier_first"] is True
+    assert symbol_payload["parallelism"]["fwg_ran_in_parallel"] is True
+    assert symbol_payload["parallelism"]["kfwg_ran_in_parallel"] is False
+    assert symbol_payload["judge_status"] == "needs_review"
+
+    for agent_id in ("f_partner_view", "w_partner_view", "g_partner_view"):
+        payload = payloads_by_agent[agent_id]
+        assert payload["required_schema"] == PERSPECTIVE_AGENT_SCHEMA_V4
+        assert payload["research_task"]["schema"] == RESEARCH_TASK_SCHEMA_V2
+        assert payload["evidence_packet"]["schema"] == EVIDENCE_PACKET_SCHEMA_V2
+        assert payload["k_deep_research_dossier"]["schema"] == K_DOSSIER_SCHEMA
+        assert payload["k_dossier_hash"] == symbol_payload["k_dossier_hash"]
+        assert payload["agent_brief"]
+        assert payload["must_not_conclude_without"]
+
+    chairman = payloads_by_agent["chairman_synthesis"]
+    red_team = payloads_by_agent["red_team_audit"]
+    assert chairman["required_schema"] == CHAIRMAN_SCHEMA_V4
+    assert set(chairman["dependencies"]) == {"k_deep_research", "f_partner_view", "w_partner_view", "g_partner_view"}
+    assert chairman["k_dossier_hash"] == symbol_payload["k_dossier_hash"]
+    assert red_team["required_schema"] == RED_TEAM_SCHEMA_V4
+    assert "chairman_synthesis" in red_team["dependencies"]
+    assert red_team["k_dossier_hash"] == symbol_payload["k_dossier_hash"]
+
+    assert records[0]["event_schema"] == ALAYA_EVENT_SCHEMA_V40
+    assert records[0]["cognition_flywheel_layer"] == METHODOLOGY_VERSION_V40
+    assert records[0]["research_task_hash"] == symbol_payload["research_task_hash"]
+    assert records[0]["evidence_packet_hash"] == symbol_payload["evidence_packet_hash"]
+    assert records[0]["k_dossier_hash"] == symbol_payload["k_dossier_hash"]
+    assert records[0]["agent_hashes"] == symbol_payload["agent_hashes"]
+    assert records[0]["chairman_hash"] == symbol_payload["agent_hashes"]["chairman_synthesis"]
+    assert records[0]["red_team_hash"] == symbol_payload["agent_hashes"]["red_team_audit"]
+    assert records[0]["research_quality_gate_hash"] == symbol_payload["research_quality_gate_hash"]
+    assert records[0]["knowledge_gate_hash"] == symbol_payload["knowledge_gate_hash"]
+    assert records[0]["public_payload_hash"] == symbol_payload["public_payload_hash"]
+    assert records[0]["knowledge_persistence"] == symbol_payload["knowledge_persistence"]
+    assert records[0]["unresolved_questions"] == symbol_payload["unresolved_questions"]
+    assert "readback_status" in records[0]
+
+
+def test_v40_requested_can_explicitly_fallback_to_v2() -> None:
+    args = parse_args(["--mode", MODE, "--v40-cognition-flywheel"])
+
+    cfg = config_from_args(args)
+
+    assert cfg.requested_execution_model == EXECUTION_MODEL_V40
+    assert cfg.execution_model == EXECUTION_MODEL_V40
+    assert cfg.v3_independent_agents is True
+    assert cfg.v40_cognition_flywheel is True
+
+    fallback_args = parse_args(["--mode", MODE, "--v40-cognition-flywheel", "--fallback-to-v2"])
+    fallback_cfg = config_from_args(fallback_args)
+
+    assert fallback_cfg.requested_execution_model == EXECUTION_MODEL_V40
+    assert fallback_cfg.execution_model == EXECUTION_MODEL
+    assert fallback_cfg.v3_independent_agents is False
+    assert fallback_cfg.v40_cognition_flywheel is False
     assert fallback_cfg.explicit_v2_fallback is True
 
 
