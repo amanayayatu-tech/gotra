@@ -68,6 +68,7 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     update_loop_public_status,
     v3_agent_failure_record,
     validate_evidence_packet_contract,
+    load_existing_research_ledger,
     merge_research_ledger,
     validate_publication_decision_contract,
     validate_ledger_entry_contract,
@@ -1485,6 +1486,25 @@ def test_research_ledger_integrity_detects_tampering() -> None:
 
     assert integrity["ok"] is False
     assert integrity["reason"] in {"ledger_entry_hash_mismatch", "ledger_previous_hash_mismatch"}
+
+
+def test_load_existing_research_ledger_blocks_corrupt_chain(tmp_path: Path) -> None:
+    payload = valid_published_symbol_payload()
+    manifest = merge_research_ledger([], [payload], generated_at="2026-06-29T10:00:00+00:00")
+    manifest["entries"][0]["previous_hash"] = "1" * 64
+    ledger_path = tmp_path / "research_ledger.json"
+    ledger_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="ledger_existing_integrity_failed"):
+        load_existing_research_ledger(ledger_path)
+
+
+def test_load_existing_research_ledger_blocks_invalid_json(tmp_path: Path) -> None:
+    ledger_path = tmp_path / "research_ledger.json"
+    ledger_path.write_text("{not-json", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="ledger_existing_json_invalid"):
+        load_existing_research_ledger(ledger_path)
 
 
 def test_research_signal_contract_blocks_missing_required_field() -> None:

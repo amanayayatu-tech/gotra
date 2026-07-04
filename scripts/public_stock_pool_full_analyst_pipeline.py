@@ -3318,13 +3318,17 @@ def load_existing_research_ledger(path: Path) -> list[dict[str, Any]]:
         return []
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
+    except OSError as exc:
+        raise ValueError("ledger_existing_read_failed") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError("ledger_existing_json_invalid") from exc
     entries = payload.get("entries") if isinstance(payload, dict) else []
     if not isinstance(entries, list):
-        return []
+        raise ValueError("ledger_existing_entries_not_list")
     chain = verify_ledger_chain([entry for entry in entries if isinstance(entry, dict)])
-    return [entry for entry in entries if isinstance(entry, dict)] if chain.get("ok") else []
+    if not chain.get("ok"):
+        raise ValueError(f"ledger_existing_integrity_failed:{chain.get('reason')}")
+    return [entry for entry in entries if isinstance(entry, dict)]
 
 
 def merge_research_ledger(
