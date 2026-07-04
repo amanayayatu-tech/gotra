@@ -70,6 +70,9 @@ from scripts.public_stock_pool_full_analyst_pipeline import (
     update_loop_public_status,
     v3_agent_failure_record,
     validate_evidence_packet_contract,
+    build_monthly_transparency_report,
+    build_monthly_transparency_reports,
+    validate_monthly_transparency_report_contract,
     load_existing_research_ledger,
     merge_research_ledger,
     validate_publication_decision_contract,
@@ -1532,6 +1535,70 @@ def test_research_ledger_not_due_entry_is_not_silently_marked_failed() -> None:
     assert manifest["review_unavailable"] == []
     assert manifest["review_coverage"]["not_due_count"] == 1
     assert manifest["review_coverage"]["reviewed_count"] == 0
+
+
+def test_monthly_transparency_report_contract_includes_required_sections() -> None:
+    entry = build_ledger_entry(
+        valid_published_symbol_payload(),
+        previous_hash="0" * 64,
+        version=1,
+        published_at="2026-06-29T10:00:00+00:00",
+    )
+    entry["review_price_observation"] = {
+        "start_price": 100,
+        "end_price": 98,
+        "benchmark_start_price": 100,
+        "benchmark_end_price": 103,
+        "price_source_id": "fixture_public_adjusted_close",
+        "benchmark_source_id": "fixture_public_benchmark",
+        "currency": "HKD",
+        "quality_flags": ["fixture_public_price_observation"],
+    }
+    entry["hash"] = stable_hash({key: value for key, value in entry.items() if key != "hash"})
+    manifest = merge_research_ledger([entry], [], generated_at="2026-07-30T10:00:00+00:00")
+
+    report = build_monthly_transparency_report(manifest, month="2026-06", generated_at="2026-07-30T10:00:00+00:00")
+
+    assert report["schema"] == "gotra.monthly_transparency_report.v1"
+    assert report["month"] == "2026-06"
+    assert report["published_count"] == 1
+    assert report["needs_review_count"] == 0
+    assert report["blocked_count"] == 0
+    assert report["review_coverage"]["reviewed_count"] == 1
+    assert report["error_cases"][0]["attribution"] == "below_benchmark"
+    assert isinstance(report["data_gaps"], list)
+    assert report["improvement_items"]
+    assert report["report_hash"]
+    validate_monthly_transparency_report_contract(report)
+
+
+def test_monthly_transparency_report_records_review_data_gap() -> None:
+    manifest = merge_research_ledger([], [valid_published_symbol_payload()], generated_at="2026-07-30T10:00:00+00:00")
+
+    report = build_monthly_transparency_report(manifest, month="2026-07", generated_at="2026-07-30T10:00:00+00:00")
+
+    assert report["review_coverage"]["unavailable_count"] == 1
+    assert report["data_gaps"][0]["reason"] == "public_review_price_or_benchmark_data_unavailable"
+    assert "public review price" in report["improvement_items"][0]
+
+
+def test_monthly_transparency_reports_generate_empty_month_without_fabrication() -> None:
+    reports = build_monthly_transparency_reports(
+        {
+            "schema": "gotra.public_research_ledger.v1",
+            "generated_at": "2026-07-30T10:00:00+00:00",
+            "entries": [],
+            "review_results": [],
+            "review_unavailable": [],
+        },
+        generated_at="2026-07-30T10:00:00+00:00",
+    )
+
+    assert len(reports) == 1
+    assert reports[0]["month"] == "2026-07"
+    assert reports[0]["published_count"] == 0
+    assert reports[0]["review_coverage"]["total_count"] == 0
+    assert reports[0]["improvement_items"][0].startswith("Publish at least one")
 
 
 def test_research_ledger_integrity_detects_tampering() -> None:
