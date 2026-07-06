@@ -72,10 +72,24 @@ def test_run_once_dry_run_and_heartbeat_preserve_no_fabrication(tmp_path):
     assert status["public_status"]["last_daily_run_status"] == "unavailable_no_live_daily_research_job_configured"
 
 
+def test_run_once_dry_run_before_start_is_preview_only(tmp_path):
+    evidence_root = tmp_path / "stage15B-runtime"
+    evidence_root.mkdir()
+    public_status = tmp_path / "beta_status.json"
+
+    dry_run = run_once(dry_run=True, evidence_root=evidence_root, public_status_path=public_status)
+
+    assert dry_run["run_status"] == "beta_not_started_dry_run_preview"
+    assert dry_run["beta_started"] is False
+    assert dry_run["beta_clock_started"] is False
+    assert dry_run["no_fabrication"] is True
+    assert not (evidence_root / "beta-start.json").exists()
+    assert not public_status.exists()
+
+
 def test_systemd_unit_definition_is_recoverable(tmp_path):
     units = build_systemd_units(tmp_path)
 
     assert "gotra-stage15b-beta.service" in units["timer"]
     assert "scripts/gotra_beta_runtime.py run-once" in units["service"]
     assert "StandardOutput=append:" in units["service"]
-
