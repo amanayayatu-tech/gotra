@@ -239,7 +239,7 @@ def classify_public_text(text: str) -> dict[str, int]:
     ):
         for match in re.finditer(pattern, text, flags=re.IGNORECASE):
             context = text[max(0, match.start() - 80): match.end() + 80].lower()
-            if any(marker in context for marker in ("not ", "no ", "不是", "不提供", "无", "禁止", "不得")):
+            if is_boundary_context(context):
                 continue
             forbidden_direct += 1
     secret_tokens = [
@@ -262,12 +262,43 @@ def classify_public_text(text: str) -> dict[str, int]:
         "/Users/peachy/Documents/" + "alaya",
         "external " + "Alaya",
     ]
-    external_alaya = sum(len(re.findall(re.escape(token), text)) for token in external_alaya_tokens)
+    external_alaya = 0
+    for token in external_alaya_tokens:
+        for match in re.finditer(re.escape(token), text):
+            context = text[max(0, match.start() - 100): match.end() + 100].lower()
+            if is_boundary_context(context):
+                continue
+            external_alaya += 1
     return {
         "forbidden_direct_advice": forbidden_direct,
         "forbidden_secret_raw_provider_leak": secret_hits,
         "forbidden_external_alaya_public_implication": external_alaya,
     }
+
+
+def is_boundary_context(context: str) -> bool:
+    return any(
+        marker in context
+        for marker in (
+            "not ",
+            "no ",
+            "not a ",
+            "is not",
+            "without",
+            "only",
+            "internal",
+            "boundary",
+            "不是",
+            "不提供",
+            "不会",
+            "不得",
+            "禁止",
+            "无",
+            "非",
+            "仅",
+            "内部",
+        )
+    )
 
 
 def source_safety_scan() -> dict[str, Any]:
