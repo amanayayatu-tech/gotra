@@ -390,7 +390,31 @@ def write_heartbeat(*, evidence_root: Path | None = None, public_status_path: Pa
 
 def run_once(*, dry_run: bool = False, evidence_root: Path | None = None, public_status_path: Path = PUBLIC_STATUS_PATH) -> dict[str, Any]:
     root = evidence_root or active_evidence_root()
-    start_payload = read_json(root / "beta-start.json")
+    start_file = root / "beta-start.json"
+    if dry_run and not start_file.exists():
+        now = utc_now()
+        return {
+            "schema": BETA_DAILY_EVENT_SCHEMA,
+            "event_type": "beta_daily_runtime_event_dry_run_preview",
+            "timestamp": now.isoformat().replace("+00:00", "Z"),
+            "day_index": None,
+            "run_status": "beta_not_started_dry_run_preview",
+            "publication_count": 0,
+            "needs_review_count": 0,
+            "data_gap_count": 0,
+            "blocked_count": 0,
+            "review_due_at_schedule": [1, 7, 30, 90],
+            "track_record_ledger_integrity": "not_checked_before_beta_start",
+            "public_safety_status": "research_only_boundary_preserved",
+            "alaya_internal_readback_status": "not_run_before_beta_start",
+            "beta_started": False,
+            "beta_clock_started": False,
+            "no_fabrication": True,
+            "paid_features_enabled": False,
+            "notes": "Dry-run preview only. It does not start the beta clock and does not fabricate daily research output.",
+            "boundary": boundary(),
+        }
+    start_payload = read_json(start_file)
     now = utc_now()
     status_text = "unavailable_no_live_daily_research_job_configured"
     event = {
