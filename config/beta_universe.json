@@ -1,0 +1,26 @@
+{
+  "schema": "gotra.launch.beta_universe.v1",
+  "beta_state": "ready_not_started",
+  "beta_clock_started": false,
+  "paid_subscription_enabled": false,
+  "performance_proof_claimed": false,
+  "universe": [
+    {"symbol": "HKEX:0700", "label": "Tencent", "market": "HK", "review_windows": [1, 7, 30, 90]},
+    {"symbol": "HKEX:1810", "label": "Xiaomi", "market": "HK", "review_windows": [1, 7, 30, 90]},
+    {"symbol": "HKEX:9688", "label": "XPeng", "market": "HK", "review_windows": [1, 7, 30, 90]},
+    {"symbol": "HKEX:9988", "label": "Alibaba", "market": "HK", "review_windows": [1, 7, 30, 90]},
+    {"symbol": "HKEX:3690", "label": "Meituan", "market": "HK", "review_windows": [1, 7, 30, 90]},
+    {"symbol": "HKEX:1211", "label": "BYD", "market": "HK", "review_windows": [1, 7, 30, 90]},
+    {"symbol": "NASDAQ:MSFT", "label": "Microsoft", "market": "US", "review_windows": [1, 7, 30, 90]},
+    {"symbol": "NASDAQ:NVDA", "label": "NVIDIA", "market": "US", "review_windows": [1, 7, 30, 90]},
+    {"symbol": "NASDAQ:AAPL", "label": "Apple", "market": "US", "review_windows": [1, 7, 30, 90]},
+    {"symbol": "NASDAQ:GOOGL", "label": "Alphabet", "market": "US", "review_windows": [1, 7, 30, 90]},
+    {"symbol": "NASDAQ:META", "label": "Meta Platforms", "market": "US", "review_windows": [1, 7, 30, 90]},
+    {"symbol": "NYSE:TSM", "label": "TSMC ADR", "market": "US", "review_windows": [1, 7, 30, 90]}
+  ],
+  "limitations": [
+    "30d beta has not started.",
+    "No paid subscription is enabled.",
+    "No result may be used as investment advice, trading signal, target price, position sizing, return promise, performance proof, or science/public proof."
+  ]
+}
