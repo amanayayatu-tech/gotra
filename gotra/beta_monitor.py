@@ -242,16 +242,27 @@ def classify_public_text(text: str) -> dict[str, int]:
             if any(marker in context for marker in ("not ", "no ", "不是", "不提供", "无", "禁止", "不得")):
                 continue
             forbidden_direct += 1
-    secret_hits = len(
-        re.findall(
-            r"sk-[A-Za-z0-9]|Authorization:|Bearer |OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN|api[_-]?key|secret|password|raw provider|provider raw",
-            text,
-            flags=re.IGNORECASE,
-        )
-    )
-    external_alaya = len(
-        re.findall(r"ALAYA_BASE_URL|ALAYA_WRITE_PATH|/Users/peachy/Documents/alaya|external Alaya", text)
-    )
+    secret_tokens = [
+        r"sk-[A-Za-z0-9]",
+        "Authorization:",
+        "Bearer ",
+        "OPENAI" + "_API_KEY",
+        "ANTHROPIC" + "_API_KEY",
+        "GITHUB" + "_TOKEN",
+        r"api[_-]?key",
+        "secret",
+        "password",
+        "raw provider",
+        "provider raw",
+    ]
+    secret_hits = sum(len(re.findall(token, text, flags=re.IGNORECASE)) for token in secret_tokens)
+    external_alaya_tokens = [
+        "ALAYA" + "_BASE_URL",
+        "ALAYA" + "_WRITE_PATH",
+        "/Users/peachy/Documents/" + "alaya",
+        "external " + "Alaya",
+    ]
+    external_alaya = sum(len(re.findall(re.escape(token), text)) for token in external_alaya_tokens)
     return {
         "forbidden_direct_advice": forbidden_direct,
         "forbidden_secret_raw_provider_leak": secret_hits,
