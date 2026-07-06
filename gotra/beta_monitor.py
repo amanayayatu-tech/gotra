@@ -15,14 +15,13 @@ import subprocess
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from gotra.beta_runtime import (
     PUBLIC_STATUS_PATH,
-    REMAINING_REVIEW_ITEMS,
     SERVICE_NAME as DAILY_SERVICE_NAME,
     TIMER_NAME as DAILY_TIMER_NAME,
     active_evidence_root,
