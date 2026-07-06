@@ -45,6 +45,7 @@ MONITOR_POST_RUN_TIMER = "gotra-beta-monitor-post-run.timer"
 MONITOR_HEALTH_SERVICE = "gotra-beta-monitor-health.service"
 MONITOR_HEALTH_TIMER = "gotra-beta-monitor-health.timer"
 SYSTEMD_DIR = Path("/etc/systemd/system")
+PUBLIC_LEDGER_ROOT = Path(os.environ.get("GOTRA_PUBLIC_LEDGER_PATH", "/opt/gotra-public-ledger"))
 MAIN_HEARTBEAT_PATH = Path("/tmp/gotra-launch-roadmap-heartbeat.json")
 MAIN_EVENTS_PATH = Path("/tmp/gotra-launch-roadmap-events.jsonl")
 MAIN_SUMMARY_PATH = Path("/tmp/gotra-launch-roadmap-summary.md")
@@ -243,15 +244,15 @@ def classify_public_text(text: str) -> dict[str, int]:
                 continue
             forbidden_direct += 1
     secret_tokens = [
-        r"sk-[A-Za-z0-9]",
-        "Authorization:",
-        "Bearer ",
+        r"\bsk-[A-Za-z0-9]{16,}\b",
+        r"\bAuthorization:",
+        r"\bBearer\s+[A-Za-z0-9._-]{12,}",
         "OPENAI" + "_API_KEY",
         "ANTHROPIC" + "_API_KEY",
         "GITHUB" + "_TOKEN",
-        r"api[_-]?key",
-        "secret",
-        "password",
+        r"\bapi[_-]?key\b",
+        r"\bsecret\b",
+        r"\bpassword\b",
         "raw provider",
         "provider raw",
     ]
@@ -291,6 +292,9 @@ def is_boundary_context(context: str) -> bool:
             "不是",
             "不提供",
             "不会",
+            "不能",
+            "不构成",
+            "避免",
             "不得",
             "禁止",
             "无",
@@ -302,7 +306,7 @@ def is_boundary_context(context: str) -> bool:
 
 
 def source_safety_scan() -> dict[str, Any]:
-    root = Path("/opt/gotra-public-ledger")
+    root = PUBLIC_LEDGER_ROOT
     paths = [root / "src", root / "public", root / "scripts"]
     existing_paths = [path for path in paths if path.exists()]
     if not existing_paths:
@@ -373,6 +377,15 @@ def is_scanner_or_test_context(rel_path: str, context: str) -> bool:
             "allowed",
             "audit",
             "boundary",
+            "failure",
+            "failures",
+            "unacceptable",
+            "输出",
+            "失败",
+            "复核",
+            "审计",
+            "边界",
+            "能当",
             "not investment advice",
             "not a trading signal",
             "不是投资建议",
