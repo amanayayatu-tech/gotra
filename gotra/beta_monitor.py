@@ -307,17 +307,92 @@ def source_safety_scan() -> dict[str, Any]:
     existing_paths = [path for path in paths if path.exists()]
     if not existing_paths:
         return {"available": False, "reason": "public_ledger_paths_absent"}
-    text_parts: list[str] = []
+    result: dict[str, Any] = {
+        "available": True,
+        "allowed_boundary_copy": 0,
+        "allowed_scanner_test_history": 0,
+        "allowed_context_mention": 0,
+        "forbidden_direct_advice": 0,
+        "forbidden_secret_raw_provider_leak": 0,
+        "forbidden_external_alaya_public_implication": 0,
+        "forbidden_samples": [],
+    }
     for base in existing_paths:
         for path in base.rglob("*"):
             if path.is_file() and path.suffix.lower() in {".ts", ".tsx", ".js", ".mjs", ".html", ".json", ".md"}:
                 try:
-                    text_parts.append(path.read_text(encoding="utf-8", errors="replace"))
+                    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
                 except OSError:
                     continue
-    classified = classify_public_text("\n".join(text_parts))
-    classified["available"] = True
-    return classified
+                for line_number, line in enumerate(lines, start=1):
+                    classify_source_line(result, path.relative_to(root), line_number, line)
+    return result
+
+
+def classify_source_line(result: dict[str, Any], rel_path: Path, line_number: int, line: str) -> None:
+    if not line.strip():
+        return
+    context = line.lower()
+    rel = str(rel_path)
+    scanner_context = is_scanner_or_test_context(rel, context)
+    boundary_context = is_boundary_context(context)
+    advice_hit = classify_public_text(line)["forbidden_direct_advice"] > 0
+    secret_hit = classify_public_text(line)["forbidden_secret_raw_provider_leak"] > 0
+    alaya_hit = classify_public_text(line)["forbidden_external_alaya_public_implication"] > 0
+
+    for hit_type, hit in (
+        ("forbidden_direct_advice", advice_hit),
+        ("forbidden_secret_raw_provider_leak", secret_hit),
+        ("forbidden_external_alaya_public_implication", alaya_hit),
+    ):
+        if not hit:
+            continue
+        if boundary_context:
+            result["allowed_boundary_copy"] += 1
+            continue
+        if scanner_context:
+            result["allowed_scanner_test_history"] += 1
+            continue
+        if hit_type == "forbidden_secret_raw_provider_leak" and is_generic_secret_context(context):
+            result["allowed_context_mention"] += 1
+            continue
+        result[hit_type] += 1
+        if len(result["forbidden_samples"]) < 10:
+            result["forbidden_samples"].append({"path": rel, "line": line_number, "type": hit_type})
+
+
+def is_scanner_or_test_context(rel_path: str, context: str) -> bool:
+    rel = rel_path.lower()
+    return any(marker in rel for marker in ("scan", "compliance", "test", "history")) or any(
+        marker in context
+        for marker in (
+            "scan",
+            "scanner",
+            "grep",
+            "forbidden",
+            "allowed",
+            "audit",
+            "boundary",
+            "not investment advice",
+            "not a trading signal",
+            "不是投资建议",
+            "不是交易信号",
+        )
+    )
+
+
+def is_generic_secret_context(context: str) -> bool:
+    return not any(
+        marker in context
+        for marker in (
+            "sk-",
+            "authorization:",
+            "bearer ",
+            "openai" + "_api_key",
+            "anthropic" + "_api_key",
+            "github" + "_token",
+        )
+    )
 
 
 def latest_daily_event(evidence_root: Path) -> dict[str, Any] | None:
