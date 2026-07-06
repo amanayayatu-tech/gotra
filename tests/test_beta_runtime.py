@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
+import gotra.beta_runtime as beta_runtime
 from gotra.beta_runtime import (
     build_systemd_units,
     run_once,
@@ -85,6 +86,18 @@ def test_run_once_dry_run_before_start_is_preview_only(tmp_path):
     assert dry_run["no_fabrication"] is True
     assert not (evidence_root / "beta-start.json").exists()
     assert not public_status.exists()
+
+
+def test_non_default_public_status_does_not_activate_global_pointer(tmp_path, monkeypatch):
+    active_pointer = tmp_path / "active-path.txt"
+    monkeypatch.setattr(beta_runtime, "ACTIVE_POINTER_PATH", active_pointer)
+    evidence_root = tmp_path / "stage15B-runtime"
+    public_status = tmp_path / "beta_status.json"
+
+    start_beta_runtime(evidence_root=evidence_root, public_status_path=public_status, install_scheduler=False)
+
+    assert public_status.exists()
+    assert not active_pointer.exists()
 
 
 def test_systemd_unit_definition_is_recoverable(tmp_path):

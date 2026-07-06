@@ -335,8 +335,9 @@ def start_beta_runtime(
     write_json(root / "beta-heartbeat.json", build_beta_heartbeat(root, status, current))
     (root / "beta-summary.md").write_text(beta_summary_markdown(status), encoding="utf-8")
     (root / "weekly-reports" / "beta-weekly-report-template.md").write_text(weekly_report_template(started_at), encoding="utf-8")
-    ACTIVE_POINTER_PATH.parent.mkdir(parents=True, exist_ok=True)
-    ACTIVE_POINTER_PATH.write_text(str(root) + "\n", encoding="utf-8")
+    if public_status_path == PUBLIC_STATUS_PATH:
+        ACTIVE_POINTER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ACTIVE_POINTER_PATH.write_text(str(root) + "\n", encoding="utf-8")
     write_json(root / "scheduler-status.json", {"scheduler": scheduler, "systemd_status": systemd_status()})
     return {"root": str(root), "status": status, "scheduler": scheduler}
 
