@@ -294,6 +294,7 @@ def is_boundary_context(context: str) -> bool:
             "不会",
             "不能",
             "不构成",
+            "不要",
             "避免",
             "不得",
             "禁止",
@@ -367,7 +368,7 @@ def classify_source_line(result: dict[str, Any], rel_path: Path, line_number: in
 
 def is_scanner_or_test_context(rel_path: str, context: str) -> bool:
     rel = rel_path.lower()
-    return any(marker in rel for marker in ("scan", "compliance", "test", "history")) or any(
+    return any(marker in rel for marker in ("scan", "compliance", "test", "history", "generate", "smoke", "check-secrets")) or any(
         marker in context
         for marker in (
             "scan",
@@ -386,6 +387,7 @@ def is_scanner_or_test_context(rel_path: str, context: str) -> bool:
             "审计",
             "边界",
             "能当",
+            "吗？",
             "not investment advice",
             "not a trading signal",
             "不是投资建议",
