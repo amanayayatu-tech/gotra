@@ -49,6 +49,11 @@ def _prepare_runtime(tmp_path, monkeypatch):
     evidence_root = tmp_path / "stage15B-runtime"
     public_status = tmp_path / "beta_status.json"
     monkeypatch.setattr(beta_runtime, "ACTIVE_POINTER_PATH", active_pointer)
+    monkeypatch.setattr(
+        beta_runtime,
+        "read_next_systemd_timer_due",
+        lambda unit=beta_runtime.TIMER_NAME: {"available": False, "unit": unit},
+    )
     monkeypatch.setattr(beta_monitor, "MAIN_HEARTBEAT_PATH", tmp_path / "roadmap-heartbeat.json")
     monkeypatch.setattr(beta_monitor, "MAIN_EVENTS_PATH", tmp_path / "roadmap-events.jsonl")
     monkeypatch.setattr(beta_monitor, "MAIN_SUMMARY_PATH", tmp_path / "roadmap-summary.md")
@@ -81,6 +86,11 @@ def test_health_check_writes_monitor_heartbeat_without_completing_beta(tmp_path,
     assert heartbeat["beta_complete"] is False
     assert heartbeat["paid_features_enabled"] is False
     assert heartbeat["current_blocker"] is None
+    assert heartbeat["next_daily_run_due_at"] == "2026-07-06T10:30:00Z"
+    assert "fallback_schedule" in heartbeat["next_daily_run_due_at_source"]
+    assert heartbeat["daily_research_job_configured"] is False
+    assert heartbeat["valid_research_output_days"] == 0
+    assert heartbeat["unavailable_days"] == 0
     assert (evidence_root / "monitor" / "monitor-events.jsonl").exists()
 
 
@@ -115,6 +125,10 @@ def test_daily_report_writes_chinese_report_and_summary(tmp_path, monkeypatch):
     assert payload["result"] == "pass"
     assert "# GOTRA Stage 15B 30 天公开 Beta 日报 - 2026-07-06" in report
     assert "BETA_IN_PROGRESS_REAL_TIME_WAIT" in report
+    assert "next_daily_run_due_at_source" in report
+    assert "daily research job configured: `false`" in report
+    assert "valid_research_output_days: `0`" in report
+    assert "unavailable_days: `0`" in report
     assert "这不是 30d beta complete" in report
     assert "不是投资建议" in report
     summary = (tmp_path / "roadmap-summary.md").read_text(encoding="utf-8")

@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from gotra.beta_readiness import load_beta_universe
 
@@ -29,10 +31,16 @@ TIMER_NAME = "gotra-stage15b-beta.timer"
 SERVICE_PATH = Path("/etc/systemd/system") / SERVICE_NAME
 TIMER_PATH = Path("/etc/systemd/system") / TIMER_NAME
 REQUIRED_DAYS = 30
+LOCAL_TZ = ZoneInfo("Asia/Shanghai")
+UNAVAILABLE_DAILY_RUN_STATUSES = {
+    "day0_started_no_daily_research_run_yet",
+    "unavailable_no_live_daily_research_job_configured",
+}
 REMAINING_REVIEW_ITEMS = [
     "Full Analyst public sample withheld pending fresh real v4 canary",
     "Backend/private external Alaya client references remain P1 before formal/paid readiness",
     "npm audit 17 moderate dev-only/transitive vulnerabilities remain review items",
+    "Daily research job not configured; beta clock running but valid_research_output_days remains 0",
 ]
 
 
@@ -89,12 +97,141 @@ def elapsed_days(started_at: str, *, now: datetime | None = None) -> int:
     return max(0, int((current - start).total_seconds() // 86400))
 
 
-def next_daily_run_due_at(now: datetime | None = None) -> str:
+def iso_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def fallback_next_daily_run_metadata(now: datetime | None = None) -> dict[str, Any]:
     current = now or utc_now()
-    candidate = current.replace(hour=18, minute=30, second=0, microsecond=0)
-    if candidate <= current:
-        candidate = candidate + timedelta(days=1)
-    return candidate.isoformat().replace("+00:00", "Z")
+    local_current = current.astimezone(LOCAL_TZ)
+    candidate_local = local_current.replace(hour=18, minute=30, second=0, microsecond=0)
+    if candidate_local <= local_current:
+        candidate_local += timedelta(days=1)
+    return {
+        "next_daily_run_due_at": iso_utc(candidate_local),
+        "next_daily_run_due_at_local": candidate_local.isoformat(),
+        "next_daily_run_due_at_source": "fallback_schedule_asia_shanghai_18_30",
+        "timer_active": None,
+        "timer_unit": TIMER_NAME,
+        "timer_raw": "",
+    }
+
+
+def read_next_systemd_timer_due(unit: str = TIMER_NAME) -> dict[str, Any]:
+    if shutil.which("systemctl") is None:
+        return {"available": False, "unit": unit, "reason": "systemctl_unavailable"}
+    active = subprocess.run(
+        ["systemctl", "is-active", unit],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    show = subprocess.run(
+        ["systemctl", "show", unit, "-p", "NextElapseUSecRealtime", "--value"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    raw = show.stdout.strip()
+    if show.returncode != 0 or not raw or raw in {"0", "n/a", "N/A"}:
+        return {
+            "available": True,
+            "unit": unit,
+            "timer_active": active.stdout.strip() == "active",
+            "reason": "next_elapse_unavailable",
+            "raw": raw,
+        }
+    match = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})", raw)
+    if not match:
+        return {
+            "available": True,
+            "unit": unit,
+            "timer_active": active.stdout.strip() == "active",
+            "reason": "date_parse_failed",
+            "raw": raw,
+        }
+    parsed = datetime.fromisoformat(f"{match.group(1)}T{match.group(2)}").replace(tzinfo=LOCAL_TZ)
+    due_utc = iso_utc(parsed)
+    return {
+        "available": True,
+        "unit": unit,
+        "timer_active": active.stdout.strip() == "active",
+        "raw": raw,
+        "next_daily_run_due_at": due_utc,
+        "next_daily_run_due_at_local": parsed.astimezone(LOCAL_TZ).isoformat() if parsed else "",
+        "next_daily_run_due_at_source": "systemd_timer",
+    }
+
+
+def next_daily_run_metadata(
+    *,
+    now: datetime | None = None,
+    previous_due_at: str | None = None,
+    prefer_systemd: bool = True,
+) -> dict[str, Any]:
+    current = now or utc_now()
+    metadata: dict[str, Any]
+    if prefer_systemd:
+        systemd = read_next_systemd_timer_due(TIMER_NAME)
+        if systemd.get("next_daily_run_due_at") and systemd.get("timer_active") is True:
+            metadata = {
+                "next_daily_run_due_at": systemd["next_daily_run_due_at"],
+                "next_daily_run_due_at_local": systemd.get("next_daily_run_due_at_local", ""),
+                "next_daily_run_due_at_source": systemd.get("next_daily_run_due_at_source", "systemd_timer"),
+                "timer_active": True,
+                "timer_unit": TIMER_NAME,
+                "timer_raw": systemd.get("raw", ""),
+            }
+        else:
+            metadata = fallback_next_daily_run_metadata(current)
+            metadata["next_daily_run_due_at_source"] = f"{metadata['next_daily_run_due_at_source']}_systemd_unavailable"
+            metadata["timer_active"] = systemd.get("timer_active")
+            metadata["timer_raw"] = str(systemd.get("raw", ""))
+    else:
+        metadata = fallback_next_daily_run_metadata(current)
+    previous = parse_iso_datetime(previous_due_at)
+    metadata["stale_status_detected"] = bool(previous and previous <= current)
+    metadata["previous_next_daily_run_due_at"] = previous_due_at or ""
+    return metadata
+
+
+def next_daily_run_due_at(now: datetime | None = None) -> str:
+    return str(next_daily_run_metadata(now=now, prefer_systemd=False)["next_daily_run_due_at"])
+
+
+def beta_daily_counts(evidence_root: Path | None = None, *, extra_event: dict[str, Any] | None = None) -> dict[str, int]:
+    events: list[dict[str, Any]] = []
+    if evidence_root is not None:
+        events_path = evidence_root / "beta-daily-events.jsonl"
+        if events_path.exists():
+            for line in events_path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    events.append(json.loads(line))
+    if extra_event is not None:
+        events.append(extra_event)
+    daily_events = [event for event in events if event.get("event_type") == "beta_daily_runtime_event"]
+    unavailable_days = sum(1 for event in daily_events if event.get("run_status") in UNAVAILABLE_DAILY_RUN_STATUSES)
+    valid_research_output_days = sum(
+        1
+        for event in daily_events
+        if event.get("run_status") not in UNAVAILABLE_DAILY_RUN_STATUSES
+        and int(event.get("publication_count", 0) or 0) > 0
+    )
+    return {
+        "valid_research_output_days": valid_research_output_days,
+        "unavailable_days": unavailable_days,
+    }
 
 
 def ensure_runtime_dirs(evidence_root: Path) -> None:
@@ -230,9 +367,13 @@ def build_public_status(
     last_daily_event_at: str | None = None,
     last_daily_run_status: str | None = None,
     now: datetime | None = None,
+    evidence_root: Path | None = None,
+    previous_due_at: str | None = None,
 ) -> dict[str, Any]:
     started_at = str(start_payload["started_at"])
     days = elapsed_days(started_at, now=now)
+    next_run = next_daily_run_metadata(now=now, previous_due_at=previous_due_at or start_payload.get("next_daily_run_due_at"))
+    output_counts = beta_daily_counts(evidence_root)
     return {
         "schema": PUBLIC_BETA_STATUS_SCHEMA,
         "beta_started": True,
@@ -245,7 +386,18 @@ def build_public_status(
         "free_beta": True,
         "last_daily_event_at": last_daily_event_at or start_payload.get("last_daily_event_at") or started_at,
         "last_daily_run_status": last_daily_run_status or start_payload.get("last_daily_run_status") or "day0_started_no_daily_research_run_yet",
-        "next_daily_run_due_at": next_daily_run_due_at(now=now),
+        "next_daily_run_due_at": next_run["next_daily_run_due_at"],
+        "next_daily_run_due_at_local": next_run["next_daily_run_due_at_local"],
+        "next_daily_run_due_at_source": next_run["next_daily_run_due_at_source"],
+        "next_daily_run_timer_active": next_run["timer_active"],
+        "next_daily_run_timer_unit": next_run["timer_unit"],
+        "stale_status_detected": next_run["stale_status_detected"],
+        "previous_next_daily_run_due_at": next_run["previous_next_daily_run_due_at"],
+        "daily_research_job_configured": False,
+        "daily_research_job_status": "not_configured",
+        "safe_to_enable_daily_research_job_from_next_run": False,
+        "valid_research_output_days": output_counts["valid_research_output_days"],
+        "unavailable_days": output_counts["unavailable_days"],
         "no_fabrication": True,
         "not_launch_ready": True,
         "not_paid_ready": True,
@@ -330,7 +482,7 @@ def start_beta_runtime(
         "boundary": boundary(),
     }
     append_jsonl(root / "beta-daily-events.jsonl", event)
-    status = build_public_status(start_payload, now=current)
+    status = build_public_status(start_payload, now=current, evidence_root=root)
     write_json(public_status_path, status)
     write_json(root / "beta-heartbeat.json", build_beta_heartbeat(root, status, current))
     (root / "beta-summary.md").write_text(beta_summary_markdown(status), encoding="utf-8")
@@ -373,6 +525,13 @@ def build_beta_heartbeat(evidence_root: Path, status: dict[str, Any], now: datet
         "beta_complete": False,
         "last_daily_run_status": status["last_daily_run_status"],
         "next_daily_run_due_at": status["next_daily_run_due_at"],
+        "next_daily_run_due_at_local": status.get("next_daily_run_due_at_local"),
+        "next_daily_run_due_at_source": status.get("next_daily_run_due_at_source"),
+        "next_daily_run_timer_active": status.get("next_daily_run_timer_active"),
+        "stale_status_detected": status.get("stale_status_detected"),
+        "daily_research_job_configured": status.get("daily_research_job_configured"),
+        "valid_research_output_days": status.get("valid_research_output_days", 0),
+        "unavailable_days": status.get("unavailable_days", 0),
         "current_blocker": None,
         "boundary": boundary(),
     }
@@ -381,7 +540,13 @@ def build_beta_heartbeat(evidence_root: Path, status: dict[str, Any], now: datet
 def write_heartbeat(*, evidence_root: Path | None = None, public_status_path: Path = PUBLIC_STATUS_PATH) -> dict[str, Any]:
     root = evidence_root or active_evidence_root()
     start_payload = read_json(root / "beta-start.json")
-    status = build_public_status(start_payload)
+    previous_status = read_json(public_status_path) if public_status_path.exists() else {}
+    status = build_public_status(
+        start_payload,
+        now=utc_now(),
+        evidence_root=root,
+        previous_due_at=previous_status.get("next_daily_run_due_at"),
+    )
     write_json(public_status_path, status)
     heartbeat = build_beta_heartbeat(root, status)
     write_json(root / "beta-heartbeat.json", heartbeat)
@@ -437,13 +602,23 @@ def run_once(*, dry_run: bool = False, evidence_root: Path | None = None, public
         "notes": "Daily research job is not fabricated by the beta runtime. This event preserves no-fabrication state until a real daily run is configured.",
         "boundary": boundary(),
     }
+    event.update(beta_daily_counts(root, extra_event=event))
+    event["daily_research_job_configured"] = False
     if dry_run:
         return event
     append_jsonl(root / "beta-daily-events.jsonl", event)
     start_payload["last_daily_event_at"] = event["timestamp"]
     start_payload["last_daily_run_status"] = status_text
     write_json(root / "beta-start.json", start_payload)
-    status = build_public_status(start_payload, last_daily_event_at=event["timestamp"], last_daily_run_status=status_text, now=now)
+    previous_status = read_json(public_status_path) if public_status_path.exists() else {}
+    status = build_public_status(
+        start_payload,
+        last_daily_event_at=event["timestamp"],
+        last_daily_run_status=status_text,
+        now=now,
+        evidence_root=root,
+        previous_due_at=previous_status.get("next_daily_run_due_at"),
+    )
     write_json(public_status_path, status)
     write_json(root / "beta-heartbeat.json", build_beta_heartbeat(root, status, now))
     daily_dir = root / "daily-runs" / now.strftime("%Y-%m-%d")
@@ -456,7 +631,13 @@ def run_once(*, dry_run: bool = False, evidence_root: Path | None = None, public
 def status_payload(*, evidence_root: Path | None = None, public_status_path: Path = PUBLIC_STATUS_PATH) -> dict[str, Any]:
     root = evidence_root or active_evidence_root()
     start_payload = read_json(root / "beta-start.json")
-    status = build_public_status(start_payload)
+    previous_status = read_json(public_status_path) if public_status_path.exists() else {}
+    status = build_public_status(
+        start_payload,
+        now=utc_now(),
+        evidence_root=root,
+        previous_due_at=previous_status.get("next_daily_run_due_at"),
+    )
     public_status = read_json(public_status_path) if public_status_path.exists() else None
     return {
         "stage": "15B_30d_public_beta_runtime",
