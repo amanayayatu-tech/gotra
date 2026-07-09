@@ -27,6 +27,8 @@ from gotra.beta_runtime import (
     active_evidence_root,
     append_jsonl,
     boundary,
+    build_beta_heartbeat,
+    build_public_status,
     read_json,
     status_payload,
     utc_now,
@@ -421,10 +423,32 @@ def latest_daily_event(evidence_root: Path) -> dict[str, Any] | None:
     return last
 
 
-def load_beta_status(public_status_path: Path = PUBLIC_STATUS_PATH) -> dict[str, Any]:
-    if public_status_path.exists():
-        return read_json(public_status_path)
-    return status_payload(public_status_path=public_status_path)["public_status"]
+def load_beta_status(
+    public_status_path: Path = PUBLIC_STATUS_PATH,
+    *,
+    evidence_root: Path | None = None,
+    now: datetime | None = None,
+    refresh_timer: bool = False,
+    write_outputs: bool = False,
+) -> dict[str, Any]:
+    current_status = read_json(public_status_path) if public_status_path.exists() else None
+    if refresh_timer and evidence_root is not None:
+        start_payload = read_json(evidence_root / "beta-start.json")
+        refreshed = build_public_status(
+            start_payload,
+            last_daily_event_at=(current_status or {}).get("last_daily_event_at"),
+            last_daily_run_status=(current_status or {}).get("last_daily_run_status"),
+            now=now,
+            evidence_root=evidence_root,
+            previous_due_at=(current_status or {}).get("next_daily_run_due_at"),
+        )
+        if write_outputs and refreshed != current_status:
+            write_json(public_status_path, refreshed)
+            write_json(evidence_root / "beta-heartbeat.json", build_beta_heartbeat(evidence_root, refreshed, now))
+        return refreshed
+    if current_status is not None:
+        return current_status
+    return status_payload(evidence_root=evidence_root, public_status_path=public_status_path)["public_status"]
 
 
 def monitor_timer_statuses() -> dict[str, Any]:
@@ -441,10 +465,11 @@ def build_monitor_heartbeat(
     public_status_path: Path = PUBLIC_STATUS_PATH,
     production: dict[str, Any] | None = None,
     now: datetime | None = None,
+    status: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     root = evidence_root or active_evidence_root()
     current = now or utc_now()
-    status = load_beta_status(public_status_path)
+    status = status or load_beta_status(public_status_path, evidence_root=root, now=current, refresh_timer=True)
     production_status = production or production_smoke()
     gotra_state = git_state(Path("/opt/gotra"))
     ledger_state = git_state(Path("/opt/gotra-public-ledger"))
@@ -461,6 +486,14 @@ def build_monitor_heartbeat(
         "last_daily_run_status": status.get("last_daily_run_status"),
         "last_daily_event_at": status.get("last_daily_event_at"),
         "next_daily_run_due_at": status.get("next_daily_run_due_at"),
+        "next_daily_run_due_at_local": status.get("next_daily_run_due_at_local"),
+        "next_daily_run_due_at_source": status.get("next_daily_run_due_at_source"),
+        "next_daily_run_timer_active": status.get("next_daily_run_timer_active"),
+        "stale_status_detected": status.get("stale_status_detected"),
+        "daily_research_job_configured": status.get("daily_research_job_configured"),
+        "daily_research_job_status": status.get("daily_research_job_status"),
+        "valid_research_output_days": status.get("valid_research_output_days", 0),
+        "unavailable_days": status.get("unavailable_days", 0),
         "systemd_daily_timer": unit_status(DAILY_TIMER_NAME),
         "systemd_daily_service": unit_status(DAILY_SERVICE_NAME),
         "systemd_monitor_timers": monitor_timer_statuses(),
@@ -535,12 +568,19 @@ def health_check(
     ensure_monitor_dirs(monitor)
     current = now or utc_now()
     production = production_smoke()
-    status = load_beta_status(public_status_path)
+    status = load_beta_status(
+        public_status_path,
+        evidence_root=root,
+        now=current,
+        refresh_timer=True,
+        write_outputs=write_outputs,
+    )
     heartbeat = build_monitor_heartbeat(
         evidence_root=root,
         public_status_path=public_status_path,
         production=production,
         now=current,
+        status=status,
     )
     snapshot = {
         "schema": MONITOR_EVENT_SCHEMA,
@@ -697,7 +737,14 @@ def render_daily_report(
 - latest daily service result: `{runtime['daily_service'].get('is_active')}`
 - last_daily_event_at: `{status.get('last_daily_event_at')}`
 - next_daily_run_due_at: `{status.get('next_daily_run_due_at')}`
+- next_daily_run_due_at_local: `{status.get('next_daily_run_due_at_local')}`
+- next_daily_run_due_at_source: `{status.get('next_daily_run_due_at_source')}`
+- timer_active: `{status.get('next_daily_run_timer_active')}`
+- stale_status_detected: `{status.get('stale_status_detected')}`
 - daily run status: `{status.get('last_daily_run_status')}`
+- daily research job configured: `{str(status.get('daily_research_job_configured') is True).lower()}`
+- valid_research_output_days: `{status.get('valid_research_output_days', 0)}`
+- unavailable_days: `{status.get('unavailable_days', 0)}`
 - blocked_count: `{(latest_event or {}).get('blocked_count', 0)}`
 - failed_count: `0`
 - needs_review_count: `{(latest_event or {}).get('needs_review_count', 0)}`
@@ -733,6 +780,7 @@ def render_daily_report(
 - 是否出现 needs_review: `{str((latest_event or {}).get('needs_review_count', 0) > 0).lower()}`
 - 是否有 no-fabrication unavailable state: `{str(status.get('no_fabrication') is True).lower()}`
 - Full Analyst sample 状态: `withheld pending fresh real v4 canary`
+- beta output review item: `daily research job not configured; beta clock running but valid_research_output_days remains {status.get('valid_research_output_days', 0)}`
 
 ## 自动修复
 - 是否触发: `false`
@@ -745,6 +793,7 @@ def render_daily_report(
 - Full Analyst public sample withheld pending fresh real v4 canary
 - backend/private external Alaya client references remain P1 before formal/paid readiness
 - npm audit 17 moderate dev-only/transitive vulnerabilities remain review items
+- daily research job not configured; beta clock running but valid_research_output_days remains 0
 
 ## Repo 状态
 - /opt/gotra: `branch={heartbeat.get('gotra_branch')} head={heartbeat.get('gotra_head')} dirty={heartbeat.get('gotra_dirty')}`
@@ -760,6 +809,7 @@ def render_daily_report(
 
 ## 明日计划
 - next daily timer: `{status.get('next_daily_run_due_at')}`
+- next daily timer source: `{status.get('next_daily_run_due_at_source')}`
 - next monitor check: `systemd timer: {MONITOR_HEALTH_TIMER}`
 - 是否需要人工 review: `{str(blocker is not None).lower()}`
 
