@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import json
 
-from gotra.beta_daily_research import DailyResearchStaging, build_pipeline_command, enablement_manifest, validate_staged_run
+from gotra.beta_daily_research import (
+    ENABLEMENT_PATH,
+    DailyResearchStaging,
+    build_pipeline_command,
+    enablement_manifest,
+    validate_staged_run,
+)
+
+
+def test_enablement_manifest_is_runtime_state_not_repo_state():
+    assert str(ENABLEMENT_PATH) == "/var/lib/gotra/stage15b_daily_research_enablement.json"
 
 
 def test_enablement_fails_closed_without_manifest(tmp_path):
