@@ -92,7 +92,9 @@ def main() -> int:
         return emit(daily_research_job_readiness())
     if args.command == "daily-job-dry-run":
         symbols = tuple(args.symbol) if args.symbol else DEFAULT_SYMBOLS
-        return emit(run_staged_daily_research(evidence_root=args.evidence_root, symbols=symbols))
+        payload = run_staged_daily_research(evidence_root=args.evidence_root, symbols=symbols)
+        emit(payload)
+        return 0 if payload["safe_to_enable_from_next_run"] else 2
     if args.command == "disable":
         return emit(disable_beta_runtime(evidence_root=args.evidence_root, public_status_path=args.public_status_path))
     return 2

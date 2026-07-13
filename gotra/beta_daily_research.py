@@ -27,6 +27,7 @@ REQUIRED_EXECUTION_MODEL = "deep_research_dossier_then_parallel_perspectives"
 REQUIRED_SYMBOL_SCHEMA = "gotra.full_analyst.symbol.v4"
 REQUIRED_STATUS_KEYS = {
     "run_id", "run_status", "failed_count", "blocked_count", "publish_count",
+    "publish_with_boundary_count",
     "needs_review_count", "data_gap_count", "public_scan_status",
     "alaya_readback_status", "ledger_integrity_status", "execution_model", "symbol_schema",
 }
@@ -109,7 +110,7 @@ def build_pipeline_command(
         "--llm-runner", "codex-cli", "--alaya-mode", "real",
         "--v40-cognition-flywheel", "--execution-model", REQUIRED_EXECUTION_MODEL,
         "--max-concurrency", str(min(3, len(symbols))), "--agent-concurrency", "3",
-        "--per-symbol-timeout-seconds", "900", "--retries", "1",
+        "--per-symbol-timeout-seconds", "900", "--retries", "2",
     ]
     for symbol in symbols:
         command.extend(("--symbol", symbol))
@@ -185,7 +186,7 @@ def validate_staged_run(staging: DailyResearchStaging, *, symbols: tuple[str, ..
     duplicate_blocks = [key for key, values in block_values.items() if len(values) > 1 and len(set(values)) == 1]
     if duplicate_blocks:
         errors.append(f"all-symbol duplicate research blocks:{','.join(duplicate_blocks)}")
-    publication_count = int(status.get("publish_count") or 0)
+    publication_count = int(status.get("publish_with_boundary_count") or 0)
     if publication_count <= 0:
         errors.append("no publishable research artifact")
     return {
