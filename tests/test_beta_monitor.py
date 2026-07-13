@@ -49,6 +49,7 @@ def _prepare_runtime(tmp_path, monkeypatch):
     evidence_root = tmp_path / "stage15B-runtime"
     public_status = tmp_path / "beta_status.json"
     monkeypatch.setattr(beta_runtime, "ACTIVE_POINTER_PATH", active_pointer)
+    monkeypatch.setattr(beta_runtime, "ENABLEMENT_PATH", tmp_path / "missing-enablement.json")
     monkeypatch.setattr(
         beta_runtime,
         "read_next_systemd_timer_due",
@@ -67,6 +68,27 @@ def _prepare_runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(beta_monitor, "production_smoke", _passing_production)
     monkeypatch.setattr(beta_monitor, "fetch_url", _fake_fetch)
     return evidence_root, public_status
+
+
+def test_health_check_uses_reviewed_runtime_enablement_without_counting_output(tmp_path, monkeypatch):
+    evidence_root, public_status = _prepare_runtime(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        beta_monitor,
+        "daily_research_job_readiness",
+        lambda: {"daily_job_configured": True, "daily_job_status": "configured"},
+    )
+
+    result = health_check(
+        evidence_root=evidence_root,
+        public_status_path=public_status,
+        now=datetime(2026, 7, 6, 5, 0, 0, tzinfo=timezone.utc),
+    )
+
+    heartbeat = result["heartbeat"]
+    assert heartbeat["daily_research_job_configured"] is True
+    assert heartbeat["valid_research_output_days"] == 0
+    assert heartbeat["unavailable_days"] == 0
+    assert all(alert["alert_code"] != "DAILY_RESEARCH_JOB_NOT_READY" for alert in result["alerts"])
 
 
 def test_health_check_writes_monitor_heartbeat_without_completing_beta(tmp_path, monkeypatch):
