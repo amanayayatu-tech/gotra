@@ -586,7 +586,7 @@ def systemd_properties(unit_name: str, properties: tuple[str, ...]) -> dict[str,
     if not systemctl_available():
         return {"available": False, "unit": unit_name}
     command = ["systemctl", "show", unit_name]
-    for name in properties:
+    for name in ("LoadState", *properties):
         command.extend(["-p", name])
     command.append("--no-pager")
     result = run_command(command)
@@ -595,6 +595,8 @@ def systemd_properties(unit_name: str, properties: tuple[str, ...]) -> dict[str,
         key, separator, value = line.partition("=")
         if separator:
             values[key] = value.strip()
+    if values.get("LoadState") == "not-found":
+        values["available"] = False
     return values
 
 
