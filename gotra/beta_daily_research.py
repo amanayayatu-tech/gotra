@@ -21,7 +21,7 @@ from typing import Any
 
 PIPELINE = Path(__file__).resolve().parents[1] / "scripts" / "public_stock_pool_full_analyst_pipeline.py"
 DEFAULT_SYMBOLS = ("HKEX:0700", "HKEX:1810", "HKEX:9688")
-ENABLEMENT_PATH = Path("/opt/gotra/config/stage15b_daily_research_enablement.json")
+ENABLEMENT_PATH = Path("/var/lib/gotra/stage15b_daily_research_enablement.json")
 STATUS_FILE = "status_full_analyst_evening_hk.json"
 REQUIRED_EXECUTION_MODEL = "deep_research_dossier_then_parallel_perspectives"
 REQUIRED_SYMBOL_SCHEMA = "gotra.full_analyst.symbol.v4"
