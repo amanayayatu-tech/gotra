@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timezone
 
 import gotra.beta_runtime as beta_runtime
+import pytest
 from gotra.beta_runtime import (
     build_systemd_units,
     daily_research_job_readiness,
@@ -13,6 +14,11 @@ from gotra.beta_runtime import (
     status_payload,
     write_heartbeat,
 )
+
+
+@pytest.fixture(autouse=True)
+def isolate_runtime_enablement(tmp_path, monkeypatch):
+    monkeypatch.setattr(beta_runtime, "ENABLEMENT_PATH", tmp_path / "missing-enablement.json")
 
 
 def test_start_beta_runtime_writes_auditable_day0_contract(tmp_path):

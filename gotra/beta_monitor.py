@@ -29,6 +29,7 @@ from gotra.beta_runtime import (
     boundary,
     build_beta_heartbeat,
     build_public_status,
+    daily_research_job_readiness,
     read_json,
     status_payload,
     utc_now,
@@ -460,6 +461,20 @@ def monitor_timer_statuses() -> dict[str, Any]:
     }
 
 
+def effective_daily_job_status(status: dict[str, Any]) -> dict[str, Any]:
+    """Overlay reviewed runtime enablement without fabricating a daily result."""
+
+    readiness = daily_research_job_readiness()
+    if readiness.get("daily_job_configured") is not True:
+        return status
+    return {
+        **status,
+        "daily_research_job_configured": True,
+        "daily_research_job_status": readiness.get("daily_job_status"),
+        "daily_research_job_status_source": "reviewed_runtime_enablement",
+    }
+
+
 def build_monitor_heartbeat(
     *,
     evidence_root: Path | None = None,
@@ -470,7 +485,9 @@ def build_monitor_heartbeat(
 ) -> dict[str, Any]:
     root = evidence_root or active_evidence_root()
     current = now or utc_now()
-    status = status or load_beta_status(public_status_path, evidence_root=root, now=current, refresh_timer=True)
+    status = effective_daily_job_status(
+        status or load_beta_status(public_status_path, evidence_root=root, now=current, refresh_timer=True)
+    )
     production_status = production or production_smoke()
     gotra_state = git_state(Path("/opt/gotra"))
     ledger_state = git_state(Path("/opt/gotra-public-ledger"))
@@ -837,6 +854,7 @@ def health_check(
         refresh_timer=True,
         write_outputs=write_outputs,
     )
+    status = effective_daily_job_status(status)
     gotra_state = git_state(Path("/opt/gotra"))
     ledger_state = git_state(Path("/opt/gotra-public-ledger"))
     heartbeat = build_monitor_heartbeat(
