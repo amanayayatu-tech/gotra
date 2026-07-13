@@ -17,6 +17,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from gotra.beta_readiness import load_beta_universe
+from gotra.beta_daily_research import ENABLEMENT_PATH, enablement_manifest, run_live_daily_research
 
 
 PUBLIC_BETA_STATUS_SCHEMA = "gotra.public_beta.status.v1"
@@ -246,29 +247,33 @@ def beta_daily_counts(evidence_root: Path | None = None, *, extra_event: dict[st
 
 
 def daily_research_job_readiness() -> dict[str, Any]:
-    """Fail closed until a real-source, side-effect-free daily job is reviewed."""
+    """Fail closed until a staged real-source canary is reviewed and enabled."""
 
     pipeline = Path(__file__).resolve().parents[1] / "scripts" / "public_stock_pool_full_analyst_pipeline.py"
+    enablement = enablement_manifest(ENABLEMENT_PATH)
+    enabled = bool(enablement.get("enabled"))
     return {
-        "daily_job_status": "not_ready",
-        "daily_job_configured": False,
-        "safe_to_enable_from_next_run": False,
+        "daily_job_status": "configured" if enabled else "implemented_pending_reviewed_canary",
+        "daily_job_configured": enabled,
+        "safe_to_enable_from_next_run": enabled,
+        "staged_dry_run_implemented": True,
+        "atomic_promotion_required": True,
         "pipeline_candidate": str(pipeline),
         "pipeline_candidate_exists": pipeline.exists(),
-        "real_data_input": False,
+        "real_data_input": None,
         "fixture_used": False,
         "public_artifact_written": False,
         "ledger_written": False,
         "public_safety_status": "not_run_job_not_ready",
         "alaya_internal_readback_status": "not_run_job_not_ready",
         "history_backfilled": False,
+        "enablement": enablement,
         "missing_conditions": [
-            "side-effect-free dry-run contract for the complete daily pipeline",
-            "reviewed live issuer or exchange evidence adapter beyond market-price context",
-            "atomic public artifact and append-only ledger promotion after all gates pass",
-            "post-publish production smoke tied to the same daily run id",
-        ],
-        "reason": "candidate v4 pipeline is not yet approved as the Stage 15B live daily research job",
+            "successful real-data staged canary with no fixture or duplicate research blocks",
+            "human-reviewed canary manifest recorded in enablement contract",
+            "atomic public artifact promotion and same-run production smoke",
+        ] if not enabled else [],
+        "reason": enablement.get("reason"),
     }
 
 
@@ -412,6 +417,11 @@ def build_public_status(
     days = elapsed_days(started_at, now=now)
     next_run = next_daily_run_metadata(now=now, previous_due_at=previous_due_at or start_payload.get("next_daily_run_due_at"))
     output_counts = beta_daily_counts(evidence_root)
+    readiness = daily_research_job_readiness()
+    review_items = [
+        item for item in REMAINING_REVIEW_ITEMS
+        if not (readiness["daily_job_configured"] and item.startswith("Daily research job not configured"))
+    ]
     return {
         "schema": PUBLIC_BETA_STATUS_SCHEMA,
         "beta_started": True,
@@ -431,9 +441,9 @@ def build_public_status(
         "next_daily_run_timer_unit": next_run["timer_unit"],
         "stale_status_detected": next_run["stale_status_detected"],
         "previous_next_daily_run_due_at": next_run["previous_next_daily_run_due_at"],
-        "daily_research_job_configured": False,
-        "daily_research_job_status": "not_configured",
-        "safe_to_enable_daily_research_job_from_next_run": False,
+        "daily_research_job_configured": readiness["daily_job_configured"],
+        "daily_research_job_status": readiness["daily_job_status"],
+        "safe_to_enable_daily_research_job_from_next_run": readiness["safe_to_enable_from_next_run"],
         "valid_research_output_days": output_counts["valid_research_output_days"],
         "unavailable_days": output_counts["unavailable_days"],
         "failed_output_days": output_counts["failed_output_days"],
@@ -443,7 +453,7 @@ def build_public_status(
         "not_paid_ready": True,
         "not_investment_advice": True,
         "not_trading_signal": True,
-        "remaining_review_items": REMAINING_REVIEW_ITEMS,
+        "remaining_review_items": review_items,
         "boundary": boundary(),
     }
 
@@ -625,30 +635,55 @@ def run_once(*, dry_run: bool = False, evidence_root: Path | None = None, public
         }
     start_payload = read_json(start_file)
     now = utc_now()
-    status_text = "unavailable_no_live_daily_research_job_configured"
+    readiness = daily_research_job_readiness()
+    live_result: dict[str, Any] | None = None
+    if readiness["daily_job_configured"]:
+        research_root = root / "daily-runs" / now.strftime("%Y-%m-%d") / "research"
+        if dry_run:
+            from gotra.beta_daily_research import run_staged_daily_research
+
+            live_result = run_staged_daily_research(evidence_root=research_root)
+        else:
+            live_result = run_live_daily_research(evidence_root=research_root)
+    promoted = bool(live_result and live_result.get("production_promotion", {}).get("promoted"))
+    validation = live_result.get("validation", {}) if live_result else {}
+    status_text = (
+        "completed_with_review_items" if promoted and int(validation.get("needs_review_count") or 0) > 0
+        else "completed" if promoted
+        else "failed_daily_research_pipeline" if readiness["daily_job_configured"]
+        else "unavailable_no_live_daily_research_job_configured"
+    )
     event = {
         "schema": BETA_DAILY_EVENT_SCHEMA,
         "event_type": "beta_daily_runtime_event",
         "timestamp": now.isoformat().replace("+00:00", "Z"),
         "day_index": elapsed_days(str(start_payload["started_at"]), now=now),
         "run_status": status_text,
-        "publication_count": 0,
-        "needs_review_count": 0,
-        "data_gap_count": 0,
-        "blocked_count": 0,
+        "publication_count": int(validation.get("publication_count") or 0),
+        "needs_review_count": int(validation.get("needs_review_count") or 0),
+        "data_gap_count": int(validation.get("data_gap_count") or 0),
+        "blocked_count": int(validation.get("blocked_count") or 0),
         "review_due_at_schedule": [1, 7, 30, 90],
-        "track_record_ledger_integrity": "unavailable_no_live_research_ledger_yet",
-        "public_safety_status": "research_only_boundary_preserved",
-        "alaya_internal_readback_status": "not_run_for_daily_unavailable_event",
+        "track_record_ledger_integrity": validation.get("ledger_integrity", "unavailable_no_live_research_ledger_yet"),
+        "public_safety_status": validation.get("public_safety_status", "research_only_boundary_preserved"),
+        "alaya_internal_readback_status": validation.get("alaya_internal_readback_status", "not_run_for_daily_unavailable_event"),
         "no_fabrication": True,
         "history_backfilled": False,
         "paid_features_enabled": False,
-        "notes": "Daily research job is not fabricated by the beta runtime. This event preserves no-fabrication state until a real daily run is configured.",
+        "latest_daily_research_artifact": str(live_result.get("staging_root") or "") if live_result else "",
+        "notes": (
+            "A real staged v4 daily research run passed all gates and was promoted atomically."
+            if promoted
+            else "Configured daily research failed closed; no staged output was counted or promoted."
+            if readiness["daily_job_configured"]
+            else "Daily research job is not fabricated by the beta runtime. This event preserves no-fabrication state until a real daily run is configured."
+        ),
         "boundary": boundary(),
     }
     event.update(beta_daily_counts(root, extra_event=event))
-    event["daily_research_job_configured"] = False
-    event["daily_research_job_readiness"] = daily_research_job_readiness()
+    event["daily_research_job_configured"] = readiness["daily_job_configured"]
+    event["daily_research_job_readiness"] = readiness
+    event["daily_research_result"] = live_result
     if dry_run:
         return event
     append_jsonl(root / "beta-daily-events.jsonl", event)

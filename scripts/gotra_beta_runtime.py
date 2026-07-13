@@ -19,6 +19,7 @@ from gotra.beta_runtime import (
     status_payload,
     write_heartbeat,
 )
+from gotra.beta_daily_research import DEFAULT_SYMBOLS, run_staged_daily_research
 
 
 def emit(payload: object) -> int:
@@ -57,6 +58,12 @@ def main() -> int:
     disable_p.add_argument("--public-status-path", type=Path, default=PUBLIC_STATUS_PATH)
 
     sub.add_parser("daily-job-readiness", help="Inspect the fail-closed daily research job readiness contract")
+    daily_dry_run = sub.add_parser(
+        "daily-job-dry-run",
+        help="Run the complete v4 daily research candidate in an isolated staging directory",
+    )
+    daily_dry_run.add_argument("--evidence-root", type=Path, required=True)
+    daily_dry_run.add_argument("--symbol", action="append", default=[])
 
     args = parser.parse_args()
     if args.command == "init":
@@ -83,6 +90,9 @@ def main() -> int:
         return emit(write_heartbeat(evidence_root=args.evidence_root, public_status_path=args.public_status_path))
     if args.command == "daily-job-readiness":
         return emit(daily_research_job_readiness())
+    if args.command == "daily-job-dry-run":
+        symbols = tuple(args.symbol) if args.symbol else DEFAULT_SYMBOLS
+        return emit(run_staged_daily_research(evidence_root=args.evidence_root, symbols=symbols))
     if args.command == "disable":
         return emit(disable_beta_runtime(evidence_root=args.evidence_root, public_status_path=args.public_status_path))
     return 2

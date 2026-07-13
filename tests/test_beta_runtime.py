@@ -145,14 +145,15 @@ def test_run_once_dry_run_and_heartbeat_preserve_no_fabrication(tmp_path):
 def test_daily_research_job_readiness_fails_closed_without_side_effect_free_live_pipeline():
     readiness = daily_research_job_readiness()
 
-    assert readiness["daily_job_status"] == "not_ready"
+    assert readiness["daily_job_status"] == "implemented_pending_reviewed_canary"
     assert readiness["daily_job_configured"] is False
     assert readiness["safe_to_enable_from_next_run"] is False
     assert readiness["fixture_used"] is False
     assert readiness["public_artifact_written"] is False
     assert readiness["ledger_written"] is False
     assert readiness["history_backfilled"] is False
-    assert readiness["missing_conditions"]
+    assert readiness["staged_dry_run_implemented"] is True
+    assert len(readiness["missing_conditions"]) == 3
 
 
 def test_run_once_dry_run_before_start_is_preview_only(tmp_path):
