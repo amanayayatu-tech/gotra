@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import gotra.beta_runtime as beta_runtime
 from gotra.beta_runtime import (
     build_systemd_units,
+    daily_research_job_readiness,
     next_daily_run_metadata,
     run_once,
     start_beta_runtime,
@@ -121,12 +122,15 @@ def test_run_once_dry_run_and_heartbeat_preserve_no_fabrication(tmp_path):
     assert event["daily_research_job_configured"] is False
     assert event["valid_research_output_days"] == 0
     assert event["unavailable_days"] == 1
+    assert event["failed_output_days"] == 0
+    assert event["history_backfilled"] is False
     heartbeat = write_heartbeat(evidence_root=evidence_root, public_status_path=public_status)
     assert heartbeat["phase"] == "beta_in_progress_real_time_wait"
     assert heartbeat["beta_complete"] is False
     assert heartbeat["daily_research_job_configured"] is False
     assert heartbeat["valid_research_output_days"] == 0
     assert heartbeat["unavailable_days"] == 1
+    assert heartbeat["failed_output_days"] == 0
     assert heartbeat["boundary"]["no_performance_proof"] is True
 
     status = status_payload(evidence_root=evidence_root, public_status_path=public_status)
@@ -135,6 +139,20 @@ def test_run_once_dry_run_and_heartbeat_preserve_no_fabrication(tmp_path):
     assert status["public_status"]["daily_research_job_configured"] is False
     assert status["public_status"]["valid_research_output_days"] == 0
     assert status["public_status"]["unavailable_days"] == 1
+    assert status["public_status"]["failed_output_days"] == 0
+
+
+def test_daily_research_job_readiness_fails_closed_without_side_effect_free_live_pipeline():
+    readiness = daily_research_job_readiness()
+
+    assert readiness["daily_job_status"] == "not_ready"
+    assert readiness["daily_job_configured"] is False
+    assert readiness["safe_to_enable_from_next_run"] is False
+    assert readiness["fixture_used"] is False
+    assert readiness["public_artifact_written"] is False
+    assert readiness["ledger_written"] is False
+    assert readiness["history_backfilled"] is False
+    assert readiness["missing_conditions"]
 
 
 def test_run_once_dry_run_before_start_is_preview_only(tmp_path):

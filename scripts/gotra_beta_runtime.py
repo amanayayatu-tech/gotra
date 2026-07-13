@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from gotra.beta_runtime import (
     PUBLIC_STATUS_PATH,
+    daily_research_job_readiness,
     disable_beta_runtime,
     run_once,
     start_beta_runtime,
@@ -55,6 +56,8 @@ def main() -> int:
     disable_p.add_argument("--evidence-root", type=Path)
     disable_p.add_argument("--public-status-path", type=Path, default=PUBLIC_STATUS_PATH)
 
+    sub.add_parser("daily-job-readiness", help="Inspect the fail-closed daily research job readiness contract")
+
     args = parser.parse_args()
     if args.command == "init":
         from gotra.beta_runtime import ensure_runtime_dirs, runtime_contract, write_json
@@ -78,6 +81,8 @@ def main() -> int:
         return emit(status_payload(evidence_root=args.evidence_root, public_status_path=args.public_status_path))
     if args.command == "write-heartbeat":
         return emit(write_heartbeat(evidence_root=args.evidence_root, public_status_path=args.public_status_path))
+    if args.command == "daily-job-readiness":
+        return emit(daily_research_job_readiness())
     if args.command == "disable":
         return emit(disable_beta_runtime(evidence_root=args.evidence_root, public_status_path=args.public_status_path))
     return 2

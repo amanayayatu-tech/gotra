@@ -79,18 +79,24 @@ def test_health_check_writes_monitor_heartbeat_without_completing_beta(tmp_path,
     )
 
     heartbeat = json.loads((evidence_root / "monitor" / "monitor-heartbeat.json").read_text())
-    assert result["result"] == "pass"
+    assert result["result"] == "needs_repair"
     assert heartbeat["phase"] == "stage15B_beta_monitoring"
     assert heartbeat["beta_started"] is True
     assert heartbeat["beta_clock_started"] is True
     assert heartbeat["beta_complete"] is False
     assert heartbeat["paid_features_enabled"] is False
-    assert heartbeat["current_blocker"] is None
+    assert heartbeat["current_blocker"] == "DAILY_RESEARCH_JOB_NOT_READY"
+    assert heartbeat["alert_count"] >= 1
     assert heartbeat["next_daily_run_due_at"] == "2026-07-06T10:30:00Z"
     assert "fallback_schedule" in heartbeat["next_daily_run_due_at_source"]
     assert heartbeat["daily_research_job_configured"] is False
     assert heartbeat["valid_research_output_days"] == 0
     assert heartbeat["unavailable_days"] == 0
+    assert heartbeat["failed_output_days"] == 0
+    current_alert = json.loads((evidence_root / "monitor" / "current-alert.json").read_text())
+    assert current_alert["alert_code"] == "DAILY_RESEARCH_JOB_NOT_READY"
+    assert current_alert["beta_clock_preserved"] is True
+    assert current_alert["beta_timer_stopped"] is False
     assert (evidence_root / "monitor" / "monitor-events.jsonl").exists()
 
 
@@ -122,13 +128,15 @@ def test_daily_report_writes_chinese_report_and_summary(tmp_path, monkeypatch):
 
     report_path = evidence_root / "monitor" / "daily-reports" / "2026-07-06.md"
     report = report_path.read_text(encoding="utf-8")
-    assert payload["result"] == "pass"
+    assert payload["result"] == "needs_repair"
     assert "# GOTRA Stage 15B 30 天公开 Beta 日报 - 2026-07-06" in report
     assert "BETA_IN_PROGRESS_REAL_TIME_WAIT" in report
     assert "next_daily_run_due_at_source" in report
     assert "daily research job configured: `false`" in report
     assert "valid_research_output_days: `0`" in report
     assert "unavailable_days: `0`" in report
+    assert "failed_output_days: `0`" in report
+    assert "`blocker` `DAILY_RESEARCH_JOB_NOT_READY`" in report
     assert "这不是 30d beta complete" in report
     assert "不是投资建议" in report
     summary = (tmp_path / "roadmap-summary.md").read_text(encoding="utf-8")
@@ -147,7 +155,7 @@ def test_post_run_check_dry_run_does_not_write_daily_output(tmp_path, monkeypatc
     )
 
     assert payload["dry_run"] is True
-    assert payload["result"] == "pass"
+    assert payload["result"] == "needs_repair"
     assert payload["repair_attempted"] is False
     assert not (evidence_root / "monitor" / "post-run" / "2026-07-06.json").exists()
 
@@ -160,4 +168,4 @@ def test_monitor_systemd_units_define_three_monitor_timers(tmp_path):
     assert "post-run-check" in units[beta_monitor.MONITOR_POST_RUN_SERVICE]
     assert "OnCalendar=*-*-* 18:50:00" in units[beta_monitor.MONITOR_POST_RUN_TIMER]
     assert "health-check" in units[beta_monitor.MONITOR_HEALTH_SERVICE]
-    assert "OnCalendar=*-*-* 03,12,21:10:00" in units[beta_monitor.MONITOR_HEALTH_TIMER]
+    assert "OnCalendar=*:0/10" in units[beta_monitor.MONITOR_HEALTH_TIMER]

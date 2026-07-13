@@ -36,6 +36,11 @@ UNAVAILABLE_DAILY_RUN_STATUSES = {
     "day0_started_no_daily_research_run_yet",
     "unavailable_no_live_daily_research_job_configured",
 }
+FAILED_DAILY_RUN_STATUSES = {
+    "failed",
+    "failed_daily_research_pipeline",
+    "blocked_daily_research_pipeline",
+}
 REMAINING_REVIEW_ITEMS = [
     "Full Analyst public sample withheld pending fresh real v4 canary",
     "Backend/private external Alaya client references remain P1 before formal/paid readiness",
@@ -228,9 +233,42 @@ def beta_daily_counts(evidence_root: Path | None = None, *, extra_event: dict[st
         if event.get("run_status") not in UNAVAILABLE_DAILY_RUN_STATUSES
         and int(event.get("publication_count", 0) or 0) > 0
     )
+    failed_output_days = sum(
+        1
+        for event in daily_events
+        if str(event.get("run_status") or "") in FAILED_DAILY_RUN_STATUSES
+    )
     return {
         "valid_research_output_days": valid_research_output_days,
         "unavailable_days": unavailable_days,
+        "failed_output_days": failed_output_days,
+    }
+
+
+def daily_research_job_readiness() -> dict[str, Any]:
+    """Fail closed until a real-source, side-effect-free daily job is reviewed."""
+
+    pipeline = Path(__file__).resolve().parents[1] / "scripts" / "public_stock_pool_full_analyst_pipeline.py"
+    return {
+        "daily_job_status": "not_ready",
+        "daily_job_configured": False,
+        "safe_to_enable_from_next_run": False,
+        "pipeline_candidate": str(pipeline),
+        "pipeline_candidate_exists": pipeline.exists(),
+        "real_data_input": False,
+        "fixture_used": False,
+        "public_artifact_written": False,
+        "ledger_written": False,
+        "public_safety_status": "not_run_job_not_ready",
+        "alaya_internal_readback_status": "not_run_job_not_ready",
+        "history_backfilled": False,
+        "missing_conditions": [
+            "side-effect-free dry-run contract for the complete daily pipeline",
+            "reviewed live issuer or exchange evidence adapter beyond market-price context",
+            "atomic public artifact and append-only ledger promotion after all gates pass",
+            "post-publish production smoke tied to the same daily run id",
+        ],
+        "reason": "candidate v4 pipeline is not yet approved as the Stage 15B live daily research job",
     }
 
 
@@ -398,6 +436,8 @@ def build_public_status(
         "safe_to_enable_daily_research_job_from_next_run": False,
         "valid_research_output_days": output_counts["valid_research_output_days"],
         "unavailable_days": output_counts["unavailable_days"],
+        "failed_output_days": output_counts["failed_output_days"],
+        "history_backfilled": False,
         "no_fabrication": True,
         "not_launch_ready": True,
         "not_paid_ready": True,
@@ -532,6 +572,8 @@ def build_beta_heartbeat(evidence_root: Path, status: dict[str, Any], now: datet
         "daily_research_job_configured": status.get("daily_research_job_configured"),
         "valid_research_output_days": status.get("valid_research_output_days", 0),
         "unavailable_days": status.get("unavailable_days", 0),
+        "failed_output_days": status.get("failed_output_days", 0),
+        "history_backfilled": False,
         "current_blocker": None,
         "boundary": boundary(),
     }
@@ -576,6 +618,7 @@ def run_once(*, dry_run: bool = False, evidence_root: Path | None = None, public
             "beta_started": False,
             "beta_clock_started": False,
             "no_fabrication": True,
+            "history_backfilled": False,
             "paid_features_enabled": False,
             "notes": "Dry-run preview only. It does not start the beta clock and does not fabricate daily research output.",
             "boundary": boundary(),
@@ -598,12 +641,14 @@ def run_once(*, dry_run: bool = False, evidence_root: Path | None = None, public
         "public_safety_status": "research_only_boundary_preserved",
         "alaya_internal_readback_status": "not_run_for_daily_unavailable_event",
         "no_fabrication": True,
+        "history_backfilled": False,
         "paid_features_enabled": False,
         "notes": "Daily research job is not fabricated by the beta runtime. This event preserves no-fabrication state until a real daily run is configured.",
         "boundary": boundary(),
     }
     event.update(beta_daily_counts(root, extra_event=event))
     event["daily_research_job_configured"] = False
+    event["daily_research_job_readiness"] = daily_research_job_readiness()
     if dry_run:
         return event
     append_jsonl(root / "beta-daily-events.jsonl", event)
