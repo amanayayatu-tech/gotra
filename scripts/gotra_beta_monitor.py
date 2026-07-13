@@ -32,7 +32,8 @@ def main() -> int:
     parser.add_argument("--public-status-path", type=Path, default=PUBLIC_STATUS_PATH)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("health-check", help="Run lightweight health check and update monitor heartbeat")
+    health = sub.add_parser("health-check", help="Run lightweight health check and update monitor heartbeat")
+    health.add_argument("--dry-run", action="store_true")
 
     post_run = sub.add_parser("post-run-check", help="Check the beta daily runtime after the scheduled run")
     post_run.add_argument("--dry-run", action="store_true")
@@ -49,7 +50,13 @@ def main() -> int:
 
     args = parser.parse_args()
     if args.command == "health-check":
-        return emit(health_check(evidence_root=args.evidence_root, public_status_path=args.public_status_path))
+        return emit(
+            health_check(
+                evidence_root=args.evidence_root,
+                public_status_path=args.public_status_path,
+                write_outputs=not args.dry_run,
+            )
+        )
     if args.command == "post-run-check":
         return emit(
             post_run_check(

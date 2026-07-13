@@ -15,7 +15,7 @@ import subprocess
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -40,6 +40,7 @@ MONITOR_HEARTBEAT_SCHEMA = "gotra.launch.beta_monitor_heartbeat.v1"
 MONITOR_EVENT_SCHEMA = "gotra.launch.beta_monitor_event.v1"
 MONITOR_DAILY_REPORT_SCHEMA = "gotra.launch.beta_monitor_daily_report.v1"
 MONITOR_REPAIR_EVENT_SCHEMA = "gotra.launch.beta_monitor_repair_event.v1"
+MONITOR_ALERT_SCHEMA = "gotra.launch.beta_alert.v1"
 MONITOR_DAILY_REPORT_SERVICE = "gotra-beta-monitor-daily-report.service"
 MONITOR_DAILY_REPORT_TIMER = "gotra-beta-monitor-daily-report.timer"
 MONITOR_POST_RUN_SERVICE = "gotra-beta-monitor-post-run.service"
@@ -494,6 +495,8 @@ def build_monitor_heartbeat(
         "daily_research_job_status": status.get("daily_research_job_status"),
         "valid_research_output_days": status.get("valid_research_output_days", 0),
         "unavailable_days": status.get("unavailable_days", 0),
+        "failed_output_days": status.get("failed_output_days", 0),
+        "history_backfilled": status.get("history_backfilled") is True,
         "systemd_daily_timer": unit_status(DAILY_TIMER_NAME),
         "systemd_daily_service": unit_status(DAILY_SERVICE_NAME),
         "systemd_monitor_timers": monitor_timer_statuses(),
@@ -556,6 +559,246 @@ def latest_daily_report_path(path: Path) -> str:
     return str(reports[-1]) if reports else ""
 
 
+def parse_timestamp(value: Any) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        match = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})", text)
+        if not match:
+            return None
+        parsed = datetime.fromisoformat(f"{match.group(1)}T{match.group(2)}").replace(
+            tzinfo=ZoneInfo("Asia/Shanghai")
+        )
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def file_age_seconds(path: Path, now: datetime) -> float | None:
+    if not path.exists():
+        return None
+    modified = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    return max(0.0, (now.astimezone(timezone.utc) - modified).total_seconds())
+
+
+def systemd_properties(unit_name: str, properties: tuple[str, ...]) -> dict[str, Any]:
+    if not systemctl_available():
+        return {"available": False, "unit": unit_name}
+    command = ["systemctl", "show", unit_name]
+    for name in properties:
+        command.extend(["-p", name])
+    command.append("--no-pager")
+    result = run_command(command)
+    values: dict[str, Any] = {"available": result.returncode in {0, 3}, "unit": unit_name}
+    for line in result.output.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key] = value.strip()
+    return values
+
+
+def all_daily_events(evidence_root: Path) -> list[dict[str, Any]]:
+    path = evidence_root / "beta-daily-events.jsonl"
+    if not path.exists():
+        return []
+    events: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            events.append(json.loads(line))
+    return [event for event in events if event.get("event_type") == "beta_daily_runtime_event"]
+
+
+def latest_file(path: Path, pattern: str) -> Path | None:
+    files = sorted(path.glob(pattern)) if path.exists() else []
+    return files[-1] if files else None
+
+
+def expected_repo_state_path(evidence_root: Path) -> Path:
+    return monitor_root(evidence_root) / "expected-repo-state.json"
+
+
+def write_expected_repo_state(evidence_root: Path) -> dict[str, Any]:
+    payload = {
+        "schema": "gotra.launch.beta_expected_repo_state.v1",
+        "timestamp": utc_now().isoformat().replace("+00:00", "Z"),
+        "gotra": git_state(Path("/opt/gotra")),
+        "ledger": git_state(Path("/opt/gotra-public-ledger")),
+        "beta_clock_preserved": True,
+    }
+    write_json(expected_repo_state_path(evidence_root), payload)
+    return payload
+
+
+def make_alert(
+    *,
+    current: datetime,
+    severity: str,
+    code: str,
+    root_cause: str,
+    component: str,
+    latest_good_event: str,
+    evidence_paths: list[str],
+    next_action: str,
+) -> dict[str, Any]:
+    return {
+        "schema": MONITOR_ALERT_SCHEMA,
+        "event_type": "stage15B_beta_alert",
+        "timestamp": current.isoformat().replace("+00:00", "Z"),
+        "severity": severity,
+        "alert_code": code,
+        "root_cause": root_cause,
+        "affected_component": component,
+        "latest_good_event": latest_good_event,
+        "evidence_paths": evidence_paths,
+        "auto_repair_attempted": False,
+        "auto_repair_result": "not_attempted",
+        "beta_clock_preserved": True,
+        "beta_timer_stopped": False,
+        "human_action_required": severity in {"blocker", "critical"},
+        "next_action": next_action,
+    }
+
+
+def evaluate_alerts(
+    *,
+    evidence_root: Path,
+    status: dict[str, Any],
+    production: dict[str, Any],
+    gotra_state: dict[str, Any],
+    ledger_state: dict[str, Any],
+    current: datetime,
+) -> list[dict[str, Any]]:
+    monitor = monitor_root(evidence_root)
+    alerts: list[dict[str, Any]] = []
+    timer = systemd_properties(
+        DAILY_TIMER_NAME,
+        ("ActiveState", "SubState", "NextElapseUSecRealtime", "LastTriggerUSec"),
+    )
+    service = systemd_properties(
+        DAILY_SERVICE_NAME,
+        ("ActiveState", "Result", "ExecMainStatus", "ExecMainStartTimestamp", "ExecMainExitTimestamp"),
+    )
+    latest_event = latest_daily_event(evidence_root) or {}
+    latest_event_at = parse_timestamp(latest_event.get("timestamp"))
+    last_trigger = parse_timestamp(timer.get("LastTriggerUSec"))
+    next_due = parse_timestamp(status.get("next_daily_run_due_at"))
+    canonical_start = read_json(evidence_root / "beta-start.json").get("started_at")
+
+    def add(severity: str, code: str, cause: str, component: str, action: str, paths: list[str] | None = None) -> None:
+        alerts.append(
+            make_alert(
+                current=current,
+                severity=severity,
+                code=code,
+                root_cause=cause,
+                component=component,
+                latest_good_event=str(latest_event.get("timestamp") or ""),
+                evidence_paths=paths or [str(evidence_root / "beta-daily-events.jsonl")],
+                next_action=action,
+            )
+        )
+
+    if timer.get("available") is True and (
+        timer.get("ActiveState") != "active" or timer.get("SubState") not in {"waiting", "running"}
+    ):
+        add("critical", "BETA_TIMER_INACTIVE", "daily beta timer is not active/waiting", DAILY_TIMER_NAME, "inspect systemd without resetting the beta clock")
+    if next_due and next_due < current - timedelta(minutes=15):
+        add("blocker", "NEXT_RUN_STALE", "next daily run is more than 15 minutes behind current time", "beta_status", "refresh status from the active systemd timer")
+    if service.get("available") is True and (
+        service.get("Result") not in {"", "success"}
+        or str(service.get("ExecMainStatus") or "0") not in {"", "0"}
+    ):
+        add("blocker", "DAILY_SERVICE_FAILED", "last daily service exited non-zero", DAILY_SERVICE_NAME, "preserve the failed event and inspect the service journal")
+    if last_trigger and current > last_trigger + timedelta(minutes=45) and (not latest_event_at or latest_event_at < last_trigger):
+        add("blocker", "DAILY_EVENT_MISSING_AFTER_RUN", "no new daily event within 45 minutes of the timer trigger", "beta_daily_events", "inspect the daily service and append only the truthful missing/failure state")
+
+    previous_heartbeat = monitor / "monitor-heartbeat.json"
+    heartbeat_age = file_age_seconds(previous_heartbeat, current)
+    if heartbeat_age is None or heartbeat_age > 20 * 60:
+        add("warning", "MONITOR_HEARTBEAT_STALE", "monitor heartbeat is older than 20 minutes", MONITOR_HEALTH_TIMER, "run one health check and verify the 10-minute timer", [str(previous_heartbeat)])
+    report = latest_file(monitor / "daily-reports", "*.md")
+    report_age = file_age_seconds(report, current) if report else None
+    if report_age is None or report_age > 26 * 3600:
+        add("warning", "DAILY_REPORT_STALE", "Chinese daily report is older than 26 hours", "daily_report", "regenerate the report from existing evidence", [str(report or monitor / "daily-reports")])
+    post_run = latest_file(monitor / "post-run", "*.json")
+    post_run_at = datetime.fromtimestamp(post_run.stat().st_mtime, tz=timezone.utc) if post_run else None
+    if last_trigger and current > last_trigger + timedelta(minutes=45) and (not post_run_at or post_run_at < last_trigger):
+        add("warning", "POST_RUN_EVIDENCE_MISSING", "post-run evidence is missing 45 minutes after the daily run", "post_run_monitor", "run the post-run check once", [str(post_run or monitor / "post-run")])
+
+    if production.get("verdict") != "pass" or production.get("http_ok") is not True:
+        add("critical", "PRODUCTION_SMOKE_FAILED", "production route or smoke validation failed", "production", "rerun production smoke once; do not deploy automatically")
+    for field, code in (
+        ("raw_accidental_landing_count", "RAW_ACCIDENTAL_LANDING"),
+        ("object_object_count", "OBJECT_OBJECT_RENDERED"),
+        ("python_dict_count", "PYTHON_DICT_RENDERED"),
+        ("traceback_count", "TRACEBACK_RENDERED"),
+        ("unrendered_json_or_md_count", "UNRENDERED_JSON_OR_MD"),
+        ("forbidden_direct_advice", "FORBIDDEN_ADVICE"),
+        ("forbidden_external_alaya_public_implication", "EXTERNAL_ALAYA_PUBLIC_IMPLICATION"),
+        ("forbidden_secret_raw_provider_leak", "SECRET_OR_RAW_PROVIDER_LEAK"),
+    ):
+        if int(production.get(field, 0) or 0) > 0:
+            add("critical", code, f"production smoke found {field}", "production_public_surface", "preserve evidence and require human review")
+
+    expected_path = expected_repo_state_path(evidence_root)
+    expected = read_json(expected_path) if expected_path.exists() else {}
+    for label, state in (("gotra", gotra_state), ("ledger", ledger_state)):
+        if state.get("exists") is not False and (
+            state.get("branch") != "main" or int(state.get("dirty_count", 0) or 0) > 0
+        ):
+            add("blocker", "REPO_STATE_UNSAFE", f"{label} repo is not clean main", label, "restore an explicitly reviewed clean main state")
+        expected_head = str((expected.get(label) or {}).get("head") or "")
+        if expected_head and state.get("head") != expected_head:
+            add("warning", "REPO_HEAD_CHANGED", f"{label} HEAD differs from the installed monitor baseline", label, "review the merged commit and refresh the expected-head baseline")
+    if status.get("paid_features_enabled") is True:
+        add("critical", "PAID_FEATURES_ENABLED", "paid features became enabled during free beta", "beta_status", "disable paid features without changing the beta clock")
+    if status.get("started_at") != canonical_start:
+        add("critical", "BETA_STARTED_AT_CHANGED", "public beta started_at differs from immutable beta-start evidence", "beta_clock", "preserve both artifacts and require human review")
+    if status.get("daily_research_job_configured") is not True:
+        add("blocker", "DAILY_RESEARCH_JOB_NOT_READY", "daily runtime still has no approved real research job", "daily_research", "complete a side-effect-free real-data dry-run and review before future-run enablement")
+
+    events = all_daily_events(evidence_root)
+    computed_unavailable = sum(1 for event in events if str(event.get("run_status") or "").startswith("unavailable_"))
+    computed_failed = sum(1 for event in events if str(event.get("run_status") or "").startswith(("failed", "blocked")))
+    if int(status.get("unavailable_days", 0) or 0) != computed_unavailable or int(status.get("failed_output_days", 0) or 0) != computed_failed:
+        add("blocker", "DAILY_COUNTS_INCONSISTENT", "public status does not match append-only daily events", "beta_status", "refresh derived counts without rewriting history")
+    last_two = events[-2:]
+    if len(last_two) == 2 and all(event.get("daily_research_job_configured") is True for event in last_two):
+        valid_counts = [int(event.get("valid_research_output_days", 0) or 0) for event in last_two]
+        if valid_counts[0] == valid_counts[1]:
+            add("warning", "VALID_OUTPUT_NOT_GROWING", "valid research output days did not grow across two configured runs", "daily_research", "inspect both truthful daily outcomes without backfilling history")
+    if str(latest_event.get("track_record_ledger_integrity") or "").lower() in {"failed", "mismatch"}:
+        add("critical", "LEDGER_INTEGRITY_FAILED", "latest daily event reports ledger integrity failure", "research_ledger", "stop publication for the affected run and preserve evidence")
+    if str(latest_event.get("alaya_internal_readback_status") or "").lower() in {"failed", "mismatch"}:
+        add("critical", "ALAYA_READBACK_FAILED", "latest daily event reports internal Alaya readback failure", "alaya_internal_readback", "preserve the event and require a fresh future run")
+    return sorted(alerts, key=lambda item: {"critical": 0, "blocker": 1, "warning": 2}[str(item["severity"])])
+
+
+def persist_alerts(evidence_root: Path, alerts: list[dict[str, Any]]) -> dict[str, Any]:
+    monitor = monitor_root(evidence_root)
+    current_path = monitor / "current-alert.json"
+    previous = read_json(current_path) if current_path.exists() else {}
+    current_alert = alerts[0] if alerts else {
+        "schema": MONITOR_ALERT_SCHEMA,
+        "event_type": "stage15B_beta_alert_state",
+        "timestamp": utc_now().isoformat().replace("+00:00", "Z"),
+        "severity": "none",
+        "alert_code": "none",
+        "beta_clock_preserved": True,
+        "beta_timer_stopped": False,
+        "human_action_required": False,
+    }
+    changed = (previous.get("severity"), previous.get("alert_code"), previous.get("root_cause")) != (
+        current_alert.get("severity"), current_alert.get("alert_code"), current_alert.get("root_cause")
+    )
+    write_json(current_path, current_alert)
+    if changed:
+        append_jsonl(monitor / "alerts.jsonl", current_alert)
+        append_jsonl(MAIN_EVENTS_PATH, current_alert)
+    return current_alert
+
+
 def health_check(
     *,
     evidence_root: Path | None = None,
@@ -575,6 +818,8 @@ def health_check(
         refresh_timer=True,
         write_outputs=write_outputs,
     )
+    gotra_state = git_state(Path("/opt/gotra"))
+    ledger_state = git_state(Path("/opt/gotra-public-ledger"))
     heartbeat = build_monitor_heartbeat(
         evidence_root=root,
         public_status_path=public_status_path,
@@ -582,6 +827,22 @@ def health_check(
         now=current,
         status=status,
     )
+    alerts = evaluate_alerts(
+        evidence_root=root,
+        status=status,
+        production=production,
+        gotra_state=gotra_state,
+        ledger_state=ledger_state,
+        current=current,
+    )
+    current_alert = alerts[0] if alerts else None
+    heartbeat["active_alerts"] = [
+        {key: alert[key] for key in ("severity", "alert_code", "root_cause", "next_action")}
+        for alert in alerts
+    ]
+    heartbeat["alert_count"] = len(alerts)
+    if current_alert:
+        heartbeat["current_blocker"] = current_alert["alert_code"]
     snapshot = {
         "schema": MONITOR_EVENT_SCHEMA,
         "event_type": "stage15B_beta_monitor_health_check",
@@ -595,14 +856,17 @@ def health_check(
         "production": production,
         "source_safety_scan": source_safety_scan(),
         "repo_state": {
-            "gotra": git_state(Path("/opt/gotra")),
-            "ledger": git_state(Path("/opt/gotra-public-ledger")),
+            "gotra": gotra_state,
+            "ledger": ledger_state,
         },
+        "alerts": alerts,
+        "current_alert": current_alert,
         "heartbeat": heartbeat,
         "result": "pass" if heartbeat["current_blocker"] is None else "needs_repair",
         "boundary": boundary(),
     }
     if write_outputs:
+        snapshot["current_alert"] = persist_alerts(root, alerts)
         write_json(monitor / "monitor-heartbeat.json", heartbeat)
         write_json(monitor / "health-snapshots" / f"{local_now(current).date().isoformat()}-{current.strftime('%H%M%SZ')}.json", snapshot)
         append_jsonl(monitor / "health-events.jsonl", snapshot)
@@ -634,6 +898,7 @@ def post_run_check(
         "daily_journal_tail": journal_tail(DAILY_SERVICE_NAME),
         "health_result": health["result"],
         "current_blocker": health["heartbeat"]["current_blocker"],
+        "active_alert_count": health["heartbeat"].get("alert_count", 0),
         "repair_attempted": False,
         "result": health["result"],
         "boundary": boundary(),
@@ -714,7 +979,17 @@ def render_daily_report(
     latest_event = latest_daily_event(evidence_root)
     remaining_days = max(0, int(status.get("required_days", 30)) - int(status.get("elapsed_days", 0)))
     blocker = heartbeat.get("current_blocker")
+    alerts = health.get("alerts") or []
+    alert_lines = "\n".join(
+        f"- `{alert['severity']}` `{alert['alert_code']}`: {alert['root_cause']}"
+        for alert in alerts
+    ) or "- 当前没有活动告警。"
     return f"""# GOTRA Stage 15B 30 天公开 Beta 日报 - {date}
+
+## 当前异常
+{alert_lines}
+- 异常是否影响 beta clock: `false`
+- beta timer 是否停止: `false`
 
 ## 今日结论
 - 状态: `BETA_IN_PROGRESS_REAL_TIME_WAIT`
@@ -745,6 +1020,8 @@ def render_daily_report(
 - daily research job configured: `{str(status.get('daily_research_job_configured') is True).lower()}`
 - valid_research_output_days: `{status.get('valid_research_output_days', 0)}`
 - unavailable_days: `{status.get('unavailable_days', 0)}`
+- failed_output_days: `{status.get('failed_output_days', 0)}`
+- history_backfilled: `{str(status.get('history_backfilled') is True).lower()}`
 - blocked_count: `{(latest_event or {}).get('blocked_count', 0)}`
 - failed_count: `0`
 - needs_review_count: `{(latest_event or {}).get('needs_review_count', 0)}`
@@ -783,9 +1060,9 @@ def render_daily_report(
 - beta output review item: `daily research job not configured; beta clock running but valid_research_output_days remains {status.get('valid_research_output_days', 0)}`
 
 ## 自动修复
-- 是否触发: `false`
+- 是否触发: `{str(bool((heartbeat.get('last_repair_action') or {}).get('repair_action') not in (None, 'none'))).lower()}`
 - root cause: `{blocker or 'none'}`
-- action: `none`
+- action: `{(heartbeat.get('last_repair_action') or {}).get('repair_action', 'none')}`
 - result: `{health.get('result')}`
 - evidence: `{report_path}`
 
@@ -945,7 +1222,7 @@ WantedBy=timers.target
 Description=Run GOTRA Stage 15B beta lightweight health checks
 
 [Timer]
-OnCalendar=*-*-* 03,12,21:10:00
+OnCalendar=*:0/10
 Persistent=true
 Unit=gotra-beta-monitor-health.service
 
@@ -987,6 +1264,7 @@ def install_monitor_timers(*, evidence_root: Path | None = None) -> dict[str, An
     results = [run_command(command).as_dict() for command in commands]
     if any(result["returncode"] != 0 for result in results):
         raise RuntimeError(f"monitor_timer_install_failed:{results}")
+    expected_repo_state = write_expected_repo_state(root)
     payload = {
         "schema": MONITOR_EVENT_SCHEMA,
         "event_type": "stage15B_beta_monitor_timers_installed",
@@ -994,6 +1272,7 @@ def install_monitor_timers(*, evidence_root: Path | None = None) -> dict[str, An
         "definitions": definitions,
         "install_results": results,
         "timer_status": monitor_timer_statuses(),
+        "expected_repo_state": expected_repo_state,
         "boundary": boundary(),
     }
     append_jsonl(monitor_root(root) / "monitor-events.jsonl", payload)
@@ -1007,6 +1286,19 @@ def repair_if_safe(*, evidence_root: Path | None = None) -> dict[str, Any]:
     current = utc_now().isoformat().replace("+00:00", "Z")
     health = health_check(evidence_root=root, write_outputs=True)
     blocker = health["heartbeat"]["current_blocker"]
+    repairs_path = monitor / "repair-events.jsonl"
+    previous_repairs = []
+    if repairs_path.exists():
+        previous_repairs = [
+            json.loads(line)
+            for line in repairs_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    attempts = sum(
+        1
+        for item in previous_repairs
+        if item.get("root_cause") == blocker and item.get("repair_action") != "none"
+    )
     event = {
         "schema": MONITOR_REPAIR_EVENT_SCHEMA,
         "event_type": "stage15B_beta_monitor_self_repair",
@@ -1017,19 +1309,27 @@ def repair_if_safe(*, evidence_root: Path | None = None) -> dict[str, Any]:
         "commands_run": [],
         "validation_after": [],
         "result": "not_needed" if blocker is None else "needs_review",
+        "attempt": attempts + 1 if blocker else 0,
+        "beta_clock_preserved": True,
+        "beta_timer_stopped": False,
         "evidence_paths": [str(monitor)],
         "boundary": boundary(),
     }
-    if blocker == "P0_production_http":
-        nginx_test = run_command(["nginx", "-t"])
-        event["commands_run"].append(nginx_test.as_dict())
-        if nginx_test.returncode == 0:
-            restart = run_command(["systemctl", "restart", "nginx"])
-            event["commands_run"].append(restart.as_dict())
-            after = health_check(evidence_root=root, write_outputs=True)
-            event["validation_after"].append({"production": after["production"], "blocker": after["heartbeat"]["current_blocker"]})
-            event["repair_action"] = "restart_nginx_once"
-            event["result"] = "repaired" if after["heartbeat"]["current_blocker"] is None else "needs_review"
-    append_jsonl(monitor / "repair-events.jsonl", event)
+    safe_retry_codes = {
+        "PRODUCTION_SMOKE_FAILED",
+        "MONITOR_HEARTBEAT_STALE",
+        "DAILY_REPORT_STALE",
+        "POST_RUN_EVIDENCE_MISSING",
+    }
+    if blocker in safe_retry_codes and attempts >= 3:
+        event["result"] = "auto_repair_limit_reached"
+    elif blocker in safe_retry_codes:
+        after = health_check(evidence_root=root, write_outputs=True)
+        event["validation_after"].append(
+            {"production": after["production"], "blocker": after["heartbeat"]["current_blocker"]}
+        )
+        event["repair_action"] = "rerun_health_and_production_smoke_once"
+        event["result"] = "repaired" if after["heartbeat"]["current_blocker"] is None else "needs_review"
+    append_jsonl(repairs_path, event)
     append_jsonl(monitor / "monitor-events.jsonl", event)
     return event
