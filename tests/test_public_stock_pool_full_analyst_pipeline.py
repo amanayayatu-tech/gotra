@@ -986,6 +986,7 @@ def test_v35_fixture_run_builds_task_evidence_and_alaya_hash_readback(tmp_path: 
     assert status["agent_parallelism"] == 4
     assert status["agent_calls_total"] == 7
     assert status["publish_count"] == 0
+    assert status["publish_with_boundary_count"] == 0
     assert status["needs_review_count"] == 1
     assert status["blocked_count"] == 0
     assert status["alaya_event_schema"] == ALAYA_EVENT_SCHEMA_V35
@@ -1149,6 +1150,7 @@ def test_v40_fixture_run_builds_k_first_gates_and_alaya_hash_readback(tmp_path: 
     assert status["agent_parallelism"] == 3
     assert status["agent_calls_total"] == 7
     assert status["publish_count"] == 0
+    assert status["publish_with_boundary_count"] == 1
     assert status["needs_review_count"] == 1
     assert status["blocked_count"] == 0
     assert status["failed_count"] == 0
@@ -1480,6 +1482,24 @@ def test_research_ledger_update_appends_version_without_overwrite() -> None:
     assert second["entries"][1]["previous_hash"] == second["entries"][0]["hash"]
     assert second["entries"][1]["previous_version_hash"] == second["entries"][0]["hash"]
     assert second["integrity"]["ok"] is True
+
+
+def test_research_ledger_appends_needs_review_when_reader_boundary_allows_publication() -> None:
+    payload = valid_published_symbol_payload()
+    payload["publication_decision"] = {
+        **payload["publication_decision"],  # type: ignore[arg-type]
+        "decision": "needs_review",
+        "publish_with_boundary": True,
+        "decision_hash": "needs-review-decision-hash",
+    }
+    payload["publication_decision_hash"] = "needs-review-decision-hash"
+
+    manifest = merge_research_ledger([], [payload], generated_at="2026-06-29T10:00:00+00:00")
+
+    assert manifest["entry_count"] == 1
+    assert manifest["appended_count"] == 1
+    assert manifest["entries"][0]["status"] == "needs_review"
+    assert manifest["integrity"]["ok"] is True
 
 
 def test_research_ledger_adds_review_result_for_due_entry_with_public_prices() -> None:

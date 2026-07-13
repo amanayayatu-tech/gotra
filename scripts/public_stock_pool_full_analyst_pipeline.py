@@ -3732,7 +3732,11 @@ def merge_research_ledger(
     for payload in sorted(symbol_payloads, key=lambda item: (str(item.get("exchange")), str(item.get("symbol")))):
         decision = payload.get("publication_decision") if isinstance(payload.get("publication_decision"), dict) else {}
         signal = payload.get("research_signal") if isinstance(payload.get("research_signal"), dict) else {}
-        if decision.get("decision") != "publish" or not signal:
+        if (
+            decision.get("decision") not in {"publish", "needs_review"}
+            or decision.get("publish_with_boundary") is not True
+            or not signal
+        ):
             continue
         base_entry_id = ledger_base_entry_id(payload)
         versions = sorted(by_base.get(base_entry_id, []), key=lambda entry: int(entry.get("version") or 0))
@@ -5040,6 +5044,14 @@ def build_status(
     blocked = [row for row in results if row["judge_status"] == "blocked"]
     needs_review = [row for row in results if row["judge_status"] == "needs_review"]
     publish = [row for row in results if row["judge_status"] == "publish"]
+    publish_with_boundary = [
+        row
+        for row in results
+        if isinstance(row.get("research"), dict)
+        and isinstance(row["research"].get("publication_decision"), dict)
+        and row["research"]["publication_decision"].get("publish_with_boundary") is True
+        and row["judge_status"] != "blocked"
+    ]
     alaya_failed = [row for row in results if row["alaya_sync_status"] == "failed"]
     alaya_synced = [row for row in results if row["alaya_sync_status"] == "synced"]
     alaya_readback_failed = [
@@ -5092,6 +5104,7 @@ def build_status(
         "success_count": sum(1 for row in results if row["status"] == "success"),
         "failed_count": len(failed),
         "publish_count": len(publish),
+        "publish_with_boundary_count": len(publish_with_boundary),
         "needs_review_count": len(needs_review),
         "blocked_count": len(blocked),
         "data_gap_count": sum(1 for row in results if row["price_coverage_status"] == "data_gap"),

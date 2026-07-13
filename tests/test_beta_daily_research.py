@@ -55,6 +55,7 @@ def test_staged_validation_accepts_one_real_v4_symbol(tmp_path):
         "failed_count": 0,
         "blocked_count": 0,
         "publish_count": 1,
+        "publish_with_boundary_count": 1,
         "needs_review_count": 0,
         "data_gap_count": 0,
         "public_scan_status": "ok",
