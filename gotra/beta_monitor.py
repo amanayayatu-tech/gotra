@@ -780,7 +780,12 @@ def evaluate_alerts(
 def persist_alerts(evidence_root: Path, alerts: list[dict[str, Any]]) -> dict[str, Any]:
     monitor = monitor_root(evidence_root)
     current_path = monitor / "current-alert.json"
-    previous = read_json(current_path) if current_path.exists() else {}
+    state_path = monitor / "active-alert-state.json"
+    previous_state = read_json(state_path) if state_path.exists() else {}
+    previous_alerts = {
+        str(alert.get("alert_code")): alert
+        for alert in previous_state.get("alerts", [])
+    }
     current_alert = alerts[0] if alerts else {
         "schema": MONITOR_ALERT_SCHEMA,
         "event_type": "stage15B_beta_alert_state",
@@ -791,13 +796,25 @@ def persist_alerts(evidence_root: Path, alerts: list[dict[str, Any]]) -> dict[st
         "beta_timer_stopped": False,
         "human_action_required": False,
     }
-    changed = (previous.get("severity"), previous.get("alert_code"), previous.get("root_cause")) != (
-        current_alert.get("severity"), current_alert.get("alert_code"), current_alert.get("root_cause")
-    )
     write_json(current_path, current_alert)
-    if changed:
-        append_jsonl(monitor / "alerts.jsonl", current_alert)
-        append_jsonl(MAIN_EVENTS_PATH, current_alert)
+    for alert in alerts:
+        previous = previous_alerts.get(str(alert.get("alert_code")), {})
+        changed = (previous.get("severity"), previous.get("root_cause")) != (
+            alert.get("severity"), alert.get("root_cause")
+        )
+        if changed:
+            append_jsonl(monitor / "alerts.jsonl", alert)
+            append_jsonl(MAIN_EVENTS_PATH, alert)
+    write_json(
+        state_path,
+        {
+            "schema": "gotra.launch.beta_active_alert_state.v1",
+            "timestamp": utc_now().isoformat().replace("+00:00", "Z"),
+            "alerts": alerts,
+            "beta_clock_preserved": True,
+            "beta_timer_stopped": False,
+        },
+    )
     return current_alert
 
 

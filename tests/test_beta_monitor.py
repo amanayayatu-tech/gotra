@@ -97,6 +97,14 @@ def test_health_check_writes_monitor_heartbeat_without_completing_beta(tmp_path,
     assert current_alert["alert_code"] == "DAILY_RESEARCH_JOB_NOT_READY"
     assert current_alert["beta_clock_preserved"] is True
     assert current_alert["beta_timer_stopped"] is False
+    persisted_alerts = [
+        json.loads(line)
+        for line in (evidence_root / "monitor" / "alerts.jsonl").read_text().splitlines()
+    ]
+    assert {alert["alert_code"] for alert in persisted_alerts} >= {
+        "DAILY_RESEARCH_JOB_NOT_READY",
+        "MONITOR_HEARTBEAT_STALE",
+    }
     assert (evidence_root / "monitor" / "monitor-events.jsonl").exists()
 
 
